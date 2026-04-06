@@ -2,64 +2,36 @@
 
 ## System overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           kaizen-trader process                              │
-│                                                                               │
-│  ┌─────────────────┐    ┌──────────────────────────────────────────────────┐ │
-│  │  Coinbase WS    │    │              Signal pipeline                      │ │
-│  │  (price ticks   │    │                                                    │ │
-│  │   + L2 book)    │    │  CryptoPanic ──► news sentiment [-1,+1]           │ │
-│  └────────┬────────┘    │  LunarCrush  ──► social score + velocity          │ │
-│           │             │  Whale Alert ──► net flow direction (2h window)   │ │
-│           ▼             │  Binance     ──► funding rates + open interest    │ │
-│  ┌─────────────────┐    │  DeFiLlama   ──► protocol revenue spikes          │ │
-│  │  Strategy       │    │  Alternative ──► Fear & Greed index               │ │
-│  │  scanners (12)  │◄───┤                                                    │ │
-│  └────────┬────────┘    └──────────────────────────────────────────────────┘ │
-│           │                                                                   │
-│           ▼                                                                   │
-│  ┌─────────────────┐                                                          │
-│  │  Qualification  │  Aggregates strategy score + orthogonal signals         │
-│  │  scorer         │  Two-gate: strategy gate → signal confirmation gate     │
-│  └────────┬────────┘                                                          │
-│           │ score ≥ threshold                                                 │
-│           ▼                                                                   │
-│  ┌─────────────────┐    ┌──────────────────────────────────────────────────┐ │
-│  │  Position       │    │  Kelly position sizer                             │ │
-│  │  manager        │◄───│  size = quarter_kelly(win_rate, edge) × portfolio │ │
-│  └────────┬────────┘    └──────────────────────────────────────────────────┘ │
-│           │                                                                   │
-│           ▼                                                                   │
-│  ┌─────────────────┐    ┌──────────────────────────────────────────────────┐ │
-│  │  Executor       │    │  Circuit breaker                                  │ │
-│  │  (Coinbase REST │◄───│  canOpen = !circuitBreaker && openPos < max       │ │
-│  │   or paper sim) │    └──────────────────────────────────────────────────┘ │
-│  └────────┬────────┘                                                          │
-│           │                                                                   │
-│           ▼                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │                        Self-healing engine                               │ │
-│  │                                                                           │ │
-│  │  Layer 1 (after every loss)                                              │ │
-│  │    classifyLossReason() → applyLossAdaptation() → patch live config      │ │
-│  │    Max 20 adaptations per session. Bounded by CONFIG_BOUNDS.             │ │
-│  │                                                                           │ │
-│  │  Layer 2 (every 60 minutes, or on demand)                                │ │
-│  │    computeMetrics() ──► formatMetrics()                                  │ │
-│  │    buildPrompt(metrics + trades + diagnoses + error_logs)                │ │
-│  │    → claude-opus-4-6 (chain-of-thought reasoning)                        │ │
-│  │    → zod-validated JSON: { parameterChanges, strategyInsights, ... }     │ │
-│  │    → reject low-confidence changes                                        │ │
-│  │    → apply medium/high-confidence changes                                 │ │
-│  │    → snapshotConfig() → full audit trail in SQLite                       │ │
-│  └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │                        SQLite (trader.db)                                │ │
-│  │  positions · trades · logs · diagnoses · scanner_config_history         │ │
-│  └─────────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    WS["**Coinbase WebSocket**\nprice ticks · L2 order book"]
+    CP["CryptoPanic\nnews sentiment"]
+    LC["LunarCrush\nsocial score + velocity"]
+    WA["Whale Alert\nnet flow direction"]
+    BN["Binance Futures\nfunding rates · liquidations"]
+    DL["DeFiLlama\nprotocol revenue"]
+    FG["Alternative.me\nFear & Greed index"]
+
+    STRAT["**Strategy Scanners ×12**"]
+    QUAL["**Qualification Scorer**\nbase + news + social + context + fear/greed\nscore ≥ threshold to proceed"]
+    KELLY["**Kelly Position Sizer**\nquarter-Kelly × qual score multiplier"]
+    CB["Circuit Breaker\n!circuitBreaker && openPos < max"]
+    EXEC["**Executor**\nCoinbase Advanced REST (HMAC)\nor paper sim with slippage model"]
+
+    L1["**Self-Healing Layer 1**\nper-loss rule-based correction\nclassifyLossReason → patch parameter\nmax 20 adaptations · bounded by CONFIG_BOUNDS"]
+    L2["**Self-Healing Layer 2**\nperiodic Claude analysis\ncomputeMetrics → buildPrompt → claude-opus-4-6\nchain-of-thought → Zod-validated JSON\nmedium/high confidence only"]
+    DB[("**SQLite · trader.db**\npositions · trades · logs\ndiagnoses · config_history")]
+
+    WS --> STRAT
+    CP & LC & WA & BN & DL & FG --> STRAT
+    STRAT --> QUAL
+    QUAL -->|passes| KELLY
+    KELLY --> CB
+    CB -->|allowed| EXEC
+    EXEC -->|on close| L1
+    L1 --> DB
+    DB -->|every 60m| L2
+    L2 --> DB
 ```
 
 ## Key design decisions
@@ -118,27 +90,28 @@ The independence of these signals is important. News sentiment and social moment
 
 ## Data flow on a single tick
 
-```
-Coinbase WS price tick received for SOL-USD at $182.50
-  │
-  ├─► pushPriceSample('SOL', 182.50, volume24h)
-  │     → momentum.ts maintains rolling swing/scalp buffers
-  │
-  ├─► updateOrderBook('SOL', bids, asks)
-  │     → orderbook-imbalance.ts reads L2 depth
-  │
-  ├─► strategies.scanMomentum('SOL', ...)
-  │     ↓ returns TradeSignal{score: 68, strategy: 'momentum_swing'}
-  │
-  ├─► scorer.qualify(signal, marketContext, config, news?, social?)
-  │     → base=68 + news+4 + social+3 + ctx-2 + fgi+0 = 73 ≥ minQualScore(55) ✓
-  │
-  ├─► portfolio.canOpenPosition()
-  │     → circuitBreaker=false, openPos=1 < maxOpenPositions=5 ✓
-  │
-  ├─► positionSizer.kellySize('momentum_swing', portfolioUsd=9800, qualScore=73)
-  │     → winRate=0.62, b=1.8, rawKelly=0.18, quarterKelly=0.045, → $91
-  │
-  └─► executor.paperBuy('SOL', 'SOL-USD', $91, positionId, 182.50)
-        → fills at 182.59 (0.05% slippage), logs to SQLite
+```mermaid
+sequenceDiagram
+    participant WS as Coinbase WS
+    participant Momentum as momentum.ts
+    participant OB as orderbook-imbalance.ts
+    participant Scanner as scanMomentum()
+    participant Scorer as scorer.qualify()
+    participant Portfolio as portfolio.canOpen()
+    participant Sizer as kellySize()
+    participant Exec as paperBuy()
+    participant DB as SQLite
+
+    WS->>Momentum: tick SOL-USD @ $182.50 vol=2.4x
+    WS->>OB: L2 book update bids/asks
+    Momentum->>Scanner: rolling buffer updated
+    Scanner-->>Scorer: TradeSignal score=68 momentum_swing
+    Note over Scorer: base=68 + news+4 + social+3 + ctx-2 = 73 ≥ 55 ✓
+    Scorer-->>Portfolio: qualified score=73
+    Note over Portfolio: circuitBreaker=false, openPos=1/5 ✓
+    Portfolio-->>Sizer: approved
+    Note over Sizer: winRate=0.62, b=1.8 → quarter-Kelly → $91
+    Sizer-->>Exec: place $91 buy
+    Note over Exec: fill @ 182.59 (0.05% slip)
+    Exec->>DB: INSERT position + trade log
 ```

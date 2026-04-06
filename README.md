@@ -36,47 +36,27 @@ The full audit trail — every trade, every self-healer diagnosis, every config 
 
 ## Architecture
 
-```
-Coinbase WebSocket ─────────────────────────────────────────────────┐
-  price ticks + L2 order book                                        │
-                                                                      ▼
-Signal pipeline                            Strategy scanners (×12)
-  CryptoPanic  → news sentiment [-1,+1]  ──► momentum_swing / scalp
-  LunarCrush   → social score + velocity ──► mean_reversion (VWAP+RSI)
-  Whale Alert  → exchange net flow       ──► listing_pump
-  Binance      → funding + liquidations  ──► whale_accumulation
-  DeFiLlama    → protocol revenue spikes ──► funding_extreme
-  Alternative  → Fear & Greed index      ──► liquidation_cascade
-                                          ──► orderbook_imbalance
-                                          ──► narrative_momentum
-                                          ──► correlation_break
-                                          ──► protocol_revenue
-                                          ──► fear_greed_contrarian
-                                                    │
-                                                    ▼
-                                     Qualification scorer
-                                     (base score + 4 orthogonal signals)
-                                     threshold gate → reject or proceed
-                                                    │
-                                                    ▼
-                                     Kelly position sizer
-                                     quarter-Kelly × qual score multiplier
-                                                    │
-                                                    ▼
-                                     Executor (Coinbase REST / paper sim)
-                                     HMAC-signed, slippage model in paper mode
-                                                    │
-                         ┌─────────────────────────┘
-                         ▼
-          Self-healing engine
-          ├── Layer 1: loss → classifyLossReason() → patch one parameter
-          └── Layer 2: every 60m → Claude reads metrics + history
-                       → chain-of-thought → validated JSON patch
-                       → medium/high confidence changes applied
-                                 │
-                                 ▼
-                    SQLite (trader.db) — full audit trail
-                    positions · trades · logs · diagnoses · config_history
+```mermaid
+flowchart TD
+    WS["Coinbase WebSocket\nprice ticks · L2 order book"]
+    SIG["Signal Pipeline\nCryptoPanic · LunarCrush · Whale Alert\nBinance · DeFiLlama · Alternative.me"]
+    STRAT["Strategy Scanners ×12\nmomentum · mean_reversion · listing_pump\nwhale_accumulation · funding_extreme\nliquidation_cascade · orderbook_imbalance\nnarrative_momentum · correlation_break\nprotocol_revenue · fear_greed_contrarian"]
+    QUAL["Qualification Scorer\nbase score + news + social + context + fear/greed\ntwo-gate: strategy gate → signal confirmation"]
+    KELLY["Kelly Position Sizer\nquarter-Kelly × qual score multiplier"]
+    EXEC["Executor\nCoinbase Advanced REST (HMAC-signed)\nor paper simulation with slippage model"]
+    HEAL1["Self-Healing Layer 1\nloss → classifyLossReason()\n→ patch one parameter immediately"]
+    HEAL2["Self-Healing Layer 2\nevery 60m → Claude reads metrics + history\n→ chain-of-thought → JSON patch\n→ medium/high confidence changes applied"]
+    DB[("SQLite · trader.db\npositions · trades · logs\ndiagnoses · config_history")]
+
+    WS --> STRAT
+    SIG --> STRAT
+    STRAT --> QUAL
+    QUAL -->|score ≥ threshold| KELLY
+    KELLY --> EXEC
+    EXEC --> HEAL1
+    HEAL1 --> DB
+    HEAL2 --> DB
+    DB --> HEAL2
 ```
 
 ---
