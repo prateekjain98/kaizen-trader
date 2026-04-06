@@ -36,28 +36,33 @@ The full audit trail — every trade, every self-healer diagnosis, every config 
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    WS["Coinbase WebSocket\nprice ticks · L2 order book"]
-    SIG["Signal Pipeline\nCryptoPanic · LunarCrush · Whale Alert\nBinance · DeFiLlama · Alternative.me"]
-    STRAT["Strategy Scanners ×12\nmomentum · mean_reversion · listing_pump\nwhale_accumulation · funding_extreme\nliquidation_cascade · orderbook_imbalance\nnarrative_momentum · correlation_break\nprotocol_revenue · fear_greed_contrarian"]
-    QUAL["Qualification Scorer\nbase score + news + social + context + fear/greed\ntwo-gate: strategy gate → signal confirmation"]
-    KELLY["Kelly Position Sizer\nquarter-Kelly × qual score multiplier"]
-    EXEC["Executor\nCoinbase Advanced REST (HMAC-signed)\nor paper simulation with slippage model"]
-    HEAL1["Self-Healing Layer 1\nloss → classifyLossReason()\n→ patch one parameter immediately"]
-    HEAL2["Self-Healing Layer 2\nevery 60m → Claude reads metrics + history\n→ chain-of-thought → JSON patch\n→ medium/high confidence changes applied"]
-    DB[("SQLite · trader.db\npositions · trades · logs\ndiagnoses · config_history")]
+Three stages run continuously in a single Node.js process:
 
-    WS --> STRAT
-    SIG --> STRAT
-    STRAT --> QUAL
-    QUAL -->|score ≥ threshold| KELLY
-    KELLY --> EXEC
-    EXEC --> HEAL1
-    HEAL1 --> DB
-    HEAL2 --> DB
-    DB --> HEAL2
+**1 — Signal ingestion**
+Coinbase WebSocket streams price ticks and L2 order book updates. Six external APIs (CryptoPanic, LunarCrush, Whale Alert, Binance Futures, DeFiLlama, Alternative.me) poll on independent schedules and update an in-memory `MarketContext` object.
+
+**2 — Trade engine**
+On every tick, 12 strategy scanners run against the current price and context. Any signal that passes the strategy gate enters the qualification scorer, which aggregates five orthogonal signal sources into a final score (0–100). Signals above the threshold are sized via quarter-Kelly and routed to the executor (paper by default, Coinbase Advanced REST in live mode). A circuit breaker blocks new positions when daily loss limits are hit.
+
+**3 — Self-healing loop**
+
 ```
+After every loss
+  └─ classifyLossReason()          → entered_pump_top | stop_too_tight | low_qual_score | ...
+     applyLossAdaptation()         → patch one parameter in the live config object
+     insertDiagnosis()             → write to SQLite
+
+Every 60 minutes
+  └─ computeMetrics()              → Sharpe / Sortino / Calmar / win rate per strategy
+     buildPrompt()                 → metrics + last 100 trades + diagnosis history
+     claude-opus-4-6               → chain-of-thought reasoning
+     Zod validation                → reject malformed responses
+     confidence filter             → skip low-confidence changes
+     applyChanges()                → patch live config
+     snapshotConfig()              → full audit trail in SQLite
+```
+
+The full data flow is documented in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 

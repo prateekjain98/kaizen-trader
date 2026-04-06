@@ -3,35 +3,53 @@
 ## System overview
 
 ```mermaid
-flowchart TD
-    WS["**Coinbase WebSocket**\nprice ticks · L2 order book"]
-    CP["CryptoPanic\nnews sentiment"]
-    LC["LunarCrush\nsocial score + velocity"]
-    WA["Whale Alert\nnet flow direction"]
-    BN["Binance Futures\nfunding rates · liquidations"]
-    DL["DeFiLlama\nprotocol revenue"]
-    FG["Alternative.me\nFear & Greed index"]
+flowchart LR
+    subgraph feeds["Feeds"]
+        direction TB
+        WS["Coinbase WS\nprice · order book"]
+        CP["CryptoPanic"]
+        LC["LunarCrush"]
+        WA["Whale Alert"]
+        BN["Binance Futures"]
+        DL["DeFiLlama"]
+        FG["Fear & Greed"]
+    end
 
-    STRAT["**Strategy Scanners ×12**"]
-    QUAL["**Qualification Scorer**\nbase + news + social + context + fear/greed\nscore ≥ threshold to proceed"]
-    KELLY["**Kelly Position Sizer**\nquarter-Kelly × qual score multiplier"]
-    CB["Circuit Breaker\n!circuitBreaker && openPos < max"]
-    EXEC["**Executor**\nCoinbase Advanced REST (HMAC)\nor paper sim with slippage model"]
+    subgraph engine["Trading Engine"]
+        direction LR
+        STRAT["12 Strategies"]
+        QUAL["Qualification Scorer"]
+        KELLY["Kelly Sizer"]
+        CB{"Circuit Breaker"}
+        EXEC["Executor"]
+        STRAT --> QUAL -->|"score >= threshold"| KELLY --> CB -->|"pass"| EXEC
+    end
 
-    L1["**Self-Healing Layer 1**\nper-loss rule-based correction\nclassifyLossReason → patch parameter\nmax 20 adaptations · bounded by CONFIG_BOUNDS"]
-    L2["**Self-Healing Layer 2**\nperiodic Claude analysis\ncomputeMetrics → buildPrompt → claude-opus-4-6\nchain-of-thought → Zod-validated JSON\nmedium/high confidence only"]
-    DB[("**SQLite · trader.db**\npositions · trades · logs\ndiagnoses · config_history")]
+    subgraph healing["Self-Healing"]
+        direction TB
+        L1["Layer 1\nRule-based · immediate"]
+        L2["Layer 2\nClaude Opus · 60 min"]
+    end
 
-    WS --> STRAT
-    CP & LC & WA & BN & DL & FG --> STRAT
-    STRAT --> QUAL
-    QUAL -->|passes| KELLY
-    KELLY --> CB
-    CB -->|allowed| EXEC
-    EXEC -->|on close| L1
+    DB[("trader.db")]
+
+    feeds --> STRAT
+    EXEC -->|"loss"| L1
     L1 --> DB
-    DB -->|every 60m| L2
-    L2 --> DB
+    DB -->|"metrics + history"| L2
+    L2 -->|"parameter patch"| STRAT
+
+    classDef feed fill:#1c2128,stroke:#388bfd,color:#79c0ff
+    classDef core fill:#122117,stroke:#3fb950,color:#56d364
+    classDef risk fill:#1e1733,stroke:#8957e5,color:#d2a8ff
+    classDef db   fill:#1c2128,stroke:#484f58,color:#8b949e
+    classDef heal fill:#261700,stroke:#9e6a03,color:#e3b341
+
+    class WS,CP,LC,WA,BN,DL,FG feed
+    class STRAT,QUAL,EXEC core
+    class KELLY,CB risk
+    class DB db
+    class L1,L2 heal
 ```
 
 ## Key design decisions
