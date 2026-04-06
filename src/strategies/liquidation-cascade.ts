@@ -1,5 +1,5 @@
 /**
- * Liquidation Cascade Strategy (NEW — not in v1)
+ * Liquidation Cascade Strategy
  *
  * Thesis: When a large cluster of liquidations is about to trigger, it creates
  * a self-reinforcing cascade. We can profit by:

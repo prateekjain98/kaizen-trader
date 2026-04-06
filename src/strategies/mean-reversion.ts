@@ -1,5 +1,5 @@
 /**
- * Mean Reversion Strategy (NEW — not in v1)
+ * Mean Reversion Strategy
  *
  * Thesis: When price deviates significantly from VWAP or deviates below a
  * rolling moving average AND RSI is oversold, price tends to snap back.

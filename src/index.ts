@@ -64,23 +64,17 @@ async function main(): Promise<void> {
 
   log('info', `
 ──────────────────────────────────────────
-  Strategies active:
-  ✓ momentum_swing        (v1 — enhanced)
-  ✓ momentum_scalp        (v1 — enhanced)
-  ✓ listing_pump          (v1 — enhanced)
-  ✓ whale_accumulation    (v1 — enhanced)
-  ✓ mean_reversion        (NEW — VWAP + RSI)
-  ✓ funding_extreme       (NEW — funding rate mean-reversion)
-  ✓ liquidation_cascade   (NEW — cascade rider + dip buyer)
-  ✓ orderbook_imbalance   (NEW — L2 book depth)
-  ✓ narrative_momentum    (NEW — sector rotation)
-  ✓ correlation_break     (NEW — BTC correlation divergence)
-  ✓ protocol_revenue      (NEW — DeFiLlama fundamental)
-  ✓ fear_greed_contrarian (NEW — extreme index plays)
+  Strategies:
+    momentum_swing        • momentum_scalp
+    listing_pump          • whale_accumulation
+    mean_reversion        • funding_extreme
+    liquidation_cascade   • orderbook_imbalance
+    narrative_momentum    • correlation_break
+    protocol_revenue      • fear_greed_contrarian
 
   Self-healing:
-  ✓ Immediate: loss diagnosis + parameter patch after each trade
-  ✓ Periodic:  Claude Code log analysis every ${env.logAnalysisIntervalMins}m
+    immediate  — loss diagnosis + parameter patch after each trade
+    periodic   — Claude log analysis every ${env.logAnalysisIntervalMins}m
 ──────────────────────────────────────────`);
 
   // Keep process alive

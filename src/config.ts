@@ -39,15 +39,14 @@ export const env = {
   // AI
   anthropicApiKey: optionalEnv('ANTHROPIC_API_KEY'),
 
-  // News & Social
-  cryptoPanicToken: optionalEnv('CRYPTOPANIC_TOKEN'),
-  serperApiKey: optionalEnv('SERPER_API_KEY'),
-  twitterBearerToken: optionalEnv('TWITTER_BEARER_TOKEN'),
+  // Social — LunarCrush aggregates Twitter, Reddit, YouTube, TikTok
   lunarCrushApiKey: optionalEnv('LUNARCRUSH_API_KEY'),
+
+  // News
+  cryptoPanicToken: optionalEnv('CRYPTOPANIC_TOKEN'),
 
   // On-chain
   whaleAlertApiKey: optionalEnv('WHALE_ALERT_API_KEY'),
-  etherscanApiKey: optionalEnv('ETHERSCAN_API_KEY'),
 
   // Risk
   maxPositionUsd: numEnv('MAX_POSITION_USD', 100),

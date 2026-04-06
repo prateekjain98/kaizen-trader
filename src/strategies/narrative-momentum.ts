@@ -1,5 +1,5 @@
 /**
- * Narrative Momentum Strategy (NEW — not in v1)
+ * Narrative Momentum Strategy
  *
  * Thesis: Crypto markets move in narratives (AI tokens, DeFi, RWA, L2s, etc.).
  * When a narrative catches fire — measured by correlated social velocity across

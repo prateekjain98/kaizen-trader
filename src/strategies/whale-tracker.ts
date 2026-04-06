@@ -1,10 +1,9 @@
 /**
- * Whale Accumulation/Distribution Strategy (enhanced from v1)
+ * Whale Accumulation/Distribution Strategy
  *
- * v1: simple keyword scoring of whale alerts
- * v2: tracks NET whale flow per symbol over a rolling 2h window,
- *     distinguishes accumulation (to cold wallets) vs distribution (to exchanges),
- *     and weights by whale wallet reputation (known funds vs unknown wallets)
+ * Tracks NET whale flow per symbol over a rolling 2h window.
+ * Distinguishes accumulation (exchange → cold wallet) from distribution (cold wallet → exchange).
+ * Weights alerts by transfer size — only fires on $3M+ moves.
  */
 
 import type { TradeSignal } from '../types.js';

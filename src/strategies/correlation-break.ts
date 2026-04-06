@@ -1,5 +1,5 @@
 /**
- * Correlation Break Strategy (NEW — not in v1)
+ * Correlation Break Strategy
  *
  * Thesis: Most altcoins are highly correlated with BTC. When an altcoin
  * diverges significantly from BTC's move (either outperforming or

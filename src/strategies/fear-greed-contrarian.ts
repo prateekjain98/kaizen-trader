@@ -1,8 +1,7 @@
 /**
- * Fear & Greed Contrarian Strategy (NEW — not in v1)
+ * Fear & Greed Contrarian Strategy
  *
- * v1 used Fear & Greed as a qual modifier (+/- 10 points). This elevates it
- * to a standalone contrarian strategy: buy extreme fear, sell extreme greed.
+ * Standalone contrarian strategy: buy extreme fear, sell extreme greed.
  *
  * Research: Extreme Fear (<15) historically precedes positive 30-day returns
  * in BTC 76% of the time (2019-2024 data). Extreme Greed (>85) precedes

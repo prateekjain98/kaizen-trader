@@ -1,5 +1,5 @@
 /**
- * Order Book Imbalance Strategy (NEW — not in v1)
+ * Order Book Imbalance Strategy
  *
  * Thesis: When the order book has a heavily imbalanced bid/ask wall within
  * 1% of the current price, it creates a magnetic pull — price tends to move

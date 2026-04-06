@@ -1,14 +1,13 @@
 /**
- * Listing Pump Strategy (ported from v1 + enhanced)
+ * Listing Pump Strategy
  *
- * Detects new exchange listings across Coinbase, Binance, and Kraken.
+ * Detects new exchange listings across Coinbase, Binance, Kraken, and Bybit.
  * New listings historically pump 20-100% in the first 48h.
  *
- * Enhancements over v1:
- *  - Multi-exchange: catches Binance listings (not just Coinbase)
- *  - Pre-listing signal: monitors CryptoPanic for "listing" news before official
- *  - Checks if token already listed elsewhere (less pumpy if so)
- *  - Estimates first-mover opportunity via time-since-announcement
+ * Scoring factors:
+ *  - Exchange weight (Coinbase/Binance listings score highest)
+ *  - Freshness bonus (within 30m of announcement)
+ *  - Penalty if already listed on other major exchanges (less discovery excitement)
  */
 
 import type { TradeSignal } from '../types.js';

@@ -1,5 +1,5 @@
 /**
- * Protocol Revenue Strategy (NEW — not in v1)
+ * Protocol Revenue Strategy
  *
  * Thesis: DeFi protocols with real revenue (fees paid to token holders / treasury)
  * are undervalued when their P/E ratio (Price-to-Fees) is low relative to peers.

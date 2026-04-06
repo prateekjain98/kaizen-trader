@@ -1,197 +1,203 @@
-# Self-Healing AI Crypto Trader
+# kaizen-trader
 
-An autonomous crypto trading system that **improves itself over time** by having Claude analyze its own trading logs and patch its parameters.
+> **kaizen** (改善) — the practice of continuous improvement
+
+An autonomous crypto trading system with 12 strategies and a self-healing engine that gets smarter after every trade. It diagnoses its own losses, patches its parameters in real-time, and calls Claude periodically to perform deeper analysis on its trade history.
+
+> **Risk warning:** This is experimental software. Crypto trading can result in total loss of capital. Always run with `PAPER_TRADING=true` first. No financial advice is expressed or implied.
+
+---
+
+## How the self-healing works
+
+After every losing trade, the system classifies the root cause and adjusts the responsible parameter immediately:
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    SELF-HEALING LOOP                              │
-│                                                                    │
-│  Trade → Loss → Diagnose → Patch Parameters → Better Next Trade  │
-│                     ↑                                              │
-│              Claude Code reads logs every N minutes               │
-│              and applies deeper pattern analysis                   │
-└──────────────────────────────────────────────────────────────────┘
+Trade closes at a loss
+  └── Why did it lose?
+        ├── Entered at the top of a pump  →  raise momentum threshold
+        ├── Stop hit too fast (<2h)        →  widen trailing stop
+        ├── Slow bleed over long hold      →  tighten trailing stop
+        ├── Low conviction entry            →  raise minimum signal score
+        └── Funding rate squeezed it       →  lower funding threshold
+
+Every 60 minutes
+  └── Claude reads the last 200 trades + all diagnoses
+        →  identifies patterns the rule-based healer misses
+        →  returns a validated parameter patch
+        →  logs reasoning for the next iteration to build on
 ```
 
-## How it works
-
-### Layer 1: Immediate self-healing (after every loss)
-The system diagnoses WHY each losing trade failed and immediately adjusts the parameter responsible:
-
-| Loss Pattern | Root Cause | Auto Fix |
-|---|---|---|
-| Entered at top, quick exit | `entered_pump_top` | Raise momentum threshold |
-| Stop hit in <2h | `stop_too_tight` | Widen base trail % |
-| Held too long, slowly bled | `stop_too_wide` | Tighten base trail % |
-| Low qual score trade lost | `low_qual_score` | Raise min score threshold |
-| Funding rate squeezed | `funding_squeeze` | Lower funding threshold |
-
-### Layer 2: Claude-powered deep analysis (every N minutes)
-Claude reads the full trade history, win rates by strategy, and self-healer diagnoses, then:
-- Identifies patterns the immediate healer can't see (e.g. "momentum_scalp loses 70% of trades during UTC 02-06h")
-- Recommends targeted parameter changes with evidence
-- Suggests new strategies based on what the data reveals is missing
-- All changes are validated against `CONFIG_BOUNDS` before applying
-
-### Layer 3: Strategy evolution (human-in-the-loop)
-Claude Code can read `CLAUDE.md` and directly edit strategy files when patterns emerge that require code changes rather than parameter tuning.
+All parameter changes are bounded by hard limits in `src/config.ts`. Claude cannot override these.
 
 ---
 
 ## Strategies
 
-### Ported from v1 (enhanced)
+### Momentum
 
-| Strategy | Edge | Tier |
+| Strategy | Signal | Timeframe |
 |---|---|---|
-| `momentum_swing` | 1h momentum breakout + volume spike | Swing |
-| `momentum_scalp` | 5m momentum breakout, freshness-gated | Scalp |
-| `listing_pump` | New exchange listings (Coinbase, Binance, Kraken, Bybit) | Swing |
-| `whale_accumulation` | Net whale flow to/from exchanges over 2h window | Swing |
+| `momentum_swing` | Price +2% in 1h with 2× volume spike | Swing |
+| `momentum_scalp` | Price +2.5% in 5m, freshness-gated, 2.5× volume | Scalp |
 
-### New in v2
+### Mean reversion
 
-| Strategy | Edge | Tier |
+| Strategy | Signal | Timeframe |
 |---|---|---|
-| `mean_reversion` | VWAP deviation + RSI oversold/overbought | Swing |
-| `funding_extreme` | Extreme funding rates → over-leveraged side will flush | Swing |
-| `liquidation_cascade` | Ride the cascade short, then buy the exhaustion dip | Scalp/Swing |
-| `orderbook_imbalance` | Large bid/ask walls within 1% of price → scalp the support | Scalp |
-| `narrative_momentum` | Sector social velocity spike → buy the sector laggard | Swing |
-| `correlation_break` | Alt diverges from BTC correlation → mean reversion | Swing |
-| `protocol_revenue` | DeFiLlama fee spike before token catches up | Swing |
-| `fear_greed_contrarian` | Extreme Fear (<15) or Extreme Greed (>85) plays | Position |
+| `mean_reversion` | Price >3% below VWAP + RSI <30 (long) or >3% above VWAP + RSI >70 (short) | Swing |
+| `fear_greed_contrarian` | Fear & Greed Index ≤15 (extreme fear long) or ≥85 (extreme greed short) | Swing |
+| `correlation_break` | Alt diverges >3% from its BTC regression baseline — bets on reversion | Swing |
 
----
+### Event-driven
 
-## Architecture
+| Strategy | Signal | Timeframe |
+|---|---|---|
+| `listing_pump` | New listing on Coinbase / Binance / Kraken / Bybit detected within 30m | Swing |
+| `whale_accumulation` | Net whale flow >$5M out of exchanges in 2h window (accumulation) | Swing |
+| `liquidation_cascade` | >$2M longs liquidated in 10m + OI dropping → ride the cascade; buy exhaustion dip | Scalp/Swing |
 
-```
-src/
-├── types.ts                    # All TypeScript types (start here)
-├── config.ts                   # Parameter defaults + hard bounds
-├── index.ts                    # Main process (WebSocket + polling loops)
-│
-├── strategies/                 # One file per trading strategy
-│   ├── momentum.ts             # Momentum breakout (swing + scalp)
-│   ├── mean-reversion.ts       # VWAP deviation + RSI
-│   ├── listing-pump.ts         # Exchange listing detector
-│   ├── whale-tracker.ts        # Whale flow analysis
-│   ├── funding-extreme.ts      # Funding rate extremes
-│   ├── liquidation-cascade.ts  # Liquidation event detection
-│   ├── orderbook-imbalance.ts  # L2 order book depth
-│   ├── narrative-momentum.ts   # Sector rotation (10 narratives)
-│   ├── correlation-break.ts    # BTC correlation divergence
-│   ├── protocol-revenue.ts     # DeFiLlama fundamentals
-│   └── fear-greed-contrarian.ts # Fear & Greed index extremes
-│
-├── self-healing/
-│   ├── index.ts                # Immediate: loss → diagnosis → parameter patch
-│   └── log-analyzer.ts         # Claude: periodic deep log analysis
-│
-└── storage/
-    └── database.ts             # SQLite: trades, logs, diagnoses, config history
-```
+### Structural / macro
+
+| Strategy | Signal | Timeframe |
+|---|---|---|
+| `funding_extreme` | Perp funding >0.1%/8h (over-leveraged longs → short) or <-0.05% (squeeze → long) | Swing |
+| `orderbook_imbalance` | Bid/ask depth ratio >3× within 1% of price — scalp the wall | Scalp |
+| `narrative_momentum` | Sector social velocity >3× baseline → buy the sector's laggard token | Swing |
+| `protocol_revenue` | DeFiLlama: protocol fees 2× above 7d avg before token price catches up | Swing |
 
 ---
 
 ## Signal sources
 
-| Source | Data | API |
+| Source | What it provides | Why this one |
 |---|---|---|
-| CryptoPanic | News headlines, sentiment | `https://cryptopanic.com/developers/api/` |
-| LunarCrush | Social galaxy score, volume, alt rank | `https://lunarcrush.com/developers` |
-| Twitter/X | Cashtag mentions velocity | X Developer API |
-| Whale Alert | Large wallet transfers | `https://whale-alert.io` |
-| Binance | Funding rates, open interest, liquidations | Binance Futures WS |
-| DeFiLlama | Protocol revenue, TVL | `https://api.llama.fi/overview/fees` |
-| Alternative.me | Fear & Greed Index | `https://api.alternative.me/fng/` |
-| Coinbase Advanced | Real-time prices, order book | Coinbase Advanced Trade WS |
+| **LunarCrush** | Social score, volume, AltRank across Twitter/Reddit/YouTube/TikTok | Single API covers all social signals — no need for separate platform keys |
+| **CryptoPanic** | Crypto news headlines, sentiment | Dedicated news aggregator with token-level filtering |
+| **Whale Alert** | Large on-chain transfers ($3M+) | Best coverage of CEX/DEX/wallet flows |
+| **Binance Futures WS** | Funding rates, open interest, real-time liquidations | Only exchange with public liquidation WebSocket |
+| **DeFiLlama** | Protocol TVL, daily revenue by protocol | Free, accurate, covers 2000+ protocols |
+| **Alternative.me** | Fear & Greed Index | Free, widely cited, no auth required |
+| **Coinbase Advanced WS** | Real-time prices, L2 order book | Primary execution venue |
 
 ---
 
-## Self-healing loop detail
+## Project structure
 
 ```
-Every closed position
-  └─ pnl < -0.5%?
-       ├─ NO  → log win, no changes
-       └─ YES → classifyLossReason()
-                  ├─ entered_pump_top → raise momentumPct (+0.01)
-                  ├─ stop_too_tight   → widen baseTrailPct (+0.01)
-                  ├─ stop_too_wide    → tighten baseTrailPct (-0.01)
-                  ├─ low_qual_score   → raise minQualScore (+2)
-                  ├─ funding_squeeze  → lower fundingThreshold (-0.0001)
-                  └─ unknown          → log for Claude analysis
-
-Every N minutes (configurable, default 60)
-  └─ >= MIN_TRADES_FOR_ANALYSIS closed trades?
-       └─ YES → Claude reads last 200 trades + diagnoses + error logs
-                → returns JSON: { summary, parameterPatch, suggestions }
-                → validate each param against CONFIG_BOUNDS
-                → apply valid changes, reject out-of-bounds changes
-                → log everything to trader.db for audit trail
+kaizen-trader/
+├── src/
+│   ├── types.ts                     # All shared types — start here
+│   ├── config.ts                    # Parameter defaults + hard bounds
+│   ├── index.ts                     # Process entry — attaches all loops
+│   │
+│   ├── strategies/                  # One file per strategy
+│   │   ├── momentum.ts
+│   │   ├── mean-reversion.ts
+│   │   ├── listing-pump.ts
+│   │   ├── whale-tracker.ts
+│   │   ├── funding-extreme.ts
+│   │   ├── liquidation-cascade.ts
+│   │   ├── orderbook-imbalance.ts
+│   │   ├── narrative-momentum.ts
+│   │   ├── correlation-break.ts
+│   │   ├── protocol-revenue.ts
+│   │   └── fear-greed-contrarian.ts
+│   │
+│   ├── self-healing/
+│   │   ├── index.ts                 # Immediate: loss → diagnosis → patch
+│   │   └── log-analyzer.ts         # Claude: periodic deep analysis
+│   │
+│   └── storage/
+│       └── database.ts              # SQLite — trades, logs, diagnoses, config history
+│
+├── scripts/
+│   └── analyze-logs.ts             # Run Claude analysis manually
+│
+├── CLAUDE.md                        # How Claude Code should read and improve this system
+├── .env.example
+└── trader.db                        # Created at runtime (gitignored)
 ```
 
 ---
 
-## Setup
+## Quick start
 
 ```bash
-# 1. Clone and install
-git clone https://github.com/prateek9jain8/self-healing-crypto-trader
-cd self-healing-crypto-trader
+git clone https://github.com/prateekjain98/kaizen-trader
+cd kaizen-trader
 npm install
 
-# 2. Configure
 cp .env.example .env
-# Edit .env — at minimum set ANTHROPIC_API_KEY
-# Leave PAPER_TRADING=true until you've validated the system
+# Fill in at minimum: ANTHROPIC_API_KEY, COINBASE_API_KEY/SECRET
+# Leave PAPER_TRADING=true until you trust the system
 
-# 3. Run
 npm start
+```
 
-# 4. Trigger manual log analysis
+To trigger a manual Claude analysis at any time:
+
+```bash
 npm run analyze
 ```
 
-### Required API keys
+### Minimum required keys
 
-| Key | Required | Purpose |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | Yes (for self-healing) | Claude log analysis |
-| `COINBASE_API_KEY/SECRET` | Yes (for live trading) | Order execution + price feed |
-| `PAPER_TRADING=true` | Strongly recommended first | No real money at risk |
-| `CRYPTOPANIC_TOKEN` | Recommended | News sentiment |
-| `LUNARCRUSH_API_KEY` | Recommended | Social signals |
-| `BINANCE_API_KEY/SECRET` | Optional | Shorts + funding rates |
-| `WHALE_ALERT_API_KEY` | Optional | Whale tracking |
-| `TWITTER_BEARER_TOKEN` | Optional | Social mentions |
+| Key | Required for |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude log analysis (the core self-healing loop) |
+| `COINBASE_API_KEY` + `COINBASE_API_SECRET` | Price feed + order execution |
+
+Everything else is optional — strategies degrade gracefully when their data source isn't configured.
 
 ---
 
-## Risk management
+## Configuration
 
-- **Circuit breaker**: halts new trades if daily drawdown exceeds `MAX_DAILY_LOSS_USD`
-- **Position sizing**: configurable max per trade, respects daily loss limit
-- **Per-symbol cooldown**: won't re-enter a recently closed symbol
-- **Self-healer cap**: max 20 parameter adaptations per session (prevents over-correction)
-- **CONFIG_BOUNDS**: every parameter has hard min/max — Claude can't override these
+All parameters live in `src/config.ts`. The self-healer adjusts these at runtime. Each parameter has a hard bound it cannot exceed:
 
----
-
-## Paper trading vs live
-
-The system defaults to `PAPER_TRADING=true`. In paper mode:
-- All orders are simulated at the current market price
-- No API calls to Coinbase/Binance for order placement
-- Everything else (signal detection, self-healing, logging) runs identically
-- The database logs paper trades with `paper_trading=1` flag
-
-Run paper trading for at least 2 weeks and verify the self-healing loop is improving win rates before enabling live trading.
+```
+momentumPctSwing          default 2%      bounds [1%, 15%]
+momentumPctScalp          default 2.5%    bounds [1.5%, 10%]
+volumeMultiplierSwing     default 2.0×    bounds [1.5×, 5×]
+baseTrailPctSwing         default 7%      bounds [4%, 18%]
+baseTrailPctScalp         default 4%      bounds [2%, 8%]
+minQualScoreSwing         default 55      bounds [45, 85]
+fundingRateExtremeThresh  default 0.1%    bounds [0.05%, 0.5%]
+narrativeVelocityThresh   default 3×      bounds [1.5×, 8×]
+```
 
 ---
 
-## Disclaimer
+## Risk controls
 
-This is an educational project. Crypto trading involves significant risk of loss. The self-healing mechanism improves parameters based on historical patterns — past performance does not guarantee future results. Use `PAPER_TRADING=true` until you fully understand the system's behavior.
+- **Circuit breaker** — halts all new entries if daily drawdown exceeds `MAX_DAILY_LOSS_USD`
+- **Per-symbol cooldown** — won't re-enter a symbol recently exited
+- **Concurrent position cap** — `MAX_OPEN_POSITIONS` (default 5)
+- **Self-healer session cap** — max 20 parameter changes per process lifetime (prevents overcorrection)
+- **Hard parameter bounds** — Claude and the rule-based healer both respect these
+
+---
+
+## Adding a strategy
+
+1. Create `src/strategies/your-strategy.ts`:
+   ```ts
+   export function scanYourStrategy(
+     symbol: string,
+     productId: string,
+     currentPrice: number,
+     config: ScannerConfig,
+     ctx: MarketContext,
+   ): TradeSignal | null {
+     // return a TradeSignal when conditions are met, null otherwise
+   }
+   ```
+2. Add the `StrategyId` to the union in `src/types.ts`
+3. Export from `src/strategies/index.ts`
+
+---
+
+## License
+
+MIT

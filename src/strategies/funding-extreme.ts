@@ -1,5 +1,5 @@
 /**
- * Funding Rate Extreme Strategy (NEW — v1 had funding data but no strategy)
+ * Funding Rate Extreme Strategy
  *
  * Thesis: When perpetual futures funding rates are extremely high (longs paying),
  * the market is over-leveraged long — price often corrects as longs get liquidated.
