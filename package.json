@@ -5,9 +5,8 @@
   "private": false,
   "scripts": {
     "start": "tsx src/index.ts",
-    "backtest": "tsx scripts/backtest.ts",
     "analyze": "tsx scripts/analyze-logs.ts",
-    "seed": "tsx scripts/seed.ts",
+    "performance": "tsx scripts/performance.ts",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit"
   },

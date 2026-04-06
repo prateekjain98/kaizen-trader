@@ -1,15 +1,27 @@
 /**
- * Claude-Powered Log Analyzer — the "self-healing via Claude Code" core loop.
+ * Claude-powered log analyzer — the core self-improving loop.
  *
- * Every N minutes (default: 60), this module:
- *  1. Reads the last M closed trades + all diagnoses from the DB
- *  2. Sends them to Claude with a structured prompt
- *  3. Claude returns a JSON patch of parameter recommendations + reasoning
- *  4. We validate the patch against CONFIG_BOUNDS and apply it
- *  5. Everything is logged so the next analysis builds on it
+ * Design philosophy:
+ *   The in-process self-healer (index.ts) handles fast, local corrections:
+ *   one loss → one parameter patch. It's essentially a PID controller.
  *
- * Run standalone:  tsx scripts/analyze-logs.ts
- * Or scheduled:    setInterval(runAnalysis, env.logAnalysisIntervalMins * 60_000)
+ *   This module handles a fundamentally different problem: patterns that
+ *   only emerge across many trades — strategy interactions, time-of-day
+ *   effects, market regime correlations, signal quality drift.
+ *
+ *   Claude's reasoning is better suited for this than hand-coded heuristics.
+ *   We give it institutional-quality metrics, raw trade data, and the full
+ *   history of previous self-healer actions, then ask it to think in steps.
+ *
+ * Prompt design notes:
+ *   - Chain-of-thought: Claude reasons before producing the JSON patch
+ *   - Few-shot examples in the schema description prevent format errors
+ *   - Hard bounds are included in the prompt (not just enforced in code)
+ *   - We ask for confidence levels so low-confidence patches are discarded
+ *   - "newStrategySuggestions" surfaces ideas we can implement as new files
+ *
+ * This is the same two-gate pattern we used at Salesmonk for LLM evals:
+ * quantitative metrics gate + LLM reasoning gate, in sequence.
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -17,175 +29,222 @@ import { z } from 'zod';
 import { env } from '../config.js';
 import { CONFIG_BOUNDS, defaultScannerConfig } from '../config.js';
 import { getClosedTrades, getRecentDiagnoses, getRecentLogs, snapshotConfig, log } from '../storage/database.js';
+import { computeMetrics, formatMetrics } from '../evaluation/metrics.js';
 import type { ScannerConfig } from '../types.js';
 
-// ─── Response schema ───────────────────────────────────────────────────────
+// ─── Response schema ───────────────────────────────────────────────────────────
 
 const StrategyInsightSchema = z.object({
-  strategy: z.string(),
-  winRate: z.number().optional(),
-  avgPnlPct: z.number().optional(),
-  observation: z.string(),
+  strategy:       z.string(),
+  verdict:        z.enum(['performing_well', 'underperforming', 'needs_disable', 'needs_more_data']),
+  observation:    z.string(),
   recommendation: z.string(),
 });
 
-const ParameterPatchSchema = z.record(z.string(), z.number());
-
-const AnalysisResponseSchema = z.object({
-  summary: z.string(),
-  topIssues: z.array(z.string()),
-  strategyInsights: z.array(StrategyInsightSchema),
-  parameterPatch: ParameterPatchSchema,
-  newStrategySuggestions: z.array(z.string()),
-  confidenceLevel: z.enum(['low', 'medium', 'high']),
+const ParameterChangeSchema = z.object({
+  parameter:    z.string(),
+  currentValue: z.number(),
+  proposedValue: z.number(),
+  evidence:     z.string(), // what specifically in the data supports this change
+  confidence:   z.enum(['low', 'medium', 'high']),
 });
 
-type AnalysisResponse = z.infer<typeof AnalysisResponseSchema>;
+const AnalysisSchema = z.object({
+  chainOfThought:         z.string(),    // Claude's reasoning before conclusions
+  summary:                z.string(),
+  topIssues:              z.array(z.string()),
+  strategyInsights:       z.array(StrategyInsightSchema),
+  parameterChanges:       z.array(ParameterChangeSchema),
+  newStrategySuggestions: z.array(z.string()),
+  overallHealthScore:     z.number().min(0).max(100),
+});
 
-// ─── Prompt builder ───────────────────────────────────────────────────────
+type Analysis = z.infer<typeof AnalysisSchema>;
 
-function buildPrompt(
-  trades: ReturnType<typeof getClosedTrades>,
-  diagnoses: ReturnType<typeof getRecentDiagnoses>,
-  recentLogs: ReturnType<typeof getRecentLogs>,
-  currentConfig: ScannerConfig,
-): string {
-  const tradeStats = trades.reduce<Record<string, { wins: number; losses: number; totalPnl: number }>>((acc, t) => {
-    if (!acc[t.strategy]) acc[t.strategy] = { wins: 0, losses: 0, totalPnl: 0 };
-    const s = acc[t.strategy]!;
-    const pnl = t.pnlPct ?? 0;
-    if (pnl > 0) s.wins++; else s.losses++;
-    s.totalPnl += pnl;
-    return acc;
-  }, {});
+// ─── Prompt ───────────────────────────────────────────────────────────────────
 
-  const errorLogs = recentLogs
-    .filter(l => l.level === 'error' || l.level === 'warn')
-    .slice(0, 20)
-    .map(l => `[${l.level}] ${l.message}`)
+function buildPrompt(config: ScannerConfig): string {
+  const trades = getClosedTrades(300);
+  const diagnoses = getRecentDiagnoses(50);
+  const errorLogs = getRecentLogs(200).filter(l => l.level === 'error' || l.level === 'warn').slice(0, 30);
+  const metrics = computeMetrics(300);
+  const metricsStr = formatMetrics(metrics);
+
+  const configSnapshot = Object.fromEntries(
+    Object.entries(config).map(([k, v]) => [k, v])
+  );
+
+  const recentTrades = trades.slice(0, 100).map(t => ({
+    symbol: t.symbol,
+    strategy: t.strategy,
+    side: t.side,
+    tier: t.tier,
+    pnlPct: t.pnlPct?.toFixed(4),
+    holdHours: t.closedAt ? ((t.closedAt - t.openedAt) / 3_600_000).toFixed(1) : null,
+    exitReason: t.exitReason,
+    qualScore: t.qualScore,
+    openedAt: t.openedAt ? new Date(t.openedAt).toISOString() : null,
+  }));
+
+  const parameterBoundsSummary = Object.entries(CONFIG_BOUNDS)
+    .map(([k, [min, max]]) => `  ${k}: [${min}, ${max}]`)
     .join('\n');
 
-  return `You are analyzing a self-healing crypto trading system. Your job is to review the trading history and recommend specific parameter improvements.
+  return `You are a quantitative trading analyst reviewing the performance of an autonomous crypto trading system.
+
+Your job is to:
+1. Reason through the data step by step (chain of thought)
+2. Identify specific problems backed by evidence
+3. Recommend targeted parameter changes with supporting data
+4. Surface patterns that require new strategy logic
 
 ## Current Configuration
-${JSON.stringify(currentConfig, null, 2)}
+\`\`\`json
+${JSON.stringify(configSnapshot, null, 2)}
+\`\`\`
 
-## Parameter Bounds (hard limits you MUST stay within)
-${JSON.stringify(CONFIG_BOUNDS, null, 2)}
+## Hard Parameter Bounds (you MUST stay within these)
+${parameterBoundsSummary}
 
-## Trade Statistics by Strategy (last ${trades.length} closed trades)
-${JSON.stringify(tradeStats, null, 2)}
+## Performance Metrics (last ${metrics.totalTrades} closed trades)
+\`\`\`
+${metricsStr}
+\`\`\`
 
-## Recent Closed Trades (last 50)
-${JSON.stringify(trades.slice(0, 50).map(t => ({
-  symbol: t.symbol,
-  strategy: t.strategy,
-  side: t.side,
-  tier: t.tier,
-  pnlPct: t.pnlPct?.toFixed(4),
-  holdMs: t.closedAt ? t.closedAt - t.openedAt : null,
-  exitReason: t.exitReason,
-  qualScore: t.qualScore,
-})), null, 2)}
+## Recent Trade History (last 100)
+\`\`\`json
+${JSON.stringify(recentTrades, null, 2)}
+\`\`\`
 
-## Recent Self-Healer Diagnoses (last 20)
-${JSON.stringify(diagnoses.slice(0, 20), null, 2)}
+## Self-Healer Diagnosis History (last 50 adaptations)
+\`\`\`json
+${JSON.stringify(diagnoses.slice(0, 50), null, 2)}
+\`\`\`
 
 ## Recent Error/Warning Logs
-${errorLogs || '(none)'}
+${errorLogs.map(l => `[${l.level.toUpperCase()}] ${l.symbol ? '[' + l.symbol + '] ' : ''}${l.message}`).join('\n') || '(none)'}
 
-## Your Task
-Analyze this data and return a JSON object with this exact structure:
+---
+
+## Instructions
+
+Think through the data carefully before producing your output. Look for:
+
+1. **Strategy-level patterns**: Is a specific strategy consistently losing? What's the common exit reason and hold time for its losses vs wins?
+
+2. **Timing patterns**: Are losses clustered at specific hold durations (e.g., all scalp losses exit in <30m — stop too tight)?
+
+3. **Over-correction risk**: The self-healer has already made adaptations. Look at the diagnosis history — has it been patching the same parameter repeatedly? That may indicate a deeper issue the rule-based healer can't see.
+
+4. **Signal quality drift**: Are qual scores on losing trades near the minimum threshold? That suggests the threshold should be higher, or that certain signal combinations are low-quality.
+
+5. **Interaction effects**: Do certain strategy + market phase combinations consistently underperform?
+
+## Output Format
+
+Return a JSON object with this exact structure (no markdown, no preamble):
 
 {
-  "summary": "2-3 sentence overall assessment",
-  "topIssues": ["issue 1", "issue 2", ...],  // up to 5 specific problems
+  "chainOfThought": "Your step-by-step reasoning before conclusions...",
+  "summary": "2-3 sentence overall assessment of system health",
+  "topIssues": ["specific issue 1", "specific issue 2", ...],
   "strategyInsights": [
     {
       "strategy": "strategy_id",
-      "winRate": 0.0–1.0,
-      "avgPnlPct": number,
-      "observation": "what you see",
-      "recommendation": "what to change"
+      "verdict": "performing_well | underperforming | needs_disable | needs_more_data",
+      "observation": "what the data shows",
+      "recommendation": "specific action"
     }
   ],
-  "parameterPatch": {
-    // Only include parameters you want to change. Must stay within CONFIG_BOUNDS.
-    "momentumPctSwing": 0.03,  // example
-    ...
-  },
-  "newStrategySuggestions": ["suggestion 1", ...],  // ideas for new strategies based on patterns
-  "confidenceLevel": "low" | "medium" | "high"
+  "parameterChanges": [
+    {
+      "parameter": "exactParameterName",
+      "currentValue": 0.02,
+      "proposedValue": 0.03,
+      "evidence": "momentum_scalp has 8 losses where hold_hours < 0.5 — exit too fast suggests stop too tight",
+      "confidence": "low | medium | high"
+    }
+  ],
+  "newStrategySuggestions": [
+    "Suggestion for a new strategy based on patterns in the data"
+  ],
+  "overallHealthScore": 72
 }
 
 IMPORTANT:
-- Only recommend parameter changes where you have clear evidence from the data
-- Do not change parameters without clear reasoning
-- Stay strictly within CONFIG_BOUNDS for all numeric values
-- If a strategy is performing well, say so and don't change its parameters
-- Return ONLY valid JSON, no markdown, no explanation outside the JSON`;
+- Only recommend changes where the data provides clear evidence
+- Do not change parameters with high confidence unless you have >15 data points
+- If a strategy has <10 trades, verdict should be "needs_more_data"
+- If the self-healer has already adjusted a parameter 3+ times, explain why your adjustment is different
+- Stay strictly within CONFIG_BOUNDS`;
 }
 
-// ─── Apply validated patch ────────────────────────────────────────────────
+// ─── Apply validated parameter patch ─────────────────────────────────────────
 
-function applyPatch(config: ScannerConfig, patch: Record<string, number>): { applied: string[]; rejected: string[] } {
+function applyChanges(config: ScannerConfig, changes: Analysis['parameterChanges']): {
+  applied: string[];
+  rejected: string[];
+} {
   const applied: string[] = [];
   const rejected: string[] = [];
 
-  for (const [rawKey, rawValue] of Object.entries(patch)) {
-    const key = rawKey as keyof ScannerConfig;
+  for (const change of changes) {
+    // Skip low-confidence changes
+    if (change.confidence === 'low') {
+      rejected.push(`${change.parameter} — confidence too low (${change.confidence})`);
+      continue;
+    }
+
+    const key = change.parameter as keyof ScannerConfig;
     const bounds = CONFIG_BOUNDS[key];
 
     if (!bounds) {
-      rejected.push(`${key} — unknown parameter`);
+      rejected.push(`${change.parameter} — unknown parameter`);
       continue;
     }
 
-    if (typeof rawValue !== 'number' || isNaN(rawValue)) {
-      rejected.push(`${key} — non-numeric value: ${String(rawValue)}`);
+    if (typeof change.proposedValue !== 'number' || isNaN(change.proposedValue)) {
+      rejected.push(`${change.parameter} — non-numeric value`);
       continue;
     }
 
-    if (rawValue < bounds[0] || rawValue > bounds[1]) {
-      rejected.push(`${key}=${rawValue} out of bounds [${bounds[0]}, ${bounds[1]}]`);
+    if (change.proposedValue < bounds[0] || change.proposedValue > bounds[1]) {
+      rejected.push(`${change.parameter}=${change.proposedValue} — out of bounds [${bounds[0]}, ${bounds[1]}]`);
       continue;
     }
 
     const old = config[key];
-    (config as Record<string, number>)[key] = rawValue;
-    applied.push(`${key}: ${String(old)} → ${rawValue}`);
+    (config as Record<string, number>)[key] = change.proposedValue;
+    applied.push(`${change.parameter}: ${String(old)} → ${change.proposedValue} (${change.evidence.slice(0, 80)})`);
   }
 
   return { applied, rejected };
 }
 
-// ─── Main analysis loop ───────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
-export async function runAnalysis(config: ScannerConfig): Promise<AnalysisResponse | null> {
+export async function runAnalysis(config: ScannerConfig): Promise<Analysis | null> {
   if (!env.anthropicApiKey) {
     log('warn', 'Log analyzer skipped — ANTHROPIC_API_KEY not set');
     return null;
   }
 
-  const closedTrades = getClosedTrades(200);
-  if (closedTrades.length < env.minTradesForAnalysis) {
-    log('info', `Log analyzer skipped — only ${closedTrades.length}/${env.minTradesForAnalysis} trades`);
+  const tradeCount = getClosedTrades(1).length;
+  if (tradeCount < env.minTradesForAnalysis) {
+    log('info', `Log analyzer skipped — ${tradeCount}/${env.minTradesForAnalysis} trades needed`);
     return null;
   }
 
-  log('info', `Running Claude log analysis on ${closedTrades.length} trades...`);
+  log('info', `Running Claude analysis (${tradeCount} closed trades)...`);
 
-  const diagnoses = getRecentDiagnoses(50);
-  const recentLogs = getRecentLogs(100);
-  const prompt = buildPrompt(closedTrades, diagnoses, recentLogs, config);
-
+  const prompt = buildPrompt(config);
   const client = new Anthropic({ apiKey: env.anthropicApiKey });
 
-  let rawResponse: string;
+  let rawText: string;
   try {
     const message = await client.messages.create({
       model: 'claude-opus-4-6',
-      max_tokens: 2048,
+      max_tokens: 4096,
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -194,28 +253,27 @@ export async function runAnalysis(config: ScannerConfig): Promise<AnalysisRespon
       log('error', 'Log analyzer: unexpected response shape from Claude');
       return null;
     }
-    rawResponse = block.text;
+    rawText = block.text;
   } catch (err) {
     log('error', `Log analyzer: Claude API error — ${String(err)}`);
     return null;
   }
 
-  // Parse and validate
+  // Parse — strip any accidental markdown fences
   let parsed: unknown;
   try {
-    // Strip any markdown code fences if present
-    const jsonStr = rawResponse.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '');
+    const jsonStr = rawText.replace(/^```(?:json)?\s*/m, '').replace(/\s*```$/m, '').trim();
     parsed = JSON.parse(jsonStr);
   } catch {
     log('error', 'Log analyzer: failed to parse Claude response as JSON', {
-      data: { preview: rawResponse.slice(0, 200) },
+      data: { preview: rawText.slice(0, 300) },
     });
     return null;
   }
 
-  const result = AnalysisResponseSchema.safeParse(parsed);
+  const result = AnalysisSchema.safeParse(parsed);
   if (!result.success) {
-    log('error', 'Log analyzer: Claude response failed schema validation', {
+    log('error', 'Log analyzer: Claude response failed Zod validation', {
       data: { errors: result.error.flatten() },
     });
     return null;
@@ -223,26 +281,25 @@ export async function runAnalysis(config: ScannerConfig): Promise<AnalysisRespon
 
   const analysis = result.data;
 
-  // Apply parameter patch
-  const { applied, rejected } = applyPatch(config, analysis.parameterPatch);
+  // Apply changes (only medium/high confidence)
+  const { applied, rejected } = applyChanges(config, analysis.parameterChanges);
 
-  snapshotConfig(config, `claude-analysis: ${analysis.summary.slice(0, 80)}`);
+  if (applied.length > 0 || rejected.length > 0) {
+    snapshotConfig(config, `claude-analysis: ${analysis.summary.slice(0, 100)}`);
+  }
 
-  log('heal', `Claude analysis complete (confidence=${analysis.confidenceLevel})`, {
+  log('heal', `Claude analysis complete — health=${analysis.overallHealthScore}/100`, {
     data: {
       summary: analysis.summary,
       topIssues: analysis.topIssues,
-      applied,
-      rejected,
+      appliedChanges: applied,
+      rejectedChanges: rejected,
       newStrategySuggestions: analysis.newStrategySuggestions,
     },
   });
 
   if (applied.length > 0) {
-    log('info', `Applied ${applied.length} parameter changes from Claude analysis:\n  ${applied.join('\n  ')}`);
-  }
-  if (rejected.length > 0) {
-    log('warn', `Rejected ${rejected.length} parameter changes (out of bounds or unknown):\n  ${rejected.join('\n  ')}`);
+    log('info', `Applied ${applied.length} parameter changes:\n  ${applied.join('\n  ')}`);
   }
 
   return analysis;
