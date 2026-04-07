@@ -5,6 +5,7 @@ import time
 import requests
 
 from src.config import env
+from src.signals._circuit_breaker import CircuitBreaker
 from src.storage.database import log
 
 MIN_USD = 3_000_000
@@ -12,6 +13,7 @@ _seen_tx_ids: set[str] = set()
 _last_cursor: int = 0
 _last_fetch_at: float = 0
 _POLL_INTERVAL_MS = 120_000
+_breaker = CircuitBreaker("whale")
 
 
 def _to_wallet_type(owner_type: str) -> str:
@@ -33,6 +35,14 @@ def poll_whale_alerts(symbols: list[str]) -> None:
     if now - _last_fetch_at < _POLL_INTERVAL_MS:
         return
 
+    # Staleness warning
+    if _last_fetch_at > 0 and now - _last_fetch_at > 2 * _POLL_INTERVAL_MS:
+        log("warn", f"Whale alert data is stale (last fetch {(now - _last_fetch_at) / 60_000:.0f}m ago)")
+
+    if not _breaker.can_call():
+        log("warn", "Whale alert circuit breaker OPEN — skipping poll")
+        return
+
     since = _last_cursor or int((now - 7_200_000) / 1000)
     url = (
         f"https://api.whale-alert.io/v1/transactions"
@@ -43,10 +53,14 @@ def poll_whale_alerts(symbols: list[str]) -> None:
         res = requests.get(url, timeout=8)
         if res.status_code != 200:
             log("warn", f"Whale Alert fetch failed: {res.status_code}")
+            _breaker.record_failure()
             return
         data = res.json()
         if data.get("result") != "success":
+            _breaker.record_failure()
             return
+
+        _breaker.record_success()
 
         # Lazy import to avoid circular dependency
         from src.strategies.whale_tracker import on_whale_transfer
@@ -87,3 +101,4 @@ def poll_whale_alerts(symbols: list[str]) -> None:
 
     except Exception as err:
         log("warn", f"Whale Alert network error: {err}")
+        _breaker.record_failure()

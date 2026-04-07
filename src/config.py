@@ -1,6 +1,7 @@
 """Configuration — environment variables, default scanner config, and parameter bounds."""
 
 import os
+from dataclasses import fields as dataclass_fields
 from dotenv import load_dotenv
 from src.types import ScannerConfig
 
@@ -73,3 +74,27 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "narrative_velocity_threshold":  (1.5, 8.0),
     "max_watchlist":                 (10, 200),
 }
+
+
+def validate_config(config: ScannerConfig) -> list[str]:
+    """Check every ScannerConfig field against CONFIG_BOUNDS.
+
+    Returns a list of human-readable violation strings.
+    An empty list means the config is valid.
+    """
+    violations: list[str] = []
+    for f in dataclass_fields(config):
+        name = f.name
+        if name not in CONFIG_BOUNDS:
+            continue
+        lo, hi = CONFIG_BOUNDS[name]
+        value = getattr(config, name)
+        if value < lo:
+            violations.append(
+                f"{name}={value} is below minimum {lo}"
+            )
+        elif value > hi:
+            violations.append(
+                f"{name}={value} is above maximum {hi}"
+            )
+    return violations

@@ -2,10 +2,12 @@
 
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import requests
 
 from src.config import env
+from src.signals._circuit_breaker import CircuitBreaker
 from src.storage.database import log
 
 
@@ -18,12 +20,49 @@ class SocialSentiment:
     velocity_multiple: float
     sentiment: float
     sampled_at: float
+    # Extended sentiment breakdown
+    positive_pct: float = 0.0     # % positive mentions
+    negative_pct: float = 0.0     # % negative mentions
+    neutral_pct: float = 0.0      # % neutral mentions
+    social_volume_24h_change: float = 0.0  # % change in social volume over 24h
+    alt_rank_change_24h: int = 0  # rank change (negative = improving)
 
 
 _volume_history: dict[str, list[float]] = {}
 _last_fetch_at: float = 0
 _cached: list[SocialSentiment] = []
 _CACHE_TTL_MS = 180_000
+_breaker = CircuitBreaker("social")
+
+# Rate limit tracking for /topic/ endpoint
+_topic_requests_this_minute: int = 0
+_topic_minute_start: float = 0
+_MAX_TOPIC_PER_MINUTE = 3
+
+# Cache for topic endpoint
+_topic_cache: dict[str, SocialSentiment] = {}
+_topic_cache_at: dict[str, float] = {}
+_TOPIC_CACHE_TTL_MS = 180_000
+
+
+def _can_call_topic() -> bool:
+    """Check if we're within the topic endpoint rate limit budget."""
+    global _topic_requests_this_minute, _topic_minute_start
+    now = time.time()
+    if now - _topic_minute_start >= 60:
+        _topic_requests_this_minute = 0
+        _topic_minute_start = now
+    return _topic_requests_this_minute < _MAX_TOPIC_PER_MINUTE
+
+
+def _record_topic_call() -> None:
+    """Record a topic endpoint call for rate limiting."""
+    global _topic_requests_this_minute, _topic_minute_start
+    now = time.time()
+    if now - _topic_minute_start >= 60:
+        _topic_requests_this_minute = 0
+        _topic_minute_start = now
+    _topic_requests_this_minute += 1
 
 
 def _compute_velocity(symbol: str, current_volume: float) -> float:
@@ -57,8 +96,17 @@ def fetch_social_sentiment(symbols: list[str]) -> list[SocialSentiment]:
     if now - _last_fetch_at < _CACHE_TTL_MS:
         return _cached
 
+    # Staleness warning
+    if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
+        log("warn", f"Social data is stale (last fetch {(now - _last_fetch_at) / 60_000:.0f}m ago)")
+
+    if not _breaker.can_call():
+        log("warn", "Social circuit breaker OPEN — returning cached data")
+        return _cached
+
     results: list[SocialSentiment] = []
     chunks = [symbols[i:i+10] for i in range(0, len(symbols), 10)]
+    any_success = False
 
     for chunk in chunks:
         url = f"https://lunarcrush.com/api4/public/coins/list/v2?symbols={','.join(chunk)}&key={env.lunarcrush_api_key}"
@@ -68,6 +116,7 @@ def fetch_social_sentiment(symbols: list[str]) -> list[SocialSentiment]:
                 log("warn", f"LunarCrush fetch failed: {res.status_code}")
                 continue
             data = res.json()
+            any_success = True
             for asset in data.get("data", []):
                 sym = asset["symbol"].upper()
                 if sym not in chunk:
@@ -81,10 +130,123 @@ def fetch_social_sentiment(symbols: list[str]) -> list[SocialSentiment]:
                     velocity_multiple=velocity,
                     sentiment=_galaxy_to_sentiment(asset.get("galaxy_score", 50)) + (0.2 if velocity > 3 else 0),
                     sampled_at=now,
+                    positive_pct=asset.get("sentiment_positive_pct", 0.0),
+                    negative_pct=asset.get("sentiment_negative_pct", 0.0),
+                    neutral_pct=asset.get("sentiment_neutral_pct", 0.0),
+                    social_volume_24h_change=asset.get("social_volume_24h_change", 0.0),
+                    alt_rank_change_24h=int(asset.get("alt_rank_change_24h", 0)),
                 ))
         except Exception as err:
             log("warn", f"LunarCrush network error: {err}")
 
+    if any_success:
+        _breaker.record_success()
+    elif chunks:
+        _breaker.record_failure()
+
     _last_fetch_at = now
     _cached = results
     return results
+
+
+def fetch_topic_sentiment(symbol: str) -> Optional[SocialSentiment]:
+    """Fetch real-time social data via /topic/:topic endpoint.
+
+    LunarCrush's AI-optimized endpoint with richer sentiment breakdown.
+    Budget: 3 req/min for top-3 active symbols.
+    """
+    if not env.lunarcrush_api_key:
+        return None
+
+    now = time.time() * 1000
+
+    # Check topic cache
+    if symbol in _topic_cache and symbol in _topic_cache_at:
+        if now - _topic_cache_at[symbol] < _TOPIC_CACHE_TTL_MS:
+            return _topic_cache[symbol]
+
+    if not _can_call_topic():
+        log("warn", f"Topic endpoint rate limit reached — returning cached data for {symbol}")
+        return _topic_cache.get(symbol)
+
+    if not _breaker.can_call():
+        log("warn", "Social circuit breaker OPEN — returning cached topic data")
+        return _topic_cache.get(symbol)
+
+    # LunarCrush topic uses the coin name, but we pass symbol for simplicity
+    topic = symbol.lower()
+    url = f"https://lunarcrush.com/api4/public/topic/{topic}?key={env.lunarcrush_api_key}"
+
+    try:
+        _record_topic_call()
+        res = requests.get(url, timeout=8)
+        if res.status_code != 200:
+            log("warn", f"LunarCrush topic fetch failed: {res.status_code}")
+            _breaker.record_failure()
+            return _topic_cache.get(symbol)
+
+        data = res.json().get("data", {})
+        _breaker.record_success()
+
+        velocity = _compute_velocity(symbol, data.get("social_volume", 0))
+        sentiment_obj = SocialSentiment(
+            symbol=symbol.upper(),
+            galaxy_score=data.get("galaxy_score", 50),
+            alt_rank=data.get("alt_rank", 999),
+            social_volume=data.get("social_volume", 0),
+            velocity_multiple=velocity,
+            sentiment=_galaxy_to_sentiment(data.get("galaxy_score", 50)) + (0.2 if velocity > 3 else 0),
+            sampled_at=now,
+            positive_pct=data.get("sentiment_positive_pct", 0.0),
+            negative_pct=data.get("sentiment_negative_pct", 0.0),
+            neutral_pct=data.get("sentiment_neutral_pct", 0.0),
+            social_volume_24h_change=data.get("social_volume_24h_change", 0.0),
+            alt_rank_change_24h=int(data.get("alt_rank_change_24h", 0)),
+        )
+
+        _topic_cache[symbol] = sentiment_obj
+        _topic_cache_at[symbol] = now
+        return sentiment_obj
+
+    except Exception as err:
+        log("warn", f"LunarCrush topic network error: {err}")
+        _breaker.record_failure()
+        return _topic_cache.get(symbol)
+
+
+def fetch_social_time_series(symbol: str, interval: str = "1d",
+                              data_points: int = 7) -> list[dict]:
+    """Fetch historical social data via /public/topic/:topic/time-series/v2.
+
+    Returns hourly/daily social metrics for trend detection.
+    Budget: 2 req/min.
+    """
+    if not env.lunarcrush_api_key:
+        return []
+
+    if not _breaker.can_call():
+        log("warn", "Social circuit breaker OPEN — skipping time series fetch")
+        return []
+
+    topic = symbol.lower()
+    url = (
+        f"https://lunarcrush.com/api4/public/topic/{topic}/time-series/v2"
+        f"?interval={interval}&data_points={data_points}"
+        f"&key={env.lunarcrush_api_key}"
+    )
+
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            log("warn", f"LunarCrush time-series fetch failed: {res.status_code}")
+            _breaker.record_failure()
+            return []
+
+        data = res.json().get("data", [])
+        _breaker.record_success()
+        return data
+
+    except Exception as err:
+        log("warn", f"LunarCrush time-series network error: {err}")
+        _breaker.record_failure()
+        return []

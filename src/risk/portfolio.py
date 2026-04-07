@@ -1,12 +1,14 @@
-"""Portfolio-level risk manager."""
+"""Portfolio-level risk manager — now powered by declarative ProtectionChain."""
 
 import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import env
+from src.risk.protections import ProtectionChain, ProtectionContext, DEFAULT_PROTECTIONS
 from src.storage.database import log
 from src.types import Position
 
@@ -22,77 +24,117 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+_lock = threading.RLock()  # RLock: _get_chain() may re-enter from can_open/register_close
 _daily_stats = DailyStats(date=_today_utc())
-_circuit_breaker_open = False
 _open_positions: dict[str, Position] = {}
 _daily_returns: list[float] = []
+_protection_chain: Optional[ProtectionChain] = None
+
+
+def init_protections(config_list: Optional[list[dict]] = None) -> None:
+    """Initialize the protection chain. Call once at startup."""
+    global _protection_chain
+    with _lock:
+        _protection_chain = ProtectionChain.from_config(config_list or DEFAULT_PROTECTIONS)
+        rule_names = [r.name for r in _protection_chain.rules]
+    log("info", f"Protection chain initialized: {', '.join(rule_names)}")
+
+
+def _get_chain() -> ProtectionChain:
+    """Lazy-init the chain if not explicitly initialized."""
+    global _protection_chain
+    with _lock:
+        if _protection_chain is None:
+            _protection_chain = ProtectionChain.from_config(DEFAULT_PROTECTIONS)
+        return _protection_chain
 
 
 def _maybe_reset_day() -> None:
-    global _daily_stats, _circuit_breaker_open
+    global _daily_stats
     today = _today_utc()
-    if _daily_stats.date != today:
-        if _daily_stats.realized_pnl != 0:
-            _daily_returns.append(_daily_stats.realized_pnl)
-            if len(_daily_returns) > 365:
-                _daily_returns.pop(0)
-        _daily_stats = DailyStats(date=today)
-        _circuit_breaker_open = False
+    reset_needed = False
+    with _lock:
+        if _daily_stats.date != today:
+            if _daily_stats.realized_pnl != 0:
+                _daily_returns.append(_daily_stats.realized_pnl)
+                if len(_daily_returns) > 365:
+                    _daily_returns.pop(0)
+            _daily_stats = DailyStats(date=today)
+            reset_needed = True
+    if reset_needed:
+        _get_chain().reset_day()
         log("info", f"Daily stats reset for {today}")
 
 
 def can_open_position() -> bool:
     _maybe_reset_day()
-    if _circuit_breaker_open:
-        log("warn", f"Circuit breaker OPEN — daily loss ${-_daily_stats.realized_pnl:.2f} exceeded ${env.max_daily_loss_usd}")
-        return False
-    if len(_open_positions) >= env.max_open_positions:
-        log("info", f"Position cap reached ({len(_open_positions)}/{env.max_open_positions})")
+    with _lock:
+        chain = _get_chain()
+        ctx = ProtectionContext(
+            realized_pnl_today=_daily_stats.realized_pnl,
+            open_position_count=len(_open_positions),
+            timestamp_ms=time.time() * 1000,
+        )
+        verdict = chain.can_open(ctx)
+    if not verdict.allowed:
+        log("warn", f"Blocked by {verdict.rule_name}: {verdict.reason}")
         return False
     return True
 
 
 def register_open(position: Position) -> None:
-    _open_positions[position.id] = position
+    with _lock:
+        _open_positions[position.id] = position
 
 
 def register_close(position: Position, pnl_usd: float) -> None:
-    global _circuit_breaker_open
-    _open_positions.pop(position.id, None)
     _maybe_reset_day()
-    _daily_stats.realized_pnl += pnl_usd
-    _daily_stats.trade_count += 1
-    if _daily_stats.realized_pnl < -env.max_daily_loss_usd:
-        _circuit_breaker_open = True
-        log("warn", f"CIRCUIT BREAKER TRIGGERED — daily loss ${-_daily_stats.realized_pnl:.2f} > ${env.max_daily_loss_usd}")
+    with _lock:
+        _open_positions.pop(position.id, None)
+        _daily_stats.realized_pnl += pnl_usd
+        _daily_stats.trade_count += 1
+        _get_chain().notify_close(position, pnl_usd)
 
 
 def update_position_price(position_id: str, current_price: float) -> None:
-    pos = _open_positions.get(position_id)
-    if pos:
-        pos.current_price = current_price
+    with _lock:
+        pos = _open_positions.get(position_id)
+        if pos:
+            pos.current_price = current_price
 
 
 def get_open_positions() -> list[Position]:
-    return list(_open_positions.values())
+    with _lock:
+        return list(_open_positions.values())
 
 
 def get_daily_stats() -> DailyStats:
     _maybe_reset_day()
-    return DailyStats(date=_daily_stats.date, realized_pnl=_daily_stats.realized_pnl, trade_count=_daily_stats.trade_count)
+    with _lock:
+        return DailyStats(date=_daily_stats.date, realized_pnl=_daily_stats.realized_pnl, trade_count=_daily_stats.trade_count)
 
 
 def is_circuit_breaker_open() -> bool:
+    """Legacy API — checks if the chain would block a new position."""
     _maybe_reset_day()
-    return _circuit_breaker_open
+    with _lock:
+        chain = _get_chain()
+        ctx = ProtectionContext(
+            realized_pnl_today=_daily_stats.realized_pnl,
+            open_position_count=len(_open_positions),
+            timestamp_ms=time.time() * 1000,
+        )
+        return not chain.can_open(ctx).allowed
 
 
 def compute_sharpe(risk_free_rate_annual: float = 0.05) -> Optional[float]:
-    if len(_daily_returns) < 30:
+    with _lock:
+        returns_snapshot = list(_daily_returns)
+    if len(returns_snapshot) < 30:
         return None
-    n = len(_daily_returns)
-    mean = sum(_daily_returns) / n
-    variance = sum((r - mean) ** 2 for r in _daily_returns) / (n - 1)
+    n = len(returns_snapshot)
+    mean = sum(returns_snapshot) / n
+    variance = sum((r - mean) ** 2 for r in returns_snapshot) / (n - 1)
     std_dev = math.sqrt(variance)
     if std_dev == 0:
         return None
@@ -101,10 +143,12 @@ def compute_sharpe(risk_free_rate_annual: float = 0.05) -> Optional[float]:
 
 
 def compute_max_drawdown() -> float:
-    if not _daily_returns:
+    with _lock:
+        returns_snapshot = list(_daily_returns)
+    if not returns_snapshot:
         return 0
     peak = equity = max_dd = 0.0
-    for r in _daily_returns:
+    for r in returns_snapshot:
         equity += r
         if equity > peak:
             peak = equity

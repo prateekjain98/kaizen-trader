@@ -19,10 +19,20 @@ _swing_buffers: dict[str, list[PriceSample]] = {}
 _scalp_buffers: dict[str, list[PriceSample]] = {}
 _cooldowns: dict[str, float] = {}
 
+_MAX_SYMBOLS = 500  # prevent unbounded growth of per-symbol buffers
+
 
 def push_price_sample(symbol: str, price: float, volume_24h: float) -> None:
     now = time.time() * 1000
     sample = PriceSample(price=price, volume_24h=volume_24h, ts=now)
+
+    # Evict oldest symbols if we exceed the max to prevent unbounded growth
+    if symbol not in _swing_buffers and len(_swing_buffers) >= _MAX_SYMBOLS:
+        oldest_key = min(_swing_buffers, key=lambda k: _swing_buffers[k][-1].ts if _swing_buffers[k] else 0)
+        del _swing_buffers[oldest_key]
+    if symbol not in _scalp_buffers and len(_scalp_buffers) >= _MAX_SYMBOLS:
+        oldest_key = min(_scalp_buffers, key=lambda k: _scalp_buffers[k][-1].ts if _scalp_buffers[k] else 0)
+        del _scalp_buffers[oldest_key]
 
     sw = _swing_buffers.setdefault(symbol, [])
     sw.append(sample)
@@ -42,8 +52,12 @@ def _compute_momentum(samples: list[PriceSample]) -> Optional[dict]:
         return None
     first = samples[0]
     last = samples[-1]
+    if first.price == 0:
+        return None
     pct = (last.price - first.price) / first.price
     avg_volume = sum(s.volume_24h for s in samples) / len(samples)
+    if avg_volume == 0:
+        return None
     return {"pct": pct, "avg_volume": avg_volume, "current_volume": last.volume_24h}
 
 
@@ -53,6 +67,12 @@ def _has_cooldown(symbol: str) -> bool:
 
 
 def _set_cooldown(symbol: str, ms: float) -> None:
+    # Purge expired cooldowns to prevent unbounded growth
+    if len(_cooldowns) > _MAX_SYMBOLS:
+        now = time.time() * 1000
+        expired = [k for k, v in _cooldowns.items() if v <= now]
+        for k in expired:
+            del _cooldowns[k]
     _cooldowns[symbol] = time.time() * 1000 + ms
 
 

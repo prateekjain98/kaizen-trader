@@ -6,6 +6,7 @@ from typing import Optional
 from src.types import TradeSignal, MarketContext, ScannerConfig
 from src.signals.news import NewsSentiment
 from src.signals.social import SocialSentiment
+from src.utils.safe_math import safe_score
 
 
 @dataclass
@@ -29,12 +30,45 @@ def _news_adjustment(signal: TradeSignal, news: Optional[NewsSentiment]) -> floa
 
 
 def _social_adjustment(signal: TradeSignal, social: Optional[SocialSentiment]) -> float:
+    """Enhanced social scoring with sentiment breakdown and rank momentum."""
     if not social:
         return 0
-    galaxy = (social.galaxy_score - 50) / 50 * 8
-    velocity_bonus = min(4, (social.velocity_multiple - 3) * 2) if social.velocity_multiple > 3 else 0
-    raw = galaxy + velocity_bonus if signal.side == "long" else -(galaxy + velocity_bonus)
-    return _clamp(raw, -12, 12)
+
+    adj = 0.0
+
+    # Galaxy score component
+    if social.galaxy_score >= 70:
+        adj += 5
+    elif social.galaxy_score <= 30:
+        adj -= 5
+
+    # Velocity component
+    if social.velocity_multiple >= 3:
+        adj += 7
+    elif social.velocity_multiple >= 2:
+        adj += 3
+
+    # Sentiment breakdown
+    # If >70% negative sentiment, penalize long entries by 5
+    if social.negative_pct > 70 and signal.side == "long":
+        adj -= 5
+    # If >70% positive with social volume, boost
+    if social.positive_pct > 70 and social.social_volume > 0:
+        adj += 3
+
+    # AltRank momentum (negative change = improving)
+    if social.alt_rank_change_24h < -20:  # Significant rank improvement
+        adj += 4
+    elif social.alt_rank_change_24h > 20:  # Rank declining
+        adj -= 3
+
+    # Social volume trend
+    if social.social_volume_24h_change > 100:  # Volume doubled
+        adj += 3
+    elif social.social_volume_24h_change < -50:  # Volume halved
+        adj -= 2
+
+    return _clamp(adj, -12, 12)
 
 
 def _context_adjustment(signal: TradeSignal, ctx: MarketContext) -> float:
@@ -78,7 +112,7 @@ def qualify(
     fgi_adj = _fear_greed_adjustment(signal, ctx.fear_greed_index)
 
     raw_score = signal.score + news_adj + social_adj + ctx_adj + fgi_adj
-    score = _clamp(raw_score, 0, 100)
+    score = safe_score(raw_score, 0, 100)
 
     min_score = config.min_qual_score_scalp if signal.tier == "scalp" else config.min_qual_score_swing
     passed = score >= min_score

@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import threading
 import time
 import uuid
 
@@ -13,6 +14,15 @@ from src.storage.database import log
 from src.types import Trade
 
 BASE_URL = "https://api.coinbase.com"
+
+# Rate limiter state (guarded by _rate_lock)
+_last_request_time: float = 0.0
+_rate_lock = threading.Lock()
+_MIN_REQUEST_INTERVAL: float = 0.1  # 100ms between requests
+
+# Retry configuration
+_MAX_RETRIES = 3
+_BACKOFF_SECONDS = [1, 2, 4]
 
 
 class InsufficientFundsError(Exception):
@@ -34,6 +44,28 @@ def _sign(timestamp: int, method: str, path: str, body: str) -> str:
     ).hexdigest()
 
 
+def _enforce_rate_limit() -> None:
+    """Enforce minimum 100ms between API requests."""
+    global _last_request_time
+    with _rate_lock:
+        now = time.monotonic()
+        elapsed = now - _last_request_time
+        if elapsed < _MIN_REQUEST_INTERVAL:
+            time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
+        _last_request_time = time.monotonic()
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True if the error is a timeout or 5xx (retryable)."""
+    if isinstance(exc, requests.exceptions.Timeout):
+        return True
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    if isinstance(exc, ExchangeError) and exc.code.startswith("5"):
+        return True
+    return False
+
+
 def _cb_request(method: str, path: str, body: dict | None = None) -> dict:
     if not env.coinbase_api_key or not env.coinbase_api_secret:
         raise ExchangeError("MISSING_CREDENTIALS", "Coinbase API key/secret not configured")
@@ -49,93 +81,209 @@ def _cb_request(method: str, path: str, body: dict | None = None) -> dict:
         "Content-Type": "application/json",
     }
 
+    _enforce_rate_limit()
+
     res = requests.request(method, f"{BASE_URL}{path}", headers=headers,
                            data=body_str if body_str else None, timeout=10)
 
     try:
         parsed = res.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError) as e:
+        log("error", f"Failed to parse JSON response: {e} (HTTP {res.status_code}): {res.text[:200]}")
         raise ExchangeError("PARSE_ERROR", f"Non-JSON response ({res.status_code}): {res.text[:200]}")
 
     if not res.ok:
-        raise ExchangeError(parsed.get("error", "HTTP_ERROR"),
-                            parsed.get("message", f"HTTP {res.status_code}"))
+        code = str(res.status_code)
+        message = parsed.get("message", f"HTTP {res.status_code}")
+        raise ExchangeError(code, message)
     return parsed
 
 
+def _cb_request_with_retry(method: str, path: str, body: dict | None = None) -> dict:
+    """Wrap _cb_request with retry + exponential backoff for transient errors."""
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return _cb_request(method, path, body)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc):
+                raise  # 4xx / client errors: don't retry
+            if attempt < _MAX_RETRIES - 1:
+                wait = _BACKOFF_SECONDS[attempt]
+                log("warn", f"Retryable error (attempt {attempt + 1}/{_MAX_RETRIES}), "
+                    f"retrying in {wait}s: {exc}")
+                time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
+
+def _make_client_order_id(position_id: str, side: str, attempt: int) -> str:
+    """Deterministic order ID per position + side + attempt to prevent duplicate orders on retry."""
+    raw = f"{position_id}:{side}:{attempt}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, raw))
+
+
 def place_buy_order(product_id: str, size_usd: float, position_id: str) -> Trade:
-    body = {
-        "client_order_id": str(uuid.uuid4()),
-        "product_id": product_id,
-        "side": "BUY",
-        "order_configuration": {
-            "market_market_ioc": {"quote_size": f"{size_usd:.2f}"},
-        },
-    }
     symbol = product_id.replace("-USD", "")
-    log("info", f"Placing BUY order: {product_id} ${size_usd}", symbol=symbol,
-        data={"product_id": product_id, "size_usd": size_usd, "position_id": position_id})
 
-    response = _cb_request("POST", "/api/v3/brokerage/orders", body)
+    # Price sanity check
+    if size_usd <= 0:
+        log("error", f"Invalid buy size_usd={size_usd} for {product_id}", symbol=symbol)
+        return Trade(
+            id=str(uuid.uuid4()), position_id=position_id, side="buy",
+            symbol=symbol, quantity=0, size_usd=0,
+            price=0, status="failed", paper_trading=False,
+            placed_at=time.time() * 1000, error="Invalid size_usd <= 0",
+        )
 
-    if not response.get("success") or not response.get("order_id"):
-        reason = (response.get("failure_reason")
-                  or (response.get("error_response") or {}).get("preview_failure_reason")
-                  or "unknown")
-        if "INSUFFICIENT_FUND" in reason:
-            raise InsufficientFundsError(f"Insufficient funds to buy {product_id} for ${size_usd}")
-        raise ExchangeError(reason, f"Order failed: {reason}")
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        client_order_id = _make_client_order_id(position_id, "buy", attempt)
+        body = {
+            "client_order_id": client_order_id,
+            "product_id": product_id,
+            "side": "BUY",
+            "order_configuration": {
+                "market_market_ioc": {"quote_size": f"{size_usd:.2f}"},
+            },
+        }
+        log("info", f"Placing BUY order: {product_id} ${size_usd} (attempt {attempt + 1})", symbol=symbol,
+            data={"product_id": product_id, "size_usd": size_usd, "position_id": position_id,
+                  "client_order_id": client_order_id})
 
-    order = response.get("order", {})
-    avg_price = float(order.get("average_filled_price", 0))
-    filled_size = float(order.get("filled_size", size_usd / avg_price if avg_price else 0))
+        try:
+            response = _cb_request("POST", "/api/v3/brokerage/orders", body)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc):
+                raise
+            if attempt < _MAX_RETRIES - 1:
+                wait = _BACKOFF_SECONDS[attempt]
+                log("warn", f"Retryable error on BUY (attempt {attempt + 1}/{_MAX_RETRIES}), "
+                    f"retrying in {wait}s: {exc}", symbol=symbol)
+                time.sleep(wait)
+                continue
+            raise
 
-    log("trade", f"BUY filled: {product_id} ${size_usd} @ avg {avg_price:.4f}", symbol=symbol,
-        data={"order_id": response["order_id"], "avg_price": avg_price, "filled_size": filled_size})
+        if not response.get("success") or not response.get("order_id"):
+            reason = (response.get("failure_reason")
+                      or (response.get("error_response") or {}).get("preview_failure_reason")
+                      or "unknown")
+            if "INSUFFICIENT_FUND" in reason:
+                raise InsufficientFundsError(f"Insufficient funds to buy {product_id} for ${size_usd}")
+            raise ExchangeError(reason, f"Order failed: {reason}")
 
-    return Trade(
-        id=str(uuid.uuid4()), position_id=position_id, side="buy",
-        symbol=symbol, quantity=filled_size, size_usd=size_usd,
-        price=avg_price, order_id=response["order_id"],
-        status="filled", paper_trading=False, placed_at=time.time() * 1000,
-    )
+        order = response.get("order", {})
+        avg_price = float(order.get("average_filled_price", 0))
+        expected_qty = size_usd / avg_price if avg_price else 0
+        filled_size = float(order.get("filled_size", expected_qty))
+
+        # Partial fill detection
+        if avg_price > 0 and expected_qty > 0:
+            fill_ratio = filled_size / expected_qty
+            if fill_ratio < 0.99:
+                log("warn",
+                    f"Partial fill on BUY {product_id}: requested ~{expected_qty:.8f}, "
+                    f"filled {filled_size:.8f} ({fill_ratio * 100:.1f}%)",
+                    symbol=symbol,
+                    data={"expected_qty": expected_qty, "filled_size": filled_size,
+                          "fill_ratio": fill_ratio})
+
+        actual_size_usd = filled_size * avg_price if avg_price else 0
+
+        log("trade", f"BUY filled: {product_id} ${actual_size_usd:.2f} @ avg {avg_price:.4f}", symbol=symbol,
+            data={"order_id": response["order_id"], "avg_price": avg_price, "filled_size": filled_size})
+
+        return Trade(
+            id=str(uuid.uuid4()), position_id=position_id, side="buy",
+            symbol=symbol, quantity=filled_size, size_usd=actual_size_usd,
+            price=avg_price, order_id=response["order_id"],
+            status="filled", paper_trading=False, placed_at=time.time() * 1000,
+        )
+
+    # Should not reach here, but just in case
+    raise last_exc  # type: ignore[misc]
 
 
 def place_sell_order(product_id: str, quantity: float, position_id: str) -> Trade:
-    body = {
-        "client_order_id": str(uuid.uuid4()),
-        "product_id": product_id,
-        "side": "SELL",
-        "order_configuration": {
-            "market_market_ioc": {"base_size": f"{quantity:.8f}"},
-        },
-    }
     symbol = product_id.replace("-USD", "")
-    log("info", f"Placing SELL order: {product_id} {quantity} units", symbol=symbol,
-        data={"product_id": product_id, "quantity": quantity, "position_id": position_id})
 
-    response = _cb_request("POST", "/api/v3/brokerage/orders", body)
+    # Price sanity check
+    if quantity <= 0:
+        log("error", f"Invalid sell quantity={quantity} for {product_id}", symbol=symbol)
+        return Trade(
+            id=str(uuid.uuid4()), position_id=position_id, side="sell",
+            symbol=symbol, quantity=0, size_usd=0,
+            price=0, status="failed", paper_trading=False,
+            placed_at=time.time() * 1000, error="Invalid quantity <= 0",
+        )
 
-    if not response.get("success") or not response.get("order_id"):
-        reason = response.get("failure_reason", "unknown")
-        raise ExchangeError(reason, f"Sell order failed: {reason}")
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        client_order_id = _make_client_order_id(position_id, "sell", attempt)
+        body = {
+            "client_order_id": client_order_id,
+            "product_id": product_id,
+            "side": "SELL",
+            "order_configuration": {
+                "market_market_ioc": {"base_size": f"{quantity:.8f}"},
+            },
+        }
+        log("info", f"Placing SELL order: {product_id} {quantity} units (attempt {attempt + 1})", symbol=symbol,
+            data={"product_id": product_id, "quantity": quantity, "position_id": position_id,
+                  "client_order_id": client_order_id})
 
-    order = response.get("order", {})
-    avg_price = float(order.get("average_filled_price", 0))
+        try:
+            response = _cb_request("POST", "/api/v3/brokerage/orders", body)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc):
+                raise
+            if attempt < _MAX_RETRIES - 1:
+                wait = _BACKOFF_SECONDS[attempt]
+                log("warn", f"Retryable error on SELL (attempt {attempt + 1}/{_MAX_RETRIES}), "
+                    f"retrying in {wait}s: {exc}", symbol=symbol)
+                time.sleep(wait)
+                continue
+            raise
 
-    log("trade", f"SELL filled: {product_id} {quantity} units @ avg {avg_price:.4f}", symbol=symbol,
-        data={"order_id": response["order_id"], "avg_price": avg_price})
+        if not response.get("success") or not response.get("order_id"):
+            reason = response.get("failure_reason", "unknown")
+            raise ExchangeError(reason, f"Sell order failed: {reason}")
 
-    return Trade(
-        id=str(uuid.uuid4()), position_id=position_id, side="sell",
-        symbol=symbol, quantity=quantity, size_usd=quantity * avg_price,
-        price=avg_price, order_id=response["order_id"],
-        status="filled", paper_trading=False, placed_at=time.time() * 1000,
-    )
+        order = response.get("order", {})
+        avg_price = float(order.get("average_filled_price", 0))
+        filled_size = float(order.get("filled_size", quantity))
+
+        # Partial fill detection
+        if quantity > 0:
+            fill_ratio = filled_size / quantity
+            if fill_ratio < 0.99:
+                log("warn",
+                    f"Partial fill on SELL {product_id}: requested {quantity:.8f}, "
+                    f"filled {filled_size:.8f} ({fill_ratio * 100:.1f}%)",
+                    symbol=symbol,
+                    data={"requested_qty": quantity, "filled_size": filled_size,
+                          "fill_ratio": fill_ratio})
+
+        actual_size_usd = filled_size * avg_price
+
+        log("trade", f"SELL filled: {product_id} {filled_size} units @ avg {avg_price:.4f}", symbol=symbol,
+            data={"order_id": response["order_id"], "avg_price": avg_price, "filled_size": filled_size})
+
+        return Trade(
+            id=str(uuid.uuid4()), position_id=position_id, side="sell",
+            symbol=symbol, quantity=filled_size, size_usd=actual_size_usd,
+            price=avg_price, order_id=response["order_id"],
+            status="filled", paper_trading=False, placed_at=time.time() * 1000,
+        )
+
+    # Should not reach here, but just in case
+    raise last_exc  # type: ignore[misc]
 
 
 def get_account_balances() -> dict[str, float]:
-    res = _cb_request("GET", "/api/v3/brokerage/accounts?limit=250")
+    res = _cb_request_with_retry("GET", "/api/v3/brokerage/accounts?limit=250")
     return {
         a["currency"]: float(a["available_balance"]["value"])
         for a in res.get("accounts", [])

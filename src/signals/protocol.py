@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import requests
 
+from src.signals._circuit_breaker import CircuitBreaker
 from src.storage.database import log
 
 
@@ -28,6 +29,7 @@ PROTOCOL_SYMBOL_MAP: dict[str, str] = {
 _cached: list[ProtocolRevenueData] = []
 _last_fetch_at: float = 0
 _CACHE_TTL_MS = 3_600_000
+_breaker = CircuitBreaker("protocol")
 
 
 def _resolve_symbol(protocol: dict) -> str | None:
@@ -46,6 +48,14 @@ def fetch_protocol_revenue() -> list[ProtocolRevenueData]:
     if now - _last_fetch_at < _CACHE_TTL_MS:
         return _cached
 
+    # Staleness warning
+    if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
+        log("warn", f"Protocol revenue data is stale (last fetch {(now - _last_fetch_at) / 60_000:.0f}m ago)")
+
+    if not _breaker.can_call():
+        log("warn", "Protocol revenue circuit breaker OPEN — returning cached data")
+        return _cached
+
     try:
         res = requests.get(
             "https://api.llama.fi/overview/fees?excludeTotalDataChartBreakdown=true",
@@ -53,6 +63,7 @@ def fetch_protocol_revenue() -> list[ProtocolRevenueData]:
         )
         if res.status_code != 200:
             log("warn", f"DeFiLlama fees fetch failed: {res.status_code}")
+            _breaker.record_failure()
             return _cached
 
         data = res.json()
@@ -87,9 +98,11 @@ def fetch_protocol_revenue() -> list[ProtocolRevenueData]:
         results.sort(key=lambda x: x.revenue_multiple, reverse=True)
         _last_fetch_at = now
         _cached = results
+        _breaker.record_success()
         log("info", f"DeFiLlama: loaded {len(results)} protocol revenue records")
         return results
 
     except Exception as err:
         log("warn", f"DeFiLlama network error: {err}")
+        _breaker.record_failure()
         return _cached

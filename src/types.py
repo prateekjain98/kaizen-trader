@@ -7,7 +7,7 @@ from typing import Literal, Optional
 Side = Literal["long", "short"]
 Tier = Literal["scalp", "swing", "position"]
 MarketPhase = Literal["bull", "bear", "neutral", "extreme_fear", "extreme_greed"]
-ExitReason = Literal["trailing_stop", "take_profit", "time_limit", "circuit_breaker", "manual", "error"]
+ExitReason = Literal["trailing_stop", "take_profit", "partial_take_profit", "time_limit", "circuit_breaker", "manual", "error"]
 
 StrategyId = Literal[
     "momentum_swing", "momentum_scalp", "listing_pump", "whale_accumulation",
@@ -77,6 +77,12 @@ class Position:
     pnl_pct: Optional[float] = None
     exit_reason: Optional[str] = None
     paper_trading: bool = True
+    # Partial take-profit tracking
+    partial_exit_pct: float = 0.0        # fraction already sold (0.0 to 1.0)
+    original_quantity: Optional[float] = None  # quantity at open (before partial exits)
+    # MAE/MFE tracking (Maximum Adverse/Favorable Excursion as % from entry)
+    mae_pct: float = 0.0  # worst drawdown from entry (always <= 0 for longs)
+    mfe_pct: float = 0.0  # best excursion from entry (always >= 0 for longs)
 
 
 @dataclass

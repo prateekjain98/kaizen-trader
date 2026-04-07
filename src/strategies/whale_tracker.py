@@ -19,6 +19,7 @@ class NetFlowState:
 
 
 _flow_windows: dict[str, NetFlowState] = {}
+_MAX_FLOW_SYMBOLS = 500
 
 
 def on_whale_transfer(tx: dict) -> None:
@@ -28,6 +29,10 @@ def on_whale_transfer(tx: dict) -> None:
     symbol = tx["symbol"]
 
     if symbol not in _flow_windows:
+        # Evict stale entries to prevent unbounded growth
+        if len(_flow_windows) >= _MAX_FLOW_SYMBOLS:
+            oldest_key = min(_flow_windows, key=lambda k: _flow_windows[k].last_ts)
+            del _flow_windows[oldest_key]
         _flow_windows[symbol] = NetFlowState(last_ts=now)
     state = _flow_windows[symbol]
 

@@ -28,10 +28,24 @@ class LiquidationWindow:
 
 
 _windows: dict[str, LiquidationWindow] = {}
+_MAX_WINDOWS = 500
+_WINDOW_EXPIRY_MS = 1_800_000  # 30 minutes
 
 
 def on_liquidation_event(event: LiquidationEvent, current_oi: float) -> None:
     now = time.time() * 1000
+
+    # Expire stale windows and enforce max size
+    if len(_windows) > _MAX_WINDOWS:
+        stale = [k for k, w in _windows.items()
+                 if not w.events or w.events[-1].ts < now - _WINDOW_EXPIRY_MS]
+        for k in stale:
+            del _windows[k]
+        # If still over limit, drop oldest
+        while len(_windows) > _MAX_WINDOWS:
+            oldest_key = min(_windows, key=lambda k: _windows[k].events[-1].ts if _windows[k].events else 0)
+            del _windows[oldest_key]
+
     if event.symbol not in _windows:
         _windows[event.symbol] = LiquidationWindow(
             oi_at_window_start=current_oi, current_oi=current_oi,

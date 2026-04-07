@@ -1,0 +1,201 @@
+import { mutation } from "./_generated/server";
+import { v } from "convex/values";
+
+export const insertPosition = mutation({
+  args: {
+    positionId: v.string(),
+    symbol: v.string(),
+    productId: v.string(),
+    strategy: v.string(),
+    side: v.string(),
+    tier: v.string(),
+    entryPrice: v.float64(),
+    quantity: v.float64(),
+    sizeUsd: v.float64(),
+    openedAt: v.float64(),
+    highWatermark: v.float64(),
+    lowWatermark: v.float64(),
+    currentPrice: v.float64(),
+    trailPct: v.float64(),
+    stopPrice: v.float64(),
+    maxHoldMs: v.float64(),
+    qualScore: v.float64(),
+    signalId: v.string(),
+    status: v.string(),
+    exitPrice: v.optional(v.float64()),
+    closedAt: v.optional(v.float64()),
+    pnlUsd: v.optional(v.float64()),
+    pnlPct: v.optional(v.float64()),
+    exitReason: v.optional(v.string()),
+    paperTrading: v.boolean(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("positions", args);
+  },
+});
+
+export const updatePositionClose = mutation({
+  args: {
+    positionId: v.string(),
+    exitPrice: v.float64(),
+    pnlUsd: v.float64(),
+    pnlPct: v.float64(),
+    exitReason: v.string(),
+    closedAt: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("positions")
+      .withIndex("by_status")
+      .filter((q) => q.eq(q.field("positionId"), args.positionId))
+      .first();
+    if (!existing) {
+      throw new Error(`Position ${args.positionId} not found`);
+    }
+    await ctx.db.patch(existing._id, {
+      status: "closed",
+      exitPrice: args.exitPrice,
+      closedAt: args.closedAt,
+      pnlUsd: args.pnlUsd,
+      pnlPct: args.pnlPct,
+      exitReason: args.exitReason,
+    });
+  },
+});
+
+export const insertTrade = mutation({
+  args: {
+    tradeId: v.string(),
+    positionId: v.string(),
+    side: v.string(),
+    symbol: v.string(),
+    quantity: v.float64(),
+    sizeUsd: v.float64(),
+    price: v.float64(),
+    orderId: v.optional(v.string()),
+    status: v.string(),
+    error: v.optional(v.string()),
+    paperTrading: v.boolean(),
+    placedAt: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("trades", args);
+  },
+});
+
+export const insertLog = mutation({
+  args: {
+    logId: v.string(),
+    level: v.string(),
+    message: v.string(),
+    symbol: v.optional(v.string()),
+    strategy: v.optional(v.string()),
+    data: v.optional(v.string()),
+    ts: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("logs", args);
+  },
+});
+
+export const insertDiagnosis = mutation({
+  args: {
+    positionId: v.string(),
+    symbol: v.string(),
+    strategy: v.string(),
+    pnlPct: v.float64(),
+    holdMs: v.float64(),
+    exitReason: v.string(),
+    lossReason: v.string(),
+    entryQualScore: v.float64(),
+    marketPhaseAtEntry: v.string(),
+    action: v.string(),
+    parameterChanges: v.string(),
+    timestamp: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("diagnoses", args);
+  },
+});
+
+export const snapshotConfig = mutation({
+  args: {
+    config: v.string(),
+    reason: v.string(),
+    timestamp: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("scannerConfigHistory", args);
+  },
+});
+
+export const insertParameterDelta = mutation({
+  args: {
+    parameter: v.string(),
+    oldValue: v.float64(),
+    newValue: v.float64(),
+    reason: v.string(),
+    source: v.string(),
+    tradesBeforeSnapshot: v.string(),
+    tradesAfterSnapshot: v.optional(v.string()),
+    evaluationStatus: v.string(),
+    evaluationTimestamp: v.optional(v.float64()),
+    verdict: v.optional(v.string()),
+    timestamp: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("parameterDeltas", args);
+  },
+});
+
+export const updateParameterDelta = mutation({
+  args: {
+    id: v.id("parameterDeltas"),
+    tradesAfterSnapshot: v.optional(v.string()),
+    evaluationStatus: v.optional(v.string()),
+    evaluationTimestamp: v.optional(v.float64()),
+    verdict: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const { id, ...updates } = args;
+    const cleanUpdates: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(updates)) {
+      if (value !== undefined) {
+        cleanUpdates[key] = value;
+      }
+    }
+    await ctx.db.patch(id, cleanUpdates);
+  },
+});
+
+export const insertGithubIssue = mutation({
+  args: {
+    issueNumber: v.float64(),
+    title: v.string(),
+    body: v.string(),
+    triggerType: v.string(),
+    triggerData: v.string(),
+    createdAt: v.float64(),
+    status: v.string(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("githubIssues", args);
+  },
+});
+
+export const insertMetrics = mutation({
+  args: {
+    windowStartMs: v.float64(),
+    windowEndMs: v.float64(),
+    errorCount: v.float64(),
+    warnCount: v.float64(),
+    tradeCount: v.float64(),
+    healingCount: v.float64(),
+    avgPnlPct: v.optional(v.float64()),
+    winRate: v.optional(v.float64()),
+    computedAt: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("metrics", args);
+  },
+});

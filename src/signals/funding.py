@@ -6,6 +6,7 @@ from typing import Optional
 
 import requests
 
+from src.signals._circuit_breaker import CircuitBreaker
 from src.storage.database import log
 
 
@@ -20,7 +21,7 @@ class FundingData:
     sampled_at: float
 
 
-_oi_history: dict[str, dict] = {}  # symbol -> {oi, ts}
+_oi_history: dict[str, dict] = {}
 
 SYMBOL_MAP: dict[str, str] = {
     "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "BNB": "BNBUSDT",
@@ -33,6 +34,7 @@ _BASE = "https://fapi.binance.com"
 _last_fetch_at: float = 0
 _cached: list[FundingData] = []
 _CACHE_TTL_MS = 300_000
+_breaker = CircuitBreaker("funding")
 
 
 def _compute_oi_change(symbol: str, current_oi: float) -> float:
@@ -53,6 +55,14 @@ def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
     if now - _last_fetch_at < _CACHE_TTL_MS:
         return _cached
 
+    # Staleness warning
+    if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
+        log("warn", f"Funding data is stale (last fetch {(now - _last_fetch_at) / 60_000:.0f}m ago)")
+
+    if not _breaker.can_call():
+        log("warn", "Funding circuit breaker OPEN — returning cached data")
+        return _cached
+
     binance_symbols = [SYMBOL_MAP[s] for s in symbols if s in SYMBOL_MAP]
     if not binance_symbols:
         return []
@@ -62,6 +72,7 @@ def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
         funding_res = requests.get(f"{_BASE}/fapi/v1/premiumIndex", timeout=8)
         if funding_res.status_code != 200:
             log("warn", f"Binance funding fetch failed: {funding_res.status_code}")
+            _breaker.record_failure()
             return _cached
 
         all_funding = funding_res.json()
@@ -98,8 +109,11 @@ def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
                 ))
             except Exception:
                 continue
+
+        _breaker.record_success()
     except Exception as err:
         log("warn", f"Binance funding network error: {err}")
+        _breaker.record_failure()
         return _cached
 
     _last_fetch_at = now

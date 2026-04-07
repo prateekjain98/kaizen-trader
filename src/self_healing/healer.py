@@ -1,13 +1,17 @@
 """Self-Healing Engine — diagnoses losses and patches parameters."""
 
 import dataclasses
+import threading
 import time
 
 from src.config import CONFIG_BOUNDS
+from src.self_healing.blind_spots import get_detector
+from src.self_healing.delta_evaluator import get_evaluator
 from src.storage.database import insert_diagnosis, snapshot_config, log
 from src.types import Position, ScannerConfig, TradeDiagnosis
 
 _MAX_ADAPTATIONS_PER_SESSION = 20
+_lock = threading.Lock()
 _adaptation_count = 0
 
 
@@ -34,6 +38,15 @@ def _classify_loss_reason(p: Position) -> str:
         return "stop_too_wide"
     if p.qual_score < 55:
         return "low_qual_score"
+
+    # Check promoted blind spots before returning unknown
+    hold_ms = ((p.closed_at or time.time() * 1000) - p.opened_at)
+    promoted = get_detector().lookup_promoted(
+        p.strategy, "", p.exit_reason or "", hold_ms,
+    )
+    if promoted:
+        return promoted
+
     return "unknown"
 
 
@@ -41,11 +54,14 @@ def _apply_loss_adaptation(p: Position, reason: str, config: ScannerConfig) -> d
     changes: dict = {}
     action = "no change"
 
+    old_values: dict = {}
+
     if reason == "entered_pump_top":
         key = "momentum_pct_swing" if p.tier == "swing" else "momentum_pct_scalp"
         old_val = getattr(config, key)
         _adjust(config, key, 0.01)
         new_val = getattr(config, key)
+        old_values[key] = old_val
         changes[key] = new_val
         action = f"raise {key} {old_val*100:.1f}% -> {new_val*100:.1f}%"
 
@@ -54,6 +70,7 @@ def _apply_loss_adaptation(p: Position, reason: str, config: ScannerConfig) -> d
         old_val = getattr(config, key)
         _adjust(config, key, 0.01)
         new_val = getattr(config, key)
+        old_values[key] = old_val
         changes[key] = new_val
         action = f"widen {key} {old_val*100:.0f}% -> {new_val*100:.0f}%"
 
@@ -62,6 +79,7 @@ def _apply_loss_adaptation(p: Position, reason: str, config: ScannerConfig) -> d
         old_val = getattr(config, key)
         _adjust(config, key, -0.01)
         new_val = getattr(config, key)
+        old_values[key] = old_val
         changes[key] = new_val
         action = f"tighten {key} {old_val*100:.0f}% -> {new_val*100:.0f}%"
 
@@ -70,6 +88,7 @@ def _apply_loss_adaptation(p: Position, reason: str, config: ScannerConfig) -> d
         old_val = getattr(config, key)
         _adjust(config, key, 2)
         new_val = getattr(config, key)
+        old_values[key] = old_val
         changes[key] = new_val
         action = f"raise {key} {old_val} -> {new_val}"
 
@@ -77,13 +96,14 @@ def _apply_loss_adaptation(p: Position, reason: str, config: ScannerConfig) -> d
         old_val = config.funding_rate_extreme_threshold
         _adjust(config, "funding_rate_extreme_threshold", -0.0001)
         new_val = config.funding_rate_extreme_threshold
+        old_values["funding_rate_extreme_threshold"] = old_val
         changes["funding_rate_extreme_threshold"] = new_val
         action = f"lower funding threshold {old_val*100:.3f}% -> {new_val*100:.3f}%"
 
     else:
         action = "no change — unknown loss reason"
 
-    return {"action": action, "changes": changes}
+    return {"action": action, "changes": changes, "old_values": old_values}
 
 
 def on_position_closed(p: Position, config: ScannerConfig, market_phase: str) -> None:
@@ -96,10 +116,12 @@ def on_position_closed(p: Position, config: ScannerConfig, market_phase: str) ->
             symbol=p.symbol, strategy=p.strategy)
         return
 
-    if _adaptation_count >= _MAX_ADAPTATIONS_PER_SESSION:
-        log("warn", f"Self-healer hit session cap ({_MAX_ADAPTATIONS_PER_SESSION}) — skipping",
-            symbol=p.symbol)
-        return
+    with _lock:
+        if _adaptation_count >= _MAX_ADAPTATIONS_PER_SESSION:
+            log("warn", f"Self-healer hit session cap ({_MAX_ADAPTATIONS_PER_SESSION}) — skipping",
+                symbol=p.symbol)
+            return
+        _adaptation_count += 1
 
     loss_reason = _classify_loss_reason(p)
     hold_ms = (p.closed_at or time.time() * 1000) - p.opened_at
@@ -117,14 +139,34 @@ def on_position_closed(p: Position, config: ScannerConfig, market_phase: str) ->
 
     insert_diagnosis(diagnosis)
     snapshot_config(config, f"self-healer: {result['action']}")
-    _adaptation_count += 1
+
+    # Record deltas for tracking and auto-revert evaluation
+    for key, new_val in result["changes"].items():
+        old_val = result["old_values"].get(key)
+        if old_val is not None and old_val != new_val:
+            get_evaluator().record_delta(
+                parameter=key, old_value=old_val, new_value=new_val,
+                reason=loss_reason, source="immediate_healer", config=config,
+            )
 
     log("heal",
         f"{p.symbol} LOSS {pnl_pct*100:.1f}% reason={loss_reason} -> {result['action']}",
         symbol=p.symbol, strategy=p.strategy,
         data={"loss_reason": loss_reason, "action": result["action"], "changes": result["changes"]})
 
+    # Blind spot detection: track recurring unknown losses
+    if loss_reason == "unknown":
+        flagged = get_detector().record_unknown(diagnosis)
+        if flagged:
+            log("warn",
+                f"BLIND SPOT DETECTED: {flagged.key} seen {flagged.occurrences} times — "
+                f"avg loss {flagged.avg_pnl_pct*100:.1f}%",
+                symbol=p.symbol, strategy=p.strategy,
+                data={"blind_spot": flagged.key, "occurrences": flagged.occurrences,
+                      "position_ids": flagged.position_ids})
+
 
 def reset_session_count() -> None:
     global _adaptation_count
-    _adaptation_count = 0
+    with _lock:
+        _adaptation_count = 0

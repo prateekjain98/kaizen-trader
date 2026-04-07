@@ -6,6 +6,7 @@ from typing import Optional
 
 import requests
 
+from src.signals._circuit_breaker import CircuitBreaker
 from src.storage.database import log
 from src.types import MarketContext
 
@@ -21,6 +22,7 @@ class FearGreedReading:
 _cached: Optional[FearGreedReading] = None
 _last_fetch_at: float = 0
 _CACHE_TTL_MS = 30 * 60_000
+_breaker = CircuitBreaker("fear_greed")
 
 
 def fetch_fear_greed() -> Optional[FearGreedReading]:
@@ -29,14 +31,24 @@ def fetch_fear_greed() -> Optional[FearGreedReading]:
     if _cached and now - _last_fetch_at < _CACHE_TTL_MS:
         return _cached
 
+    # Staleness warning
+    if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
+        log("warn", f"Fear & Greed data is stale (last fetch {(now - _last_fetch_at) / 60_000:.0f}m ago)")
+
+    if not _breaker.can_call():
+        log("warn", "Fear & Greed circuit breaker OPEN — returning cached data")
+        return _cached
+
     try:
         res = requests.get("https://api.alternative.me/fng/?limit=2", timeout=5)
         if res.status_code != 200:
             log("warn", f"Fear & Greed fetch failed: {res.status_code}")
+            _breaker.record_failure()
             return _cached
         data = res.json()
         items = data.get("data", [])
         if not items:
+            _breaker.record_failure()
             return _cached
 
         today = int(items[0]["value"])
@@ -49,9 +61,11 @@ def fetch_fear_greed() -> Optional[FearGreedReading]:
             fetched_at=now,
         )
         _last_fetch_at = now
+        _breaker.record_success()
         return _cached
     except Exception as err:
         log("warn", f"Fear & Greed network error: {err}")
+        _breaker.record_failure()
         return _cached
 
 

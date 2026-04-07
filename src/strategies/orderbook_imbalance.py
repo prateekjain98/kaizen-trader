@@ -22,9 +22,13 @@ class OrderBookSnapshot:
 
 
 _order_books: dict[str, OrderBookSnapshot] = {}
+_MAX_ORDER_BOOKS = 500
 
 
 def update_order_book(symbol: str, bids: list[OrderBookLevel], asks: list[OrderBookLevel]) -> None:
+    if symbol not in _order_books and len(_order_books) >= _MAX_ORDER_BOOKS:
+        oldest_key = min(_order_books, key=lambda k: _order_books[k].last_updated)
+        del _order_books[oldest_key]
     _order_books[symbol] = OrderBookSnapshot(
         bids=sorted(bids, key=lambda l: l.price, reverse=True),
         asks=sorted(asks, key=lambda l: l.price),
@@ -33,6 +37,8 @@ def update_order_book(symbol: str, bids: list[OrderBookLevel], asks: list[OrderB
 
 
 def _sum_book_depth(levels: list[OrderBookLevel], from_price: float, price_pct: float) -> float:
+    if from_price == 0:
+        return 0.0
     return sum(
         l.size * l.price for l in levels
         if abs(l.price - from_price) / from_price <= price_pct
@@ -82,7 +88,7 @@ def scan_orderbook_imbalance(
                 id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
                 strategy="orderbook_imbalance", side="short", tier="scalp", score=score,
                 confidence="low", sources=["orderbook"],
-                reasoning=f"{symbol} ask/bid ratio {1/imbalance_ratio:.1f}x within 1%, ${ask_depth/1e6:.1f}M ask wall",
+                reasoning=f"{symbol} ask/bid ratio {1/max(imbalance_ratio, 0.001):.1f}x within 1%, ${ask_depth/1e6:.1f}M ask wall",
                 entry_price=current_price, stop_price=current_price * 1.01,
                 suggested_size_usd=35,
                 expires_at=now + 300_000, created_at=now,

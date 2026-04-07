@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from src.storage.database import get_closed_trades
+from src.utils.safe_math import safe_ratio
 
 
 @dataclass
@@ -32,6 +33,15 @@ class PortfolioMetrics:
     calmar_ratio: Optional[float]
     max_drawdown_pct: float
     avg_hold_hours: float
+    # New metrics
+    omega_ratio: Optional[float] = None        # sum(gains) / sum(losses) above/below threshold
+    gain_to_pain: Optional[float] = None       # total return / sum of absolute losses
+    expectancy: Optional[float] = None         # (win_rate * avg_win) - (loss_rate * avg_loss)
+    avg_win_hold_hours: float = 0.0
+    avg_loss_hold_hours: float = 0.0
+    median_pnl_pct: float = 0.0
+    avg_mae_pct: float = 0.0                   # average max adverse excursion
+    avg_mfe_pct: float = 0.0                   # average max favorable excursion
     by_strategy: list[StrategyMetrics] = field(default_factory=list)
 
 
@@ -72,7 +82,7 @@ def _max_consecutive_losses(pnls: list[float]) -> int:
 
 
 def _kelly_fraction(win_rate: float, avg_win_pct: float, avg_loss_pct: float) -> float:
-    if avg_loss_pct == 0:
+    if avg_loss_pct == 0 or avg_win_pct == 0:
         return 0
     b = avg_win_pct / avg_loss_pct
     p = win_rate
@@ -111,12 +121,44 @@ def compute_metrics(lookback_trades: int = 500) -> PortfolioMetrics:
     downside = [p for p in pnl_pcts if p < 0]
     downside_std = _std_dev(downside, 0)
 
-    sharpe = (pnl_mean / pnl_std) * math.sqrt(252) if pnl_std > 0 and len(pnl_pcts) >= 30 else None
-    sortino = (pnl_mean / downside_std) * math.sqrt(252) if downside_std > 0 and len(pnl_pcts) >= 30 else None
+    sharpe_raw = (pnl_mean / pnl_std) * math.sqrt(252) if pnl_std > 0 and len(pnl_pcts) >= 30 else None
+    sortino_raw = (pnl_mean / downside_std) * math.sqrt(252) if downside_std > 0 and len(pnl_pcts) >= 30 else None
+    sharpe = safe_ratio(sharpe_raw) if sharpe_raw is not None else None
+    sortino = safe_ratio(sortino_raw) if sortino_raw is not None else None
 
     max_dd = _max_drawdown(pnl_usds)
     total_pnl = sum(pnl_usds)
-    calmar = total_pnl / max_dd if max_dd > 0 and total_pnl > 0 else None
+    calmar_raw = total_pnl / max_dd if max_dd > 0 and total_pnl > 0 else None
+    calmar = safe_ratio(calmar_raw) if calmar_raw is not None else None
+
+    # Omega ratio: sum of gains / sum of losses (threshold = 0)
+    gains_sum = sum(p for p in pnl_pcts if p > 0)
+    losses_sum = abs(sum(p for p in pnl_pcts if p < 0))
+    omega = safe_ratio(gains_sum / losses_sum) if losses_sum > 0 else None
+
+    # Gain-to-Pain: total return / sum of absolute losses
+    abs_losses_sum = sum(abs(p) for p in pnl_usds if p < 0)
+    gain_to_pain = safe_ratio(total_pnl / abs_losses_sum) if abs_losses_sum > 0 else None
+
+    # Expectancy: (win_rate * avg_win) - (loss_rate * avg_loss)
+    wins_pct = [p for p in pnl_pcts if p > 0]
+    losses_pct = [p for p in pnl_pcts if p <= 0]
+    avg_win_pct_val = _mean(wins_pct) if wins_pct else 0
+    avg_loss_pct_val = abs(_mean(losses_pct)) if losses_pct else 0
+    expectancy = (win_rate * avg_win_pct_val) - ((1 - win_rate) * avg_loss_pct_val)
+
+    # Median PnL
+    sorted_pnls = sorted(pnl_pcts)
+    n = len(sorted_pnls)
+    median_pnl = sorted_pnls[n // 2] if n % 2 == 1 else (sorted_pnls[n // 2 - 1] + sorted_pnls[n // 2]) / 2 if n > 0 else 0
+
+    # Win/loss hold time breakdown
+    win_holds = [(t.closed_at - t.opened_at) / 3_600_000 for t in trades if t.closed_at and (t.pnl_pct or 0) > 0]
+    loss_holds = [(t.closed_at - t.opened_at) / 3_600_000 for t in trades if t.closed_at and (t.pnl_pct or 0) <= 0]
+
+    # MAE/MFE averages (if positions have the data)
+    mae_vals = [getattr(t, "mae_pct", 0) for t in trades if hasattr(t, "mae_pct") and getattr(t, "mae_pct", 0) != 0]
+    mfe_vals = [getattr(t, "mfe_pct", 0) for t in trades if hasattr(t, "mfe_pct") and getattr(t, "mfe_pct", 0) != 0]
 
     # Per-strategy breakdown
     strategy_map: dict[str, list] = {}
@@ -151,7 +193,16 @@ def compute_metrics(lookback_trades: int = 500) -> PortfolioMetrics:
         total_trades=len(trades), win_rate=win_rate, profit_factor=profit_factor,
         total_pnl_usd=total_pnl, sharpe_ratio=sharpe, sortino_ratio=sortino,
         calmar_ratio=calmar, max_drawdown_pct=max_dd,
-        avg_hold_hours=avg_hold_hours, by_strategy=by_strategy,
+        avg_hold_hours=avg_hold_hours,
+        omega_ratio=omega,
+        gain_to_pain=gain_to_pain,
+        expectancy=expectancy,
+        avg_win_hold_hours=_mean(win_holds),
+        avg_loss_hold_hours=_mean(loss_holds),
+        median_pnl_pct=median_pnl,
+        avg_mae_pct=_mean(mae_vals) if mae_vals else 0,
+        avg_mfe_pct=_mean(mfe_vals) if mfe_vals else 0,
+        by_strategy=by_strategy,
     )
 
 
@@ -161,11 +212,16 @@ def format_metrics(m: PortfolioMetrics) -> str:
         f"Win rate:      {m.win_rate*100:.1f}%",
         f"Profit factor: {'inf' if m.profit_factor == float('inf') else f'{m.profit_factor:.2f}'}",
         f"Total P&L:     ${m.total_pnl_usd:.2f}",
-        f"Avg hold:      {m.avg_hold_hours:.1f}h",
+        f"Median P&L:    {m.median_pnl_pct*100:.2f}%",
+        f"Expectancy:    {m.expectancy*100:.3f}% per trade" if m.expectancy is not None else "Expectancy:    N/A",
+        f"Avg hold:      {m.avg_hold_hours:.1f}h (win: {m.avg_win_hold_hours:.1f}h, loss: {m.avg_loss_hold_hours:.1f}h)",
         f"Max drawdown:  {m.max_drawdown_pct*100:.1f}%",
         f"Sharpe:        {m.sharpe_ratio:.2f}" if m.sharpe_ratio is not None else "Sharpe:        (insufficient data)",
         f"Sortino:       {m.sortino_ratio:.2f}" if m.sortino_ratio is not None else "Sortino:       (insufficient data)",
         f"Calmar:        {m.calmar_ratio:.2f}" if m.calmar_ratio is not None else "Calmar:        (insufficient data)",
+        f"Omega:         {m.omega_ratio:.2f}" if m.omega_ratio is not None else "Omega:         (insufficient data)",
+        f"Gain/Pain:     {m.gain_to_pain:.2f}" if m.gain_to_pain is not None else "Gain/Pain:     (insufficient data)",
+        f"Avg MAE:       {m.avg_mae_pct*100:.2f}%  Avg MFE: {m.avg_mfe_pct*100:.2f}%",
         "",
         "By strategy:",
     ]

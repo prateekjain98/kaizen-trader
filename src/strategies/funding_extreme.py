@@ -35,6 +35,8 @@ def scan_funding_extreme(
     now = time.time() * 1000
 
     threshold = config.funding_rate_extreme_threshold
+    if funding.funding_interval_hours == 0 or threshold == 0:
+        return None
     annualized = funding.funding_rate * (8760 / funding.funding_interval_hours)
 
     # Short: over-leveraged longs

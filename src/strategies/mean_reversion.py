@@ -68,7 +68,7 @@ def scan_mean_reversion(
     avg_volume = sum(s.volume for s in recent_20) / len(recent_20) if recent_20 else 0
     current_volume = buf[-1].volume if buf else 0
 
-    if vwap is None or rsi is None:
+    if vwap is None or vwap == 0 or rsi is None:
         return None
 
     deviation = (current_price - vwap) / vwap
