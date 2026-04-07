@@ -1,0 +1,130 @@
+"""Self-Healing Engine — diagnoses losses and patches parameters."""
+
+import dataclasses
+import time
+
+from src.config import CONFIG_BOUNDS
+from src.storage.database import insert_diagnosis, snapshot_config, log
+from src.types import Position, ScannerConfig, TradeDiagnosis
+
+_MAX_ADAPTATIONS_PER_SESSION = 20
+_adaptation_count = 0
+
+
+def _clamp(value: float, key: str) -> float:
+    lo, hi = CONFIG_BOUNDS[key]
+    return min(hi, max(lo, value))
+
+
+def _adjust(config: ScannerConfig, key: str, delta: float) -> None:
+    current = getattr(config, key)
+    setattr(config, key, _clamp(current + delta, key))
+
+
+def _classify_loss_reason(p: Position) -> str:
+    hold_hours = ((p.closed_at or time.time() * 1000) - p.opened_at) / 3_600_000
+    pnl_pct = p.pnl_pct or 0
+    momentum_at_entry = (p.entry_price - p.low_watermark) / p.low_watermark if p.low_watermark > 0 else 0
+
+    if momentum_at_entry > 0.08 and hold_hours < 4:
+        return "entered_pump_top"
+    if hold_hours < 2 and p.exit_reason == "trailing_stop":
+        return "stop_too_tight"
+    if hold_hours > 20 and pnl_pct < -0.05:
+        return "stop_too_wide"
+    if p.qual_score < 55:
+        return "low_qual_score"
+    return "unknown"
+
+
+def _apply_loss_adaptation(p: Position, reason: str, config: ScannerConfig) -> dict:
+    changes: dict = {}
+    action = "no change"
+
+    if reason == "entered_pump_top":
+        key = "momentum_pct_swing" if p.tier == "swing" else "momentum_pct_scalp"
+        old_val = getattr(config, key)
+        _adjust(config, key, 0.01)
+        new_val = getattr(config, key)
+        changes[key] = new_val
+        action = f"raise {key} {old_val*100:.1f}% -> {new_val*100:.1f}%"
+
+    elif reason == "stop_too_tight":
+        key = "base_trail_pct_swing" if p.tier == "swing" else "base_trail_pct_scalp"
+        old_val = getattr(config, key)
+        _adjust(config, key, 0.01)
+        new_val = getattr(config, key)
+        changes[key] = new_val
+        action = f"widen {key} {old_val*100:.0f}% -> {new_val*100:.0f}%"
+
+    elif reason == "stop_too_wide":
+        key = "base_trail_pct_swing" if p.tier == "swing" else "base_trail_pct_scalp"
+        old_val = getattr(config, key)
+        _adjust(config, key, -0.01)
+        new_val = getattr(config, key)
+        changes[key] = new_val
+        action = f"tighten {key} {old_val*100:.0f}% -> {new_val*100:.0f}%"
+
+    elif reason == "low_qual_score":
+        key = "min_qual_score_swing" if p.tier == "swing" else "min_qual_score_scalp"
+        old_val = getattr(config, key)
+        _adjust(config, key, 2)
+        new_val = getattr(config, key)
+        changes[key] = new_val
+        action = f"raise {key} {old_val} -> {new_val}"
+
+    elif reason == "funding_squeeze":
+        old_val = config.funding_rate_extreme_threshold
+        _adjust(config, "funding_rate_extreme_threshold", -0.0001)
+        new_val = config.funding_rate_extreme_threshold
+        changes["funding_rate_extreme_threshold"] = new_val
+        action = f"lower funding threshold {old_val*100:.3f}% -> {new_val*100:.3f}%"
+
+    else:
+        action = "no change — unknown loss reason"
+
+    return {"action": action, "changes": changes}
+
+
+def on_position_closed(p: Position, config: ScannerConfig, market_phase: str) -> None:
+    global _adaptation_count
+    pnl_pct = p.pnl_pct or 0
+    is_loss = pnl_pct < -0.005
+
+    if not is_loss:
+        log("heal", f"{p.symbol} WIN +{pnl_pct*100:.1f}% — no parameter changes",
+            symbol=p.symbol, strategy=p.strategy)
+        return
+
+    if _adaptation_count >= _MAX_ADAPTATIONS_PER_SESSION:
+        log("warn", f"Self-healer hit session cap ({_MAX_ADAPTATIONS_PER_SESSION}) — skipping",
+            symbol=p.symbol)
+        return
+
+    loss_reason = _classify_loss_reason(p)
+    hold_ms = (p.closed_at or time.time() * 1000) - p.opened_at
+    result = _apply_loss_adaptation(p, loss_reason, config)
+
+    diagnosis = TradeDiagnosis(
+        position_id=p.id, symbol=p.symbol, strategy=p.strategy,
+        pnl_pct=pnl_pct, hold_ms=hold_ms,
+        exit_reason=p.exit_reason or "error",
+        loss_reason=loss_reason, entry_qual_score=p.qual_score,
+        market_phase_at_entry=market_phase,
+        action=result["action"], parameter_changes=result["changes"],
+        timestamp=time.time() * 1000,
+    )
+
+    insert_diagnosis(diagnosis)
+    snapshot_config(config, f"self-healer: {result['action']}")
+    _adaptation_count += 1
+
+    log("heal",
+        f"{p.symbol} LOSS {pnl_pct*100:.1f}% reason={loss_reason} -> {result['action']}",
+        symbol=p.symbol, strategy=p.strategy,
+        data={"loss_reason": loss_reason, "action": result["action"], "changes": result["changes"]})
+
+
+def reset_session_count() -> None:
+    global _adaptation_count
+    _adaptation_count = 0

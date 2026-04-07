@@ -4,7 +4,7 @@ This file tells Claude Code how to analyze trading logs and improve the system.
 
 ## What this project is
 
-An autonomous crypto trading system that:
+A Python autonomous crypto trading system that:
 1. Runs multiple trading strategies in parallel
 2. Heals itself in real-time: after each loss, it diagnoses WHY and patches its own parameters
 3. Periodically calls Claude via the Anthropic SDK to do deeper log analysis
@@ -87,39 +87,45 @@ When analyzing, focus on:
 
 ## How to improve the system
 
-You can directly edit `src/config.ts` to change `defaultScannerConfig` values.
+You can directly edit `src/config.py` to change `default_scanner_config` values.
 Always stay within the `CONFIG_BOUNDS` defined in that file.
 
-You can add new loss reason patterns to `src/self-healing/index.ts`:
-- Add a new `LossReason` type in `src/types.ts`
-- Add detection logic in `classifyLossReason()`
-- Add an adaptation action in `applyLossAdaptation()`
+You can add new loss reason patterns to `src/self_healing/healer.py`:
+- Add a new `LossReason` type in `src/types.py`
+- Add detection logic in `_classify_loss_reason()`
+- Add an adaptation action in `_apply_loss_adaptation()`
 
 To add a new strategy:
-1. Create `src/strategies/your-strategy.ts` following the existing pattern
-2. Export a `scanYourStrategy()` function returning `TradeSignal | null`
-3. Register it in `src/strategies/index.ts`
-4. Add the `StrategyId` to `src/types.ts`
+1. Create `src/strategies/your_strategy.py` following the existing pattern
+2. Export a `scan_your_strategy()` function returning `Optional[TradeSignal]`
+3. Register it in `src/strategies/__init__.py`
+4. Add the `StrategyId` to `src/types.py`
 
 ## Running analysis
 
 ```bash
 # One-time manual analysis (requires ANTHROPIC_API_KEY in .env)
-npm run analyze
+python3 scripts/analyze_logs.py
 
 # Or let it run automatically every N minutes (set in .env)
-LOG_ANALYSIS_INTERVAL_MINS=60 npm start
+LOG_ANALYSIS_INTERVAL_MINS=60 python3 -m src.main
+
+# Performance report
+python3 scripts/performance.py
+python3 scripts/performance.py --last 50
+python3 scripts/performance.py --csv
 ```
 
 ## Key files
 
 | File | Purpose |
 |------|---------|
-| `src/types.ts` | All TypeScript types — start here |
-| `src/config.ts` | Parameter defaults + bounds |
-| `src/self-healing/index.ts` | Real-time loss diagnosis + parameter patching |
-| `src/self-healing/log-analyzer.ts` | Claude-powered deep analysis loop |
+| `src/types.py` | All Python types — start here |
+| `src/config.py` | Parameter defaults + bounds |
+| `src/self_healing/healer.py` | Real-time loss diagnosis + parameter patching |
+| `src/self_healing/log_analyzer.py` | Claude-powered deep analysis loop |
 | `src/strategies/` | One file per trading strategy |
+| `src/storage/database.py` | SQLite storage layer |
 | `trader.db` | SQLite: all trades, logs, config history |
 
 ## Safety rules for Claude Code
