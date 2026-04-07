@@ -10,7 +10,9 @@ from pydantic import BaseModel, Field
 from src.automation.github_issues import create_data_gap_issue
 from src.config import env, CONFIG_BOUNDS, default_scanner_config
 from src.self_healing.blind_spots import get_detector
+from src.self_healing.chart_analyzer import render_chart, analyze_chart
 from src.self_healing.delta_evaluator import get_evaluator
+from src.self_healing.analysis_memory import get_analysis_memory
 from src.storage.database import get_closed_trades, get_recent_diagnoses, get_recent_logs, snapshot_config, log
 from src.evaluation.metrics import compute_metrics, format_metrics
 from src.evaluation.strategy_selector import StrategySelector
@@ -173,6 +175,9 @@ Your job is to:
 ## Detected Blind Spots
 {blind_spots_section}
 
+## Prior Analysis Context (Working Memory)
+{get_analysis_memory().get_working_context()}
+
 ---
 
 ## Instructions
@@ -234,6 +239,76 @@ def _apply_changes(config: ScannerConfig, changes: list[ParameterChange]) -> dic
     return {"applied": applied, "rejected": rejected}
 
 
+def _adversarial_review(analysis: Analysis) -> list[str]:
+    """Challenge proposed parameter changes with a skeptical second opinion.
+
+    Returns a list of parameter names to REJECT (adversary had high confidence).
+    Uses claude-sonnet-4-20250514 for cost efficiency.
+    """
+    if not analysis.parameterChanges or not env.anthropic_api_key:
+        return []
+
+    changes_desc = "\n".join(
+        f"- {c.parameter}: {c.currentValue} -> {c.proposedValue} (evidence: {c.evidence})"
+        for c in analysis.parameterChanges
+    )
+
+    prompt = f"""You are a skeptical risk manager reviewing proposed parameter changes to an autonomous crypto trading system.
+
+## Proposed Changes
+{changes_desc}
+
+## System Context
+Summary: {analysis.summary}
+Health Score: {analysis.overallHealthScore}/100
+Top Issues: {', '.join(analysis.topIssues[:3])}
+
+For EACH proposed change, argue why it might be WRONG or harmful. Consider:
+1. Is the evidence statistically significant or could it be noise?
+2. Could the change have unintended side effects?
+3. Is the sample size large enough to justify this change?
+4. Could market regime shifts make this change counterproductive?
+
+Return a JSON array where each element is:
+{{"parameter": "name", "counter_argument": "why this change might be wrong", "rejection_confidence": "low|medium|high"}}
+
+Only rate "high" confidence if you have a strong, specific reason the change would be harmful."""
+
+    try:
+        client = anthropic.Anthropic(api_key=env.anthropic_api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        block = message.content[0]
+        if block.type != "text":
+            return []
+
+        raw = block.text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+
+        reviews = json.loads(raw.strip())
+        rejected = []
+        for review in reviews:
+            if review.get("rejection_confidence") == "high":
+                rejected.append(review["parameter"])
+                log("info", f"Adversarial review REJECTED {review['parameter']}: {review.get('counter_argument', '')[:100]}")
+
+        if rejected:
+            log("info", f"Adversarial debate rejected {len(rejected)}/{len(analysis.parameterChanges)} proposed changes")
+        else:
+            log("info", "Adversarial debate: all proposed changes survived")
+
+        return rejected
+    except Exception as err:
+        log("warn", f"Adversarial review failed (proceeding without): {err}")
+        return []
+
+
 def run_analysis(config: ScannerConfig,
                   strategy_selector: Optional[StrategySelector] = None) -> Optional[Analysis]:
     if not env.anthropic_api_key:
@@ -285,6 +360,14 @@ def run_analysis(config: ScannerConfig,
         log("error", f"Log analyzer: Claude response failed validation — {err}")
         return None
 
+    # Adversarial debate: challenge proposed changes
+    rejected_params = _adversarial_review(analysis)
+    if rejected_params:
+        analysis.parameterChanges = [
+            c for c in analysis.parameterChanges
+            if c.parameter not in rejected_params
+        ]
+
     result = _apply_changes(config, analysis.parameterChanges)
 
     if result["applied"] or result["rejected"]:
@@ -315,5 +398,24 @@ def run_analysis(config: ScannerConfig,
             suggestion=f"[Data Source] {ds.source}: {ds.rationale}",
             context=f"Priority: {ds.priority}. Claude analysis (health={analysis.overallHealthScore}/100): {analysis.summary[:200]}",
         )
+
+    # Visual chart analysis for top traded symbols
+    trades = get_closed_trades(50)
+    chart_symbols = list(dict.fromkeys(t.symbol for t in trades))[:3]  # top 3 most recent
+    for sym in chart_symbols:
+        try:
+            chart_png = render_chart(sym)
+            if chart_png:
+                visual = analyze_chart(sym, chart_png, context=analysis.summary[:200])
+                if visual:
+                    log("info", f"Chart analysis for {sym}: {visual[:300]}", symbol=sym)
+        except Exception as err:
+            log("warn", f"Chart analysis skipped for {sym}: {err}", symbol=sym)
+
+    # Record analysis in memory for future context
+    memory = get_analysis_memory()
+    insights = analysis.topIssues + [si.observation for si in analysis.strategyInsights]
+    memory.record_analysis(analysis.summary, insights)
+    memory.decay_and_prune()
 
     return analysis

@@ -72,7 +72,126 @@ def kelly_size(strategy: str, portfolio_usd: float, qual_score: float) -> float:
     # Cap qual_multiplier at 1.0 so high-qual trades never exceed quarter-Kelly
     qual_multiplier = min(1.0, 0.5 + (qual_score / 100))
     raw_usd = fraction * portfolio_usd * qual_multiplier
+
+    # Apply drawdown scaling
+    raw_usd = apply_drawdown_scaling(raw_usd, portfolio_usd)
+
     return safe_score(raw_usd, _MIN_SIZE_USD, env.max_position_usd)
+
+
+# ─── Graduated drawdown reduction ────────────────────────────────────────────
+
+_peak_lock = threading.Lock()
+_peak_portfolio_usd: float = 0.0
+
+
+def update_peak(portfolio_usd: float) -> None:
+    """Update peak portfolio value for drawdown calculation."""
+    global _peak_portfolio_usd
+    with _peak_lock:
+        if portfolio_usd > _peak_portfolio_usd:
+            _peak_portfolio_usd = portfolio_usd
+
+
+def apply_drawdown_scaling(base_size_usd: float, portfolio_usd: float) -> float:
+    """Reduce position size based on drawdown from peak.
+
+    Drawdown tiers:
+      0%  -> 100% size
+      5%  -> 75% size
+      10% -> 50% size
+      15% -> 25% size
+      20%+ -> 10% size
+
+    Uses linear interpolation between tiers.
+    """
+    with _peak_lock:
+        peak = _peak_portfolio_usd
+
+    if peak <= 0 or portfolio_usd >= peak:
+        return base_size_usd
+
+    drawdown_pct = (peak - portfolio_usd) / peak
+
+    # Define tiers: (drawdown_threshold, size_multiplier)
+    tiers = [
+        (0.00, 1.00),
+        (0.05, 0.75),
+        (0.10, 0.50),
+        (0.15, 0.25),
+        (0.20, 0.10),
+    ]
+
+    # Find the tier bracket
+    if drawdown_pct >= tiers[-1][0]:
+        multiplier = tiers[-1][1]
+    else:
+        for i in range(len(tiers) - 1):
+            if tiers[i][0] <= drawdown_pct < tiers[i + 1][0]:
+                # Linear interpolation
+                t0, m0 = tiers[i]
+                t1, m1 = tiers[i + 1]
+                ratio = (drawdown_pct - t0) / (t1 - t0)
+                multiplier = m0 + ratio * (m1 - m0)
+                break
+        else:
+            multiplier = 1.0
+
+    return base_size_usd * multiplier
+
+
+# ─── Correlation-aware sizing ─────────────────────────────────────────────────
+
+# Correlation groups: assets that move together get reduced sizing when stacked
+_CORRELATION_GROUPS: dict[str, str] = {
+    "BTC": "btc",
+    "ETH": "eth_l1",
+    "SOL": "alt_l1", "AVAX": "alt_l1", "NEAR": "alt_l1", "SUI": "alt_l1", "APT": "alt_l1",
+    "MATIC": "eth_l2", "ARB": "eth_l2", "OP": "eth_l2", "BASE": "eth_l2",
+    "DOGE": "meme", "SHIB": "meme", "PEPE": "meme", "WIF": "meme", "BONK": "meme",
+    "LINK": "defi_infra", "AAVE": "defi_infra", "UNI": "defi_infra", "MKR": "defi_infra",
+}
+
+# Discount per additional same-group same-side position
+_CORRELATION_DISCOUNT_PER_POS = 0.30  # 30% reduction per correlated position
+_MIN_CORRELATION_MULTIPLIER = 0.25    # never reduce below 25% of original size
+
+
+def apply_correlation_discount(base_size_usd: float, symbol: str, side: str,
+                               open_positions: list) -> float:
+    """Reduce position size when entering a correlated asset on the same side.
+
+    Args:
+        base_size_usd: Size before correlation adjustment.
+        symbol: Symbol being entered (e.g., "SOL").
+        side: "long" or "short".
+        open_positions: List of Position objects currently open.
+
+    Returns:
+        Adjusted size in USD.
+    """
+    # Strip common suffixes to get base symbol
+    base_sym = symbol.replace("-USD", "").replace("-USDT", "").replace("USDT", "").replace("USD", "")
+    group = _CORRELATION_GROUPS.get(base_sym)
+    if not group:
+        return base_size_usd
+
+    # Count same-group same-side positions
+    correlated_count = 0
+    for pos in open_positions:
+        pos_sym = pos.symbol.replace("-USD", "").replace("-USDT", "").replace("USDT", "").replace("USD", "")
+        if pos_sym == base_sym:
+            continue  # same symbol handled by max-per-symbol check elsewhere
+        pos_group = _CORRELATION_GROUPS.get(pos_sym)
+        if pos_group == group and pos.side == side:
+            correlated_count += 1
+
+    if correlated_count == 0:
+        return base_size_usd
+
+    multiplier = max(_MIN_CORRELATION_MULTIPLIER,
+                     1.0 - correlated_count * _CORRELATION_DISCOUNT_PER_POS)
+    return base_size_usd * multiplier
 
 
 def log_kelly_rationale(strategy: str) -> str:

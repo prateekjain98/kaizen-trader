@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict
+from typing import Optional
 
 from src.config import env, default_scanner_config, validate_config
 from src.evaluation.strategy_selector import StrategySelector, SelectionConfig
@@ -21,7 +22,7 @@ from src.risk.portfolio import (
     init_protections, can_open_position, register_open, register_close,
     update_position_price, get_open_positions,
 )
-from src.risk.position_sizer import kelly_size
+from src.risk.position_sizer import kelly_size, apply_correlation_discount
 from src.risk.protections import DEFAULT_PROTECTIONS
 from src.self_healing.log_analyzer import run_analysis
 from src.self_healing.healer import on_position_closed
@@ -32,6 +33,10 @@ from src.signals.social import fetch_social_sentiment, SocialSentiment
 from src.signals.funding import fetch_funding_data
 from src.signals.whale import poll_whale_alerts
 from src.signals.protocol import fetch_protocol_revenue
+from src.signals.token_unlocks import fetch_token_unlocks, is_unlock_risk, TokenUnlock
+from src.signals.options import fetch_options_sentiment, OptionsSentiment
+from src.signals.stablecoin import fetch_stablecoin_flows, StablecoinFlows
+from src.signals.derivatives import fetch_derivatives_data, DerivativesData
 from src.storage.database import (
     log, insert_position, insert_trade, update_position_close,
     get_closed_trades, batch_writes, close as close_db,
@@ -99,6 +104,18 @@ _news_cache: dict[str, NewsSentiment] = {}  # symbol -> NewsSentiment
 _social_lock = threading.Lock()
 _social_cache: dict[str, SocialSentiment] = {}  # symbol -> SocialSentiment
 
+_options_lock = threading.Lock()
+_options_cache: dict[str, OptionsSentiment] = {}  # symbol -> OptionsSentiment
+
+_derivatives_lock = threading.Lock()
+_derivatives_cache: dict[str, DerivativesData] = {}  # symbol -> DerivativesData
+
+_stablecoin_lock = threading.Lock()
+_stablecoin_cache: Optional[StablecoinFlows] = None
+
+_unlock_risks: set[str] = set()  # symbols with upcoming large unlocks
+_unlock_lock = threading.Lock()
+
 # Tick-driven scan throttle: avoid scanning on every single tick
 _last_scan_time: dict[str, float] = {}
 _MIN_SCAN_INTERVAL_S = 2.0  # at most one full scan per symbol every 2s
@@ -127,9 +144,16 @@ def _refresh_market_context() -> None:
     global _market_ctx
     try:
         ctx = _build_market_context()
+        # Enrich with regime detection
+        regime = classify_regime("BTC")
+        # Override phase with regime-detected phase if available
+        if regime.phase != "unknown":
+            ctx.phase = regime.phase
         with _market_ctx_lock:
             _market_ctx = ctx
-        log("info", f"Market context refreshed: phase={ctx.phase} FGI={ctx.fear_greed_index}")
+        log("info",
+            f"Market context refreshed: phase={ctx.phase} FGI={ctx.fear_greed_index} "
+            f"regime={regime.trend}/{regime.volatility} score={regime.regime_score:.0f}")
     except Exception as err:
         log("error", f"Failed to refresh market context: {err}")
 
@@ -197,6 +221,50 @@ def _refresh_signals() -> None:
     except Exception as err:
         log("error", f"Protocol revenue scan failed: {err}")
 
+    # Token unlock risk detection
+    try:
+        risk_symbols = set()
+        for sym in symbols:
+            if is_unlock_risk(sym):
+                risk_symbols.add(sym)
+        with _unlock_lock:
+            _unlock_risks.clear()
+            _unlock_risks.update(risk_symbols)
+        if risk_symbols:
+            log("info", f"Token unlock risk active for: {', '.join(sorted(risk_symbols))}")
+    except Exception as err:
+        log("error", f"Token unlock check failed: {err}")
+
+    # Options sentiment (BTC + ETH only)
+    for sym in ("BTC", "ETH"):
+        try:
+            opt = fetch_options_sentiment(sym)
+            if opt:
+                with _options_lock:
+                    _options_cache[sym] = opt
+        except Exception as err:
+            log("error", f"Options sentiment fetch failed for {sym}: {err}")
+
+    # Stablecoin flows (global, not per-symbol)
+    try:
+        global _stablecoin_cache
+        flows = fetch_stablecoin_flows()
+        if flows:
+            with _stablecoin_lock:
+                _stablecoin_cache = flows
+    except Exception as err:
+        log("error", f"Stablecoin flows fetch failed: {err}")
+
+    # Derivatives data (futures basis, OI, funding from Binance)
+    for sym in symbols[:10]:  # top 10 symbols only to respect rate limits
+        try:
+            deriv = fetch_derivatives_data(sym)
+            if deriv:
+                with _derivatives_lock:
+                    _derivatives_cache[sym] = deriv
+        except Exception as err:
+            log("error", f"Derivatives fetch failed for {sym}: {err}")
+
 
 def _scan_protocol_revenue_signals() -> None:
     """Fetch protocol revenue data and scan for trade signals."""
@@ -229,14 +297,30 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     if not strategy_selector.is_strategy_enabled(signal.strategy):
         return
 
-    # Get news/social for qualification
+    # Get signal data for qualification
     with _news_lock:
         news = _news_cache.get(signal.symbol)
     with _social_lock:
         social = _social_cache.get(signal.symbol)
+    with _options_lock:
+        options = _options_cache.get(signal.symbol)
+    with _derivatives_lock:
+        derivatives = _derivatives_cache.get(signal.symbol)
+    with _stablecoin_lock:
+        stablecoin = _stablecoin_cache
+    with _unlock_lock:
+        has_unlock_risk = signal.symbol in _unlock_risks
+
+    cvd = get_cvd_snapshot(signal.symbol)
+    regime = classify_regime(signal.symbol)
 
     # Qualify
-    qual = qualify(signal, ctx, config, news=news, social=social)
+    qual = qualify(
+        signal, ctx, config,
+        news=news, social=social, cvd=cvd, regime=regime,
+        options=options, derivatives=derivatives,
+        stablecoin=stablecoin, has_unlock_risk=has_unlock_risk,
+    )
     if not qual.passed:
         return
 
@@ -256,6 +340,10 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     if size_usd <= 0:
         log("info", f"Kelly sizing returned 0 for {signal.strategy}", symbol=signal.symbol)
         return
+
+    # Correlation-aware discount: reduce size when stacking correlated assets
+    open_pos = get_open_positions()
+    size_usd = apply_correlation_discount(size_usd, signal.symbol, signal.side, open_pos)
 
     # Determine trail and hold time based on tier
     if signal.tier == "scalp":
