@@ -12,6 +12,8 @@ __pycache__/
 *.pyc
 data/
 convex/_generated/
+convex/node_modules/
 .agents/
 .claude/
 skills-lock.json
+package-lock.json

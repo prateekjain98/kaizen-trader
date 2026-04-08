@@ -1,11 +1,8 @@
 {
-  "name": "kaizen-trader-convex",
+  "name": "kaizen-trader",
   "version": "1.0.0",
   "private": true,
   "dependencies": {
     "convex": "^1.17.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.5.0"
   }
 }
