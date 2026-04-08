@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Python 3.11+
-- SQLite (included with Python)
+- Convex account (free tier — database backend)
 - Coinbase Advanced Trade account (for price feed + execution)
 - Anthropic API key (for self-healing log analysis)
 
@@ -56,14 +56,11 @@ MAX_OPEN_POSITIONS=5
 LOG_ANALYSIS_INTERVAL_MINS=60
 MIN_TRADES_FOR_ANALYSIS=10
 
-# ── Optional — dual-write to Convex for real-time dashboard ───────────────────
-CONVEX_URL=
+# ── Required — Convex database ────────────────────────────────────────────────
+CONVEX_URL=                       # e.g., https://your-project.convex.cloud
 
 # ── Optional — auto GitHub issue creation ─────────────────────────────────────
 GITHUB_REPO=                      # e.g., prateekjain98/kaizen-trader
-
-# ── Database ──────────────────────────────────────────────────────────────────
-DB_PATH=trader.db
 
 # ── Health check ──────────────────────────────────────────────────────────────
 PORT=8080
@@ -103,26 +100,22 @@ python scripts/backtest.py --symbol ETH --start 2025-03-01 --end 2025-06-01 --co
 
 ## Querying the database
 
-```bash
-# Win rate by strategy
-sqlite3 trader.db "
-  SELECT strategy,
-    COUNT(*) as trades,
-    ROUND(100.0 * SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) / COUNT(*), 1) as win_pct,
-    ROUND(SUM(pnl_usd), 2) as total_pnl
-  FROM positions WHERE status='closed'
-  GROUP BY strategy ORDER BY total_pnl DESC;"
+All data is stored in Convex. Use the Convex dashboard at your `CONVEX_URL` to browse tables directly, or use the bot's Python read APIs:
 
-# Recent self-healer actions
-sqlite3 trader.db "
-  SELECT symbol, loss_reason, action, datetime(timestamp/1000, 'unixepoch') as at
-  FROM diagnoses ORDER BY timestamp DESC LIMIT 20;"
+```python
+from src.storage.database import (
+    get_open_positions, get_closed_trades, get_recent_logs,
+    get_recent_diagnoses, get_trade_journal,
+)
 
-# Check config evolution
-sqlite3 trader.db "
-  SELECT reason, config, timestamp
-  FROM scanner_config_history
-  ORDER BY timestamp DESC LIMIT 20;"
+# Recent closed trades
+closed = get_closed_trades(limit=100)
+
+# Self-healer diagnoses
+diagnoses = get_recent_diagnoses(limit=20)
+
+# Error/warning logs
+logs = get_recent_logs(limit=50, level="error")
 ```
 
 ## Deployment
@@ -137,7 +130,7 @@ sqlite3 trader.db "
 railway up
 ```
 
-Set environment variables in the Railway dashboard. Health check at `/health` on port 8080. Persistent volume at `/data` for SQLite fallback.
+Set environment variables in the Railway dashboard. Health check at `/health` on port 8080.
 
 ### Docker (alternative)
 

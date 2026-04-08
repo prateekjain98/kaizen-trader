@@ -38,10 +38,10 @@ from src.signals.token_unlocks import fetch_token_unlocks, is_unlock_risk, Token
 from src.signals.options import fetch_options_sentiment, OptionsSentiment
 from src.signals.stablecoin import fetch_stablecoin_flows, StablecoinFlows
 from src.signals.derivatives import fetch_derivatives_data, fetch_leverage_profile, DerivativesData
+import src.storage.database as _db_mod
 from src.storage.database import (
     log, insert_position, insert_trade, update_position_close,
     get_closed_trades, batch_writes, close as close_db,
-    init_dual_write,
 )
 from src.strategies.registry import get_registry
 from src.strategies.momentum import push_price_sample, scan_momentum
@@ -1209,12 +1209,12 @@ def main() -> None:
     portfolio_usd = get_paper_balance() if env.paper_trading else env.portfolio_usd
     update_peak(portfolio_usd)
 
-    # ── Initialize Convex database (primary) + SQLite (local fallback) ─────
-    if env.convex_url:
-        init_dual_write(env.convex_url)
-        log("info", "Database: Convex (primary) + SQLite (fallback)")
-    else:
-        log("warn", "CONVEX_URL not set — using SQLite only (local dev mode)")
+    # ── Initialize Convex database ──────────────────────────────────────────
+    if not env.convex_url:
+        print("[FATAL] CONVEX_URL not set. Set it in your .env file.")
+        sys.exit(1)
+    _db_mod.init(env.convex_url)
+    log("info", "Database: Convex initialized")
 
     # ── Start health check server (for Railway) ────────────────────────────
     _start_health_server()

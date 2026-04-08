@@ -1,4 +1,4 @@
-"""Tests for the Convex storage client and DualWriteBackend."""
+"""Tests for the Convex storage client."""
 
 import json
 import time
@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch, call
 
 from src.types import Position, Trade, TradeDiagnosis, ScannerConfig
 from src.storage.convex_client import ConvexStorage
-from src.storage.backend import DualWriteBackend, StorageBackend
 
 
 def _now_ms() -> float:
@@ -57,7 +56,6 @@ class TestConvexStorageQueue(unittest.TestCase):
     """Test the queue-based flush mechanism."""
 
     def test_enqueue_adds_items(self):
-        """Items are added to the internal queue."""
         mock_client = MagicMock()
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
         pos = _make_position()
@@ -65,7 +63,6 @@ class TestConvexStorageQueue(unittest.TestCase):
         assert storage.pending_count == 1
 
     def test_drain_queue_calls_client_mutation(self):
-        """Draining processes queued items via client.mutation()."""
         mock_client = MagicMock()
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
         pos = _make_position()
@@ -80,18 +77,15 @@ class TestConvexStorageQueue(unittest.TestCase):
         assert storage.pending_count == 0
 
     def test_drain_queue_handles_mutation_error(self):
-        """Mutation errors are caught, not propagated."""
         mock_client = MagicMock()
         mock_client.mutation.side_effect = RuntimeError("network error")
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
         storage.insert_position(_make_position())
 
-        # Should not raise
         storage._drain_queue()
         assert storage.pending_count == 0
 
     def test_multiple_writes_queued(self):
-        """Multiple different writes all land in the queue."""
         mock_client = MagicMock()
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
 
@@ -111,17 +105,15 @@ class TestConvexStorageFlushThread(unittest.TestCase):
     """Test that the flush thread processes items."""
 
     def test_flush_thread_processes_items(self):
-        """The background thread drains items within a few seconds."""
         mock_client = MagicMock()
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
-        storage._flush_interval = 0.1  # speed up for test
+        storage._flush_interval = 0.1
 
         storage.start()
         try:
             storage.insert_position(_make_position())
             storage.insert_trade(_make_trade())
 
-            # Wait for flush thread to process
             deadline = time.time() + 3.0
             while storage.pending_count > 0 and time.time() < deadline:
                 time.sleep(0.05)
@@ -132,17 +124,15 @@ class TestConvexStorageFlushThread(unittest.TestCase):
             storage.stop()
 
     def test_graceful_shutdown_flushes_remaining(self):
-        """stop() drains any remaining items before returning."""
         mock_client = MagicMock()
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
-        storage._flush_interval = 10.0  # long interval so thread won't flush
+        storage._flush_interval = 0.2  # short interval so join is fast
 
         storage.start()
         storage.insert_position(_make_position())
         storage.insert_trade(_make_trade())
         storage.insert_diagnosis(_make_diagnosis())
 
-        # stop() should drain remaining items
         storage.stop()
 
         assert storage.pending_count == 0
@@ -153,7 +143,6 @@ class TestConvexStorageDataMapping(unittest.TestCase):
     """Test correct data mapping from Python types to Convex args."""
 
     def test_position_close_sends_correct_args(self):
-        """update_position_close maps fields correctly."""
         mock_client = MagicMock()
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
 
@@ -171,7 +160,6 @@ class TestConvexStorageDataMapping(unittest.TestCase):
         assert "closedAt" in payload
 
     def test_snapshot_config_serializes_dataclass(self):
-        """snapshot_config correctly serializes a ScannerConfig dataclass."""
         mock_client = MagicMock()
         storage = ConvexStorage(url="https://test.convex.cloud", client=mock_client)
 
@@ -185,69 +173,6 @@ class TestConvexStorageDataMapping(unittest.TestCase):
         parsed = json.loads(payload["config"])
         assert parsed["momentum_pct_swing"] == 0.02
         assert payload["reason"] == "test snapshot"
-
-
-class TestDualWriteBackend(unittest.TestCase):
-    """Test that DualWriteBackend delegates to both backends."""
-
-    def _make_backends(self):
-        primary = MagicMock(spec=["insert_position", "update_position_close",
-                                   "insert_trade", "log", "insert_diagnosis",
-                                   "snapshot_config"])
-        fallback = MagicMock(spec=["insert_position", "update_position_close",
-                                    "insert_trade", "log", "insert_diagnosis",
-                                    "snapshot_config"])
-        return primary, fallback
-
-    def test_delegates_to_both_backends(self):
-        """Both primary and fallback receive the write."""
-        primary, fallback = self._make_backends()
-        dual = DualWriteBackend(primary=primary, fallback=fallback)
-        pos = _make_position()
-
-        dual.insert_position(pos)
-
-        primary.insert_position.assert_called_once_with(pos)
-        fallback.insert_position.assert_called_once_with(pos)
-
-    def test_primary_failure_still_writes_fallback(self):
-        """If primary fails, fallback still gets the write."""
-        primary, fallback = self._make_backends()
-        primary.insert_trade.side_effect = RuntimeError("convex down")
-        dual = DualWriteBackend(primary=primary, fallback=fallback)
-        trade = _make_trade()
-
-        # Should not raise
-        dual.insert_trade(trade)
-
-        fallback.insert_trade.assert_called_once_with(trade)
-        primary.insert_trade.assert_called_once_with(trade)
-
-    def test_all_methods_delegate(self):
-        """Every StorageBackend method is forwarded by DualWriteBackend."""
-        primary, fallback = self._make_backends()
-        dual = DualWriteBackend(primary=primary, fallback=fallback)
-
-        dual.insert_position(_make_position())
-        dual.update_position_close("pos-1", 2100.0, 50.0, 0.05, "trailing_stop")
-        dual.insert_trade(_make_trade())
-        dual.log("info", "test")
-        dual.insert_diagnosis(_make_diagnosis())
-        dual.snapshot_config(ScannerConfig(), "test")
-
-        assert primary.insert_position.call_count == 1
-        assert primary.update_position_close.call_count == 1
-        assert primary.insert_trade.call_count == 1
-        assert primary.log.call_count == 1
-        assert primary.insert_diagnosis.call_count == 1
-        assert primary.snapshot_config.call_count == 1
-
-        assert fallback.insert_position.call_count == 1
-        assert fallback.update_position_close.call_count == 1
-        assert fallback.insert_trade.call_count == 1
-        assert fallback.log.call_count == 1
-        assert fallback.insert_diagnosis.call_count == 1
-        assert fallback.snapshot_config.call_count == 1
 
 
 if __name__ == "__main__":

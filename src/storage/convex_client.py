@@ -1,4 +1,8 @@
-"""Convex Python SDK wrapper with background flush queue."""
+"""Convex storage client — the single database backend.
+
+Writes are queued and flushed in a background thread every 1 second
+to avoid blocking the trading hot path. Reads are synchronous.
+"""
 
 from __future__ import annotations
 
@@ -16,28 +20,22 @@ from src.types import Position, Trade, LogEntry, TradeDiagnosis
 
 
 class ConvexStorage:
-    """Wraps the Convex Python SDK. Mirrors database.py function signatures.
+    """Wraps the Convex Python SDK.
 
-    Writes are queued and flushed in a background thread every 1 second
-    to avoid blocking the trading hot path. The queue is thread-safe.
+    Writes are async (queued and flushed in background).
+    Reads are sync (blocking call to Convex query).
     """
 
     def __init__(self, url: Optional[str] = None, client: Any = None):
-        """Initialize ConvexStorage.
-
-        Args:
-            url: Convex deployment URL. Falls back to CONVEX_URL env var.
-            client: Optional pre-built Convex client (useful for testing).
-        """
         self.url = url or os.environ.get("CONVEX_URL", "")
         self._client = client
         self._queue: queue.Queue = queue.Queue()
         self._flush_thread: Optional[threading.Thread] = None
         self._running = False
-        self._flush_interval = 1.0  # seconds
+        self._flush_interval = 1.0
+        self._paper_trading = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 
     def _get_client(self) -> Any:
-        """Lazily initialize the Convex client."""
         if self._client is None:
             try:
                 from convex import ConvexClient
@@ -50,7 +48,6 @@ class ConvexStorage:
         return self._client
 
     def start(self) -> None:
-        """Start the background flush thread."""
         if self._running:
             return
         self._running = True
@@ -60,21 +57,27 @@ class ConvexStorage:
         self._flush_thread.start()
 
     def stop(self) -> None:
-        """Flush remaining items and stop."""
         self._running = False
         if self._flush_thread and self._flush_thread.is_alive():
             self._flush_thread.join(timeout=10.0)
-        # Final drain of any remaining items
         self._drain_queue()
 
+    def close(self) -> None:
+        self.stop()
+
     def _flush_loop(self) -> None:
-        """Flush queued writes to Convex every flush_interval seconds."""
         while self._running:
             time.sleep(self._flush_interval)
             self._drain_queue()
 
+    # Mutations that must not be silently dropped
+    _CRITICAL_MUTATIONS = frozenset({
+        "mutations:insertPosition",
+        "mutations:updatePositionClose",
+        "mutations:insertTrade",
+    })
+
     def _drain_queue(self) -> None:
-        """Process all items currently in the queue."""
         items: list[tuple[str, dict]] = []
         while True:
             try:
@@ -82,22 +85,33 @@ class ConvexStorage:
             except queue.Empty:
                 break
 
+        if not items:
+            return
+
         client = self._get_client()
         for mutation_name, args in items:
-            try:
-                client.mutation(mutation_name, args)
-            except Exception as exc:
-                # Print error but don't crash the flush loop
-                print(f"[CONVEX ERROR] Failed to call {mutation_name}: {exc}")
+            retries = 3 if mutation_name in self._CRITICAL_MUTATIONS else 1
+            for attempt in range(retries):
+                try:
+                    client.mutation(mutation_name, args)
+                    break
+                except Exception as exc:
+                    if attempt < retries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+                    else:
+                        print(f"[CONVEX ERROR] Failed to call {mutation_name} "
+                              f"after {retries} attempt(s): {exc}")
 
     def _enqueue(self, mutation_name: str, args: dict) -> None:
-        """Add a mutation call to the flush queue."""
         self._queue.put((mutation_name, args))
 
-    # ─── Write operations ─────────────────────────────────────────────────
+    @property
+    def pending_count(self) -> int:
+        return self._queue.qsize()
+
+    # ─── Write operations (async, queued) ──────────────────────────────────
 
     def insert_position(self, p: Position) -> None:
-        """Queue a position insert."""
         self._enqueue("mutations:insertPosition", {
             "positionId": p.id,
             "symbol": p.symbol,
@@ -128,7 +142,6 @@ class ConvexStorage:
 
     def update_position_close(self, id: str, exit_price: float, pnl_usd: float,
                               pnl_pct: float, exit_reason: str) -> None:
-        """Queue a position close update."""
         now = int(time.time() * 1000)
         self._enqueue("mutations:updatePositionClose", {
             "positionId": id,
@@ -136,11 +149,10 @@ class ConvexStorage:
             "pnlUsd": pnl_usd,
             "pnlPct": pnl_pct,
             "exitReason": exit_reason,
-            "closedAt": float(now),
+            "closedAt": now,
         })
 
     def insert_trade(self, t: Trade) -> None:
-        """Queue a trade insert."""
         self._enqueue("mutations:insertTrade", {
             "tradeId": t.id,
             "positionId": t.position_id,
@@ -158,7 +170,6 @@ class ConvexStorage:
 
     def log(self, level: str, message: str, symbol: str | None = None,
             strategy: str | None = None, data: dict | None = None) -> None:
-        """Queue a log entry insert."""
         now = int(time.time() * 1000)
         self._enqueue("mutations:insertLog", {
             "logId": str(uuid.uuid4()),
@@ -167,16 +178,14 @@ class ConvexStorage:
             "symbol": symbol,
             "strategy": strategy,
             "data": json.dumps(data) if data else None,
-            "ts": float(now),
+            "ts": now,
         })
 
-        # Also print to stdout like the SQLite logger does
         ts_str = datetime.fromtimestamp(now / 1000, tz=timezone.utc).isoformat()
         sym_tag = f" [{symbol}]" if symbol else ""
         print(f"[{ts_str}] [{level.upper()}]{sym_tag} {message}")
 
     def insert_diagnosis(self, d: TradeDiagnosis) -> None:
-        """Queue a diagnosis insert."""
         self._enqueue("mutations:insertDiagnosis", {
             "positionId": d.position_id,
             "symbol": d.symbol,
@@ -193,7 +202,6 @@ class ConvexStorage:
         })
 
     def snapshot_config(self, config: object, reason: str) -> None:
-        """Queue a config snapshot."""
         config_dict = (
             dataclasses.asdict(config)
             if dataclasses.is_dataclass(config) and not isinstance(config, type)
@@ -202,14 +210,109 @@ class ConvexStorage:
         self._enqueue("mutations:snapshotConfig", {
             "config": json.dumps(config_dict),
             "reason": reason,
-            "timestamp": float(int(time.time() * 1000)),
+            "timestamp": int(time.time() * 1000),
         })
 
-    def close(self) -> None:
-        """Alias for stop() — flush and shut down."""
-        self.stop()
+    def insert_trade_journal(self, entry: dict) -> None:
+        self._enqueue("mutations:insertTradeJournal", {
+            "positionId": entry["position_id"],
+            "symbol": entry["symbol"],
+            "strategy": entry["strategy"],
+            "rMultiple": entry.get("r_multiple"),
+            "holdHours": entry.get("hold_hours"),
+            "maePct": entry.get("mae_pct"),
+            "mfePct": entry.get("mfe_pct"),
+            "partialExitPct": entry.get("partial_exit_pct"),
+            "exitReason": entry.get("exit_reason"),
+            "pnlPct": entry.get("pnl_pct"),
+            "regimeAtEntry": entry.get("regime_at_entry"),
+            "regimeAtExit": entry.get("regime_at_exit"),
+            "wasPartialBeneficial": entry.get("was_partial_beneficial"),
+            "timestamp": entry["timestamp"],
+        })
 
-    @property
-    def pending_count(self) -> int:
-        """Number of items waiting to be flushed. Useful for monitoring."""
-        return self._queue.qsize()
+    # ─── Read operations (sync) ────────────────────────────────────────────
+
+    def get_open_positions(self) -> list[Position]:
+        client = self._get_client()
+        rows = client.query("queries:getOpenPositions", {
+            "paperTrading": self._paper_trading,
+        })
+        return [self._row_to_position(r) for r in (rows or [])]
+
+    def get_closed_trades(self, limit: int = 200) -> list[Position]:
+        client = self._get_client()
+        rows = client.query("queries:getClosedTrades", {
+            "limit": limit,
+            "paperTrading": self._paper_trading,
+        })
+        return [self._row_to_position(r) for r in (rows or [])]
+
+    def get_recent_logs(self, limit: int = 500, level: str | None = None) -> list[LogEntry]:
+        client = self._get_client()
+        args: dict[str, Any] = {"limit": limit}
+        if level:
+            args["level"] = level
+        rows = client.query("queries:getRecentLogs", args)
+        return [self._row_to_log(r) for r in (rows or [])]
+
+    def get_recent_diagnoses(self, limit: int = 50) -> list[TradeDiagnosis]:
+        client = self._get_client()
+        rows = client.query("queries:getRecentDiagnoses", {"limit": limit})
+        return [self._row_to_diagnosis(r) for r in (rows or [])]
+
+    def get_trade_journal(self, limit: int = 50) -> list[dict]:
+        client = self._get_client()
+        rows = client.query("queries:getTradeJournal", {"limit": limit})
+        return rows or []
+
+    # ─── Row converters (Convex camelCase → Python dataclass) ──────────────
+
+    @staticmethod
+    def _row_to_position(r: dict) -> Position:
+        return Position(
+            id=r["positionId"], symbol=r["symbol"], product_id=r["productId"],
+            strategy=r["strategy"], side=r["side"], tier=r["tier"],
+            entry_price=r["entryPrice"], quantity=r["quantity"],
+            size_usd=r["sizeUsd"], opened_at=r["openedAt"],
+            high_watermark=r["highWatermark"], low_watermark=r["lowWatermark"],
+            current_price=r["currentPrice"], trail_pct=r["trailPct"],
+            stop_price=r["stopPrice"], max_hold_ms=r["maxHoldMs"],
+            qual_score=r["qualScore"], signal_id=r["signalId"],
+            status=r["status"], exit_price=r.get("exitPrice"),
+            closed_at=r.get("closedAt"), pnl_usd=r.get("pnlUsd"),
+            pnl_pct=r.get("pnlPct"), exit_reason=r.get("exitReason"),
+            paper_trading=r.get("paperTrading", True),
+        )
+
+    @staticmethod
+    def _row_to_log(r: dict) -> LogEntry:
+        raw_data = r.get("data")
+        parsed_data = None
+        if raw_data:
+            try:
+                parsed_data = json.loads(raw_data)
+            except (json.JSONDecodeError, TypeError):
+                parsed_data = None
+        return LogEntry(
+            id=r["logId"], level=r["level"], message=r["message"],
+            symbol=r.get("symbol"), strategy=r.get("strategy"),
+            data=parsed_data, ts=r["ts"],
+        )
+
+    @staticmethod
+    def _row_to_diagnosis(r: dict) -> TradeDiagnosis:
+        raw_changes = r.get("parameterChanges", "{}")
+        try:
+            param_changes = json.loads(raw_changes) if raw_changes else {}
+        except (json.JSONDecodeError, TypeError):
+            param_changes = {}
+        return TradeDiagnosis(
+            position_id=r["positionId"], symbol=r["symbol"],
+            strategy=r["strategy"], pnl_pct=r["pnlPct"],
+            hold_ms=r["holdMs"], exit_reason=r["exitReason"],
+            loss_reason=r["lossReason"], entry_qual_score=r["entryQualScore"],
+            market_phase_at_entry=r["marketPhaseAtEntry"], action=r["action"],
+            parameter_changes=param_changes,
+            timestamp=r["timestamp"],
+        )

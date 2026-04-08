@@ -35,8 +35,7 @@ flowchart LR
     end
 
     subgraph storage["Storage"]
-        DB[("SQLite\nlocal + WAL")]
-        CX[("Convex\nreal-time + optional")]
+        CX[("Convex\nreal-time database")]
     end
 
     subgraph auto["Automation"]
@@ -45,12 +44,11 @@ flowchart LR
 
     feeds --> STRAT
     EXEC -->|"loss"| L1
-    L1 --> DB
+    L1 --> CX
     L3 -->|"revert if worsened"| STRAT
     L4 -->|"disable/enable"| STRAT
-    DB -->|"metrics + history"| L2
+    CX -->|"metrics + history"| L2
     L2 -->|"parameter patch"| STRAT
-    DB -.->|"dual-write"| CX
     L1 -.-> GH
     L4 -.-> GH
     L2 -.-> GH
@@ -65,7 +63,7 @@ flowchart LR
     class WS,CP,LC,WA,BN,DL,FG feed
     class REG,STRAT,QUAL,EXEC core
     class KELLY,PROT risk
-    class DB,CX db
+    class CX db
     class L1,L2,L3,L4 heal
     class GH auto
 ```
@@ -77,9 +75,7 @@ flowchart TB
     subgraph railway["Railway ($20/mo)"]
         BOT["Python Bot\npython -m src.main"]
         HEALTH["/health :8080"]
-        VOL[("Persistent Volume\n/data — SQLite fallback")]
         BOT --> HEALTH
-        BOT --> VOL
     end
 
     subgraph convex["Convex (Free)"]
@@ -108,7 +104,7 @@ flowchart TB
     classDef web fill:#1e1733,stroke:#8957e5,color:#d2a8ff
     classDef ext fill:#261700,stroke:#9e6a03,color:#e3b341
 
-    class BOT,HEALTH,VOL infra
+    class BOT,HEALTH infra
     class TABLES,CRON db
     class DASH,API web
     class CB_API,BN_API ext
@@ -156,21 +152,16 @@ Strategies are discovered at startup by scanning `src/strategies/` for `scan_*` 
 3. Duplicate strategy ID detection (raises `ValueError`)
 4. Thread-safe lazy initialization with double-checked locking
 
-### Why SQLite + optional Convex (not Postgres)?
+### Why Convex (not Postgres or SQLite)?
 
-**SQLite** is the primary store because:
-- Zero infrastructure — ships with Python
-- WAL mode handles concurrent reads + serialized writes
-- `CLAUDE.md` instructions use raw `sqlite3` CLI commands
-- Local = no network latency in the hot tick-processing path
-
-**Convex** is the optional real-time layer because:
+**Convex** is the sole database because:
 - Native real-time subscriptions — dashboard gets live updates via `useQuery`, no polling
 - Free tier (16M fn calls/mo, 1GB storage) covers this use case
 - Native cron jobs for metric aggregation
-- Python SDK is client-only, which is fine — we just need mutations
+- Python SDK client with async background flush queue (writes don't block the tick-processing hot path)
+- Schema enforcement and indexes defined in TypeScript (`convex/schema.ts`)
 
-The `DualWriteBackend` writes to SQLite first (guaranteed), then Convex (fire-and-forget via background queue). If Convex is down, SQLite continues without interruption.
+Writes are queued in-process and flushed every 1 second via a background thread. Reads are synchronous blocking calls to Convex queries.
 
 ### Why chain-of-thought prompting for Claude?
 
@@ -226,7 +217,7 @@ sequenceDiagram
     participant Portfolio as portfolio.can_open()
     participant Sizer as kelly_size()
     participant Exec as paper_buy()
-    participant DB as SQLite + Convex
+    participant DB as Convex
 
     WS->>Registry: tick SOL @ $182.50 vol=2.4x
     Registry->>Scanner: iterate enabled strategies
@@ -239,7 +230,7 @@ sequenceDiagram
     Sizer-->>Exec: place $91 buy
     Note over Exec: fill @ 182.59 (0.05% slip)
     Exec->>DB: INSERT position + trade
-    DB-->>DB: dual-write to Convex (async)
+    DB-->>DB: async flush (background thread)
 ```
 
 ## Thread architecture
@@ -261,7 +252,6 @@ Main thread
 All threads coordinate via:
 - `threading.Event` for graceful shutdown
 - `threading.Lock` / `RLock` on all shared mutable state
-- `threading.local()` for per-thread batch commit flags
 - `queue.Queue` for Convex background flush
 
 ## Storage schema

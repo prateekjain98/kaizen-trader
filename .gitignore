@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.env.local
 *.local
 /tmp/
 *.db
@@ -10,3 +11,7 @@ dist/
 __pycache__/
 *.pyc
 data/
+convex/_generated/
+.agents/
+.claude/
+skills-lock.json

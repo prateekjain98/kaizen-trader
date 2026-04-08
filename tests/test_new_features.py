@@ -174,8 +174,8 @@ class TestSignalDecay:
 # ─── Trade Journal ───────────────────────────────────────────────────────────
 
 class TestTradeJournal:
-    def test_insert_and_retrieve(self):
-        from src.storage.database import insert_trade_journal, get_trade_journal
+    def test_insert_delegates_to_storage(self, _mock_convex_storage):
+        from src.storage.database import insert_trade_journal
 
         entry = {
             "id": str(uuid.uuid4()),
@@ -195,48 +195,31 @@ class TestTradeJournal:
             "timestamp": _now_ms(),
         }
         insert_trade_journal(entry)
+        _mock_convex_storage.insert_trade_journal.assert_called_once_with(entry)
 
+    def test_get_journal_delegates_to_storage(self, _mock_convex_storage):
+        from src.storage.database import get_trade_journal
+
+        _mock_convex_storage.get_trade_journal.return_value = [
+            {"position_id": "pos-1", "symbol": "ETH", "strategy": "momentum_swing"},
+        ]
         journal = get_trade_journal(limit=10)
-        assert len(journal) >= 1
-        latest = journal[0]
-        assert latest["position_id"] == "test-pos-1"
-        assert latest["symbol"] == "ETH"
-        assert latest["r_multiple"] == 1.5
-        assert latest["strategy"] == "momentum_swing"
+        assert len(journal) == 1
+        assert journal[0]["position_id"] == "pos-1"
 
-    def test_journal_ordering(self):
-        from src.storage.database import insert_trade_journal, get_trade_journal
-
-        now = _now_ms()
-        for i in range(3):
-            insert_trade_journal({
-                "id": str(uuid.uuid4()),
-                "position_id": f"pos-{i}",
-                "symbol": "SOL",
-                "strategy": "mean_reversion",
-                "timestamp": now + i * 1000,
-            })
-
-        journal = get_trade_journal(limit=3)
-        # Should be ordered by timestamp DESC
-        assert journal[0]["position_id"] == "pos-2"
-
-    def test_journal_with_none_values(self):
-        from src.storage.database import insert_trade_journal, get_trade_journal
+    def test_journal_with_none_values(self, _mock_convex_storage):
+        from src.storage.database import insert_trade_journal
 
         entry = {
             "id": str(uuid.uuid4()),
             "position_id": "test-pos-none",
             "symbol": "BTC",
             "strategy": "funding_extreme",
-            "timestamp": _now_ms() + 999_999,  # far future to ensure it's first
+            "timestamp": _now_ms(),
             # All optional fields missing
         }
         insert_trade_journal(entry)
-
-        journal = get_trade_journal(limit=1)
-        assert journal[0]["position_id"] == "test-pos-none"
-        assert journal[0]["r_multiple"] is None
+        _mock_convex_storage.insert_trade_journal.assert_called_once_with(entry)
 
 
 # ─── Regime-Aware Exits ──────────────────────────────────────────────────────
