@@ -1169,7 +1169,9 @@ def main() -> None:
     log("info", "--- Self-Healing Crypto Trader starting ---",
         data={
             "paper_trading": env.paper_trading,
+            "portfolio_usd": env.portfolio_usd,
             "max_position_usd": env.max_position_usd,
+            "max_open_positions": env.max_open_positions,
             "log_analysis_interval_mins": env.log_analysis_interval_mins,
         })
 
@@ -1178,6 +1180,18 @@ def main() -> None:
 
     if not env.anthropic_api_key:
         log("warn", "ANTHROPIC_API_KEY not set — Claude log analysis disabled")
+
+    # Required API keys
+    _missing_keys = []
+    if not env.coinbase_api_key:
+        _missing_keys.append("COINBASE_API_KEY")
+    if not env.lunarcrush_api_key:
+        _missing_keys.append("LUNARCRUSH_API_KEY (required for social signals)")
+    if not env.binance_api_key:
+        log("warn", "BINANCE_API_KEY not set — Binance signals, derivatives, and cross-exchange strategy disabled")
+    if _missing_keys:
+        log("error", f"Missing required API keys: {', '.join(_missing_keys)}")
+        sys.exit(1)
 
     # CONFIG_BOUNDS validation at startup
     violations = validate_config(config)
@@ -1191,15 +1205,16 @@ def main() -> None:
     for entry in registry.values():
         log("info", log_kelly_rationale(entry.strategy_id))
 
-    # Initialize portfolio peak with current balance
-    portfolio_usd = get_paper_balance() if env.paper_trading else env.max_position_usd * env.max_open_positions
+    # Initialize portfolio peak with configured portfolio size
+    portfolio_usd = get_paper_balance() if env.paper_trading else env.portfolio_usd
     update_peak(portfolio_usd)
 
-    # ── Initialize dual-write backend (SQLite + Convex) if configured ─────
-    convex_url = os.environ.get("CONVEX_URL")
-    if convex_url:
-        init_dual_write(convex_url)
-        log("info", "Dual-write enabled: SQLite + Convex")
+    # ── Initialize Convex database (primary) + SQLite (local fallback) ─────
+    if env.convex_url:
+        init_dual_write(env.convex_url)
+        log("info", "Database: Convex (primary) + SQLite (fallback)")
+    else:
+        log("warn", "CONVEX_URL not set — using SQLite only (local dev mode)")
 
     # ── Start health check server (for Railway) ────────────────────────────
     _start_health_server()
