@@ -94,3 +94,31 @@ def scan_whale_accumulation(
         )
 
     return None
+
+
+def get_net_exchange_flow() -> dict:
+    """Aggregate exchange flows across all tracked symbols.
+
+    Returns:
+        Dict with 'net_flow_usd' (positive = outflow/bullish, negative = inflow/bearish),
+        'total_inflow', 'total_outflow', 'symbols_tracked'.
+    """
+    now = time.time() * 1000
+    total_inflow = 0.0
+    total_outflow = 0.0
+    active_symbols = 0
+
+    for sym, state in _flow_windows.items():
+        if now - state.last_ts > _WINDOW_MS:
+            continue  # stale data
+        total_inflow += state.inflow_to_exchange
+        total_outflow += state.outflow_from_exchange
+        active_symbols += 1
+
+    net = total_outflow - total_inflow
+    return {
+        "net_flow_usd": net,
+        "total_inflow_usd": total_inflow,
+        "total_outflow_usd": total_outflow,
+        "symbols_tracked": active_symbols,
+    }

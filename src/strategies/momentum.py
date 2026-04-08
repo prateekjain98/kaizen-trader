@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+from src.indicators.core import compute_atr
 from src.types import TradeSignal, ScannerConfig, MarketContext
 
 
@@ -76,6 +77,26 @@ def _set_cooldown(symbol: str, ms: float) -> None:
     _cooldowns[symbol] = time.time() * 1000 + ms
 
 
+def _vol_adjusted_threshold(symbol: str, base_threshold: float, current_price: float) -> float:
+    """Adjust momentum threshold by realized volatility.
+
+    If ATR/price > 3% (high vol coin), raise the threshold proportionally.
+    If ATR/price < 1% (low vol coin), lower it.
+    Returns the adjusted threshold.
+    """
+    atr = compute_atr(symbol)
+    if atr <= 0 or current_price <= 0:
+        return base_threshold
+    # ATR as fraction of price (typical: 1-5% for crypto)
+    atr_pct = atr / current_price
+    # Normalize: base assumption is 2% ATR/price
+    vol_factor = atr_pct / 0.02 if atr_pct > 0 else 1.0
+    # Scale threshold: higher vol -> higher threshold (harder to trigger)
+    # Clamp factor to [0.5, 2.5] to avoid extremes
+    vol_factor = max(0.5, min(2.5, vol_factor))
+    return base_threshold * vol_factor
+
+
 def scan_momentum(
     symbol: str, product_id: str, current_price: float,
     config: ScannerConfig, ctx: MarketContext,
@@ -84,9 +105,10 @@ def scan_momentum(
         return None
     now = time.time() * 1000
 
-    # Swing tier
+    # Swing tier — use volatility-adjusted threshold
     swing = _compute_momentum(_swing_buffers.get(symbol, []))
-    if swing and swing["pct"] >= config.momentum_pct_swing:
+    adj_threshold_swing = _vol_adjusted_threshold(symbol, config.momentum_pct_swing, current_price)
+    if swing and swing["pct"] >= adj_threshold_swing:
         volume_ok = swing["current_volume"] >= swing["avg_volume"] * config.volume_multiplier_swing
         if volume_ok:
             market_bonus = 10 if ctx.phase == "bull" else (-15 if ctx.phase == "bear" else 0)
@@ -106,9 +128,10 @@ def scan_momentum(
                     expires_at=now + 300_000, created_at=now,
                 )
 
-    # Scalp tier
+    # Scalp tier — use volatility-adjusted threshold
     scalp = _compute_momentum(_scalp_buffers.get(symbol, []))
-    if scalp and scalp["pct"] >= config.momentum_pct_scalp:
+    adj_threshold_scalp = _vol_adjusted_threshold(symbol, config.momentum_pct_scalp, current_price)
+    if scalp and scalp["pct"] >= adj_threshold_scalp:
         volume_ok = scalp["current_volume"] >= scalp["avg_volume"] * config.volume_multiplier_scalp
         buf = _scalp_buffers.get(symbol, [])
         recent_2m = [s for s in buf if s.ts >= now - 120_000]

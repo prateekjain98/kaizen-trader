@@ -216,6 +216,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
             timestamp INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS trade_journal (
+            id TEXT PRIMARY KEY,
+            position_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            r_multiple REAL,
+            hold_hours REAL,
+            mae_pct REAL,
+            mfe_pct REAL,
+            partial_exit_pct REAL,
+            exit_reason TEXT,
+            pnl_pct REAL,
+            regime_at_entry TEXT,
+            regime_at_exit TEXT,
+            was_partial_beneficial INTEGER,
+            timestamp REAL NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
         CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol);
         CREATE INDEX IF NOT EXISTS idx_trades_position ON trades(position_id);
@@ -428,6 +446,38 @@ def _row_to_log(r: sqlite3.Row) -> LogEntry:
         ts=r["ts"],
     )
 
+
+# ─── Trade Journal ────────────────────────────────────────────────────────
+
+def insert_trade_journal(entry: dict) -> None:
+    """Insert a structured trade journal entry."""
+    with _write_lock:
+        db().execute(
+            """INSERT INTO trade_journal (id, position_id, symbol, strategy, r_multiple,
+               hold_hours, mae_pct, mfe_pct, partial_exit_pct, exit_reason, pnl_pct,
+               regime_at_entry, regime_at_exit, was_partial_beneficial, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (entry["id"], entry["position_id"], entry["symbol"], entry["strategy"],
+             entry.get("r_multiple"), entry.get("hold_hours"), entry.get("mae_pct"),
+             entry.get("mfe_pct"), entry.get("partial_exit_pct"), entry.get("exit_reason"),
+             entry.get("pnl_pct"), entry.get("regime_at_entry"), entry.get("regime_at_exit"),
+             entry.get("was_partial_beneficial"), entry["timestamp"]),
+        )
+        _auto_commit()
+
+
+def get_trade_journal(limit: int = 50) -> list[dict]:
+    """Get recent trade journal entries."""
+    rows = db().execute(
+        "SELECT * FROM trade_journal ORDER BY timestamp DESC LIMIT ?", (limit,)
+    ).fetchall()
+    cols = ["id", "position_id", "symbol", "strategy", "r_multiple", "hold_hours",
+            "mae_pct", "mfe_pct", "partial_exit_pct", "exit_reason", "pnl_pct",
+            "regime_at_entry", "regime_at_exit", "was_partial_beneficial", "timestamp"]
+    return [dict(zip(cols, row)) for row in rows]
+
+
+# ─── Row converters ────────────────────────────────────────────────────────
 
 def _row_to_diagnosis(r: sqlite3.Row) -> TradeDiagnosis:
     raw_changes = r["parameter_changes"]

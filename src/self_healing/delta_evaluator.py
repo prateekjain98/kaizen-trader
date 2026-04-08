@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from src.config import CONFIG_BOUNDS
+from src.self_healing.analysis_memory import get_analysis_memory
 from src.storage.database import log, get_closed_trades, snapshot_config
 from src.types import Position
 
@@ -133,6 +134,19 @@ class DeltaEvaluator:
                     data={"delta_id": delta.id, "parameter": delta.parameter})
 
             evaluated.append(delta)
+
+            # Reinforce analysis memory based on delta verdict
+            try:
+                memory = get_analysis_memory()
+                profitable = delta.verdict == "improved"
+                memory.reinforce(delta.parameter, profitable)
+                if delta.reason:
+                    # Also reinforce insights matching the change reason
+                    for word in delta.reason.split()[:5]:
+                        if len(word) > 4:
+                            memory.reinforce(word, profitable)
+            except Exception:
+                pass  # memory reinforcement is best-effort
 
         return evaluated
 

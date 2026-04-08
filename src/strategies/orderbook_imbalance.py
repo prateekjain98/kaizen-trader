@@ -45,6 +45,25 @@ def _sum_book_depth(levels: list[OrderBookLevel], from_price: float, price_pct: 
     )
 
 
+def get_bid_ask_spread(symbol: str) -> Optional[float]:
+    """Return the bid-ask spread as a fraction of mid price, or None if no book data.
+
+    E.g., 0.005 means 0.5% spread.
+    """
+    book = _order_books.get(symbol)
+    if not book or not book.bids or not book.asks:
+        return None
+    now = time.time() * 1000
+    if now - book.last_updated > 30_000:
+        return None  # stale book data
+    best_bid = book.bids[0].price
+    best_ask = book.asks[0].price
+    if best_bid <= 0 or best_ask <= 0:
+        return None
+    mid = (best_bid + best_ask) / 2
+    return (best_ask - best_bid) / mid
+
+
 def scan_orderbook_imbalance(
     symbol: str, product_id: str, current_price: float,
     config: ScannerConfig,

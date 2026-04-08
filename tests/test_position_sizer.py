@@ -1,9 +1,13 @@
 """Tests for Kelly Criterion position sizing."""
 
 import pytest
+from dataclasses import dataclass
 from unittest.mock import patch
 
-from src.risk.position_sizer import kelly_size, log_kelly_rationale, StrategyStats
+from src.risk.position_sizer import (
+    kelly_size, log_kelly_rationale, StrategyStats,
+    apply_correlation_discount, apply_drawdown_scaling, update_peak,
+)
 
 
 def _mock_stats(win_rate=0.6, avg_win_pct=0.05, avg_loss_pct=0.03, sample_size=50):
@@ -115,3 +119,99 @@ class TestLogKellyRationale:
         assert "win_rate=60%" in msg
         assert "avg_win=5.0%" in msg
         assert "quarter_kelly=" in msg
+
+
+@dataclass
+class _FakePosition:
+    symbol: str
+    side: str
+
+
+class TestCorrelationDiscount:
+    def test_no_correlated_positions_no_discount(self):
+        result = apply_correlation_discount(1000, "SOL-USD", "long", [])
+        assert result == 1000
+
+    def test_unknown_symbol_no_discount(self):
+        result = apply_correlation_discount(1000, "OBSCURE-USD", "long", [
+            _FakePosition("SOL-USD", "long"),
+        ])
+        assert result == 1000
+
+    def test_one_correlated_position_30pct_reduction(self):
+        result = apply_correlation_discount(1000, "SOL-USD", "long", [
+            _FakePosition("AVAX-USD", "long"),  # same alt_l1 group
+        ])
+        assert abs(result - 700) < 1  # 30% reduction
+
+    def test_two_correlated_positions(self):
+        result = apply_correlation_discount(1000, "SOL-USD", "long", [
+            _FakePosition("AVAX-USD", "long"),
+            _FakePosition("NEAR-USD", "long"),
+        ])
+        assert abs(result - 400) < 1  # 60% reduction
+
+    def test_three_correlated_hits_floor(self):
+        result = apply_correlation_discount(1000, "SOL-USD", "long", [
+            _FakePosition("AVAX-USD", "long"),
+            _FakePosition("NEAR-USD", "long"),
+            _FakePosition("SUI-USD", "long"),
+        ])
+        assert abs(result - 250) < 1  # floor at 25%
+
+    def test_opposite_side_not_correlated(self):
+        result = apply_correlation_discount(1000, "SOL-USD", "long", [
+            _FakePosition("AVAX-USD", "short"),  # opposite side
+        ])
+        assert result == 1000  # no discount
+
+    def test_same_symbol_ignored(self):
+        result = apply_correlation_discount(1000, "SOL-USD", "long", [
+            _FakePosition("SOL-USD", "long"),  # same symbol, handled elsewhere
+        ])
+        assert result == 1000
+
+    def test_different_groups_no_discount(self):
+        result = apply_correlation_discount(1000, "BTC-USD", "long", [
+            _FakePosition("ETH-USD", "long"),  # different group
+            _FakePosition("SOL-USD", "long"),  # different group
+        ])
+        assert result == 1000
+
+
+class TestDrawdownScaling:
+    def test_no_peak_no_scaling(self):
+        result = apply_drawdown_scaling(1000, 10000)
+        # peak is 0 initially, so no scaling
+        assert result == 1000
+
+    def test_at_peak_no_scaling(self):
+        import src.risk.position_sizer as ps
+        with ps._peak_lock:
+            old_peak = ps._peak_portfolio_usd
+        update_peak(10000)
+        result = apply_drawdown_scaling(1000, 10000)
+        assert result == 1000
+        # Restore
+        with ps._peak_lock:
+            ps._peak_portfolio_usd = old_peak
+
+    def test_5pct_drawdown_75pct_size(self):
+        import src.risk.position_sizer as ps
+        with ps._peak_lock:
+            old_peak = ps._peak_portfolio_usd
+        update_peak(10000)
+        result = apply_drawdown_scaling(1000, 9500)  # 5% drawdown
+        assert abs(result - 750) < 1
+        with ps._peak_lock:
+            ps._peak_portfolio_usd = old_peak
+
+    def test_20pct_drawdown_10pct_size(self):
+        import src.risk.position_sizer as ps
+        with ps._peak_lock:
+            old_peak = ps._peak_portfolio_usd
+        update_peak(10000)
+        result = apply_drawdown_scaling(1000, 8000)  # 20% drawdown
+        assert abs(result - 100) < 1
+        with ps._peak_lock:
+            ps._peak_portfolio_usd = old_peak

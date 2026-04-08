@@ -156,3 +156,20 @@ def compute_max_drawdown() -> float:
         if dd > max_dd:
             max_dd = dd
     return max_dd
+
+
+def compute_cvar(confidence: float = 0.95) -> Optional[float]:
+    """Compute Conditional Value at Risk (Expected Shortfall).
+
+    Returns the average loss in the worst (1-confidence) fraction of days.
+    E.g., at 95% confidence, returns the average of the worst 5% of daily returns.
+    Returns None if insufficient data (<30 days).
+    """
+    with _lock:
+        returns_snapshot = list(_daily_returns)
+    if len(returns_snapshot) < 30:
+        return None
+    sorted_returns = sorted(returns_snapshot)
+    cutoff_idx = max(1, int(len(sorted_returns) * (1 - confidence)))
+    tail = sorted_returns[:cutoff_idx]
+    return sum(tail) / len(tail) if tail else None

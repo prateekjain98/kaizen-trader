@@ -309,6 +309,67 @@ Only rate "high" confidence if you have a strong, specific reason the change wou
         return []
 
 
+def _ensemble_verify(prompt: str, primary_changes: list[ParameterChange],
+                     client: anthropic.Anthropic) -> list[ParameterChange]:
+    """Run 2 additional analyses with Sonnet at different temperatures.
+
+    Only keep parameter changes from the primary analysis that also appear
+    in at least 1 of the 2 ensemble runs (i.e., 2/3 majority).
+    Uses Sonnet for cost efficiency (~10x cheaper than Opus).
+    """
+    if not primary_changes:
+        return primary_changes
+
+    ensemble_params: dict[str, int] = {}  # parameter -> vote count
+    for c in primary_changes:
+        ensemble_params[c.parameter] = 1  # primary vote
+
+    temperatures = [0.3, 1.0]  # primary was ~0.7 (default)
+
+    for temp in temperatures:
+        try:
+            message = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2048,
+                temperature=temp,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            block = message.content[0]
+            if block.type != "text":
+                continue
+
+            raw = block.text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+
+            parsed = json.loads(raw.strip())
+            ensemble_analysis = Analysis(**parsed)
+
+            for c in ensemble_analysis.parameterChanges:
+                if c.parameter in ensemble_params:
+                    ensemble_params[c.parameter] += 1
+        except Exception as err:
+            log("warn", f"Ensemble run (temp={temp}) failed: {err}")
+            # If an ensemble run fails, give all primary changes a bonus vote
+            # so they aren't unfairly filtered out
+            for p in ensemble_params:
+                ensemble_params[p] = max(ensemble_params[p], 2)
+
+    # Keep only changes with 2+ votes (appeared in primary + at least 1 ensemble)
+    surviving = [c for c in primary_changes if ensemble_params.get(c.parameter, 0) >= 2]
+    filtered_count = len(primary_changes) - len(surviving)
+
+    if filtered_count:
+        filtered_names = [c.parameter for c in primary_changes if ensemble_params.get(c.parameter, 0) < 2]
+        log("info", f"Ensemble filter removed {filtered_count} changes (no majority): {', '.join(filtered_names)}")
+    else:
+        log("info", f"Ensemble filter: all {len(surviving)} changes confirmed by majority vote")
+
+    return surviving
+
+
 def run_analysis(config: ScannerConfig,
                   strategy_selector: Optional[StrategySelector] = None) -> Optional[Analysis]:
     if not env.anthropic_api_key:
@@ -367,6 +428,13 @@ def run_analysis(config: ScannerConfig,
             c for c in analysis.parameterChanges
             if c.parameter not in rejected_params
         ]
+
+    # Ensemble verification: run 2 additional quick analyses with Sonnet
+    # Only keep parameter changes that appear in 2+ of the 3 total analyses
+    if analysis.parameterChanges and env.anthropic_api_key:
+        analysis.parameterChanges = _ensemble_verify(
+            prompt, analysis.parameterChanges, client
+        )
 
     result = _apply_changes(config, analysis.parameterChanges)
 

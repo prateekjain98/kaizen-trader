@@ -48,7 +48,9 @@ def discover_strategies(strategies_dir: Optional[str] = None) -> dict[str, Strat
         module_name = f"src.strategies.{py_file.stem}"
         try:
             module = importlib.import_module(module_name)
-        except Exception:
+        except Exception as err:
+            import logging
+            logging.getLogger(__name__).warning("Failed to import strategy %s: %s", module_name, err)
             continue
 
         meta = getattr(module, "STRATEGY_META", None)

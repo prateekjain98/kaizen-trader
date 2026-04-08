@@ -157,34 +157,33 @@ _CORRELATION_DISCOUNT_PER_POS = 0.30  # 30% reduction per correlated position
 _MIN_CORRELATION_MULTIPLIER = 0.25    # never reduce below 25% of original size
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """Strip exchange suffixes to get base symbol (e.g. 'SOL-USD' -> 'SOL')."""
+    return symbol.replace("-USD", "").replace("-USDT", "").replace("USDT", "").replace("USD", "")
+
+
+def _sector_exposure(group: str, open_positions: list) -> float:
+    """Sum current USD exposure in a correlation group across open positions."""
+    return sum(
+        pos.size_usd for pos in open_positions
+        if _CORRELATION_GROUPS.get(_normalize_symbol(pos.symbol)) == group
+    )
+
+
 def apply_correlation_discount(base_size_usd: float, symbol: str, side: str,
                                open_positions: list) -> float:
-    """Reduce position size when entering a correlated asset on the same side.
-
-    Args:
-        base_size_usd: Size before correlation adjustment.
-        symbol: Symbol being entered (e.g., "SOL").
-        side: "long" or "short".
-        open_positions: List of Position objects currently open.
-
-    Returns:
-        Adjusted size in USD.
-    """
-    # Strip common suffixes to get base symbol
-    base_sym = symbol.replace("-USD", "").replace("-USDT", "").replace("USDT", "").replace("USD", "")
+    """Reduce position size when entering a correlated asset on the same side."""
+    base_sym = _normalize_symbol(symbol)
     group = _CORRELATION_GROUPS.get(base_sym)
     if not group:
         return base_size_usd
 
-    # Count same-group same-side positions
-    correlated_count = 0
-    for pos in open_positions:
-        pos_sym = pos.symbol.replace("-USD", "").replace("-USDT", "").replace("USDT", "").replace("USD", "")
-        if pos_sym == base_sym:
-            continue  # same symbol handled by max-per-symbol check elsewhere
-        pos_group = _CORRELATION_GROUPS.get(pos_sym)
-        if pos_group == group and pos.side == side:
-            correlated_count += 1
+    correlated_count = sum(
+        1 for pos in open_positions
+        if _normalize_symbol(pos.symbol) != base_sym
+        and _CORRELATION_GROUPS.get(_normalize_symbol(pos.symbol)) == group
+        and pos.side == side
+    )
 
     if correlated_count == 0:
         return base_size_usd
@@ -192,6 +191,29 @@ def apply_correlation_discount(base_size_usd: float, symbol: str, side: str,
     multiplier = max(_MIN_CORRELATION_MULTIPLIER,
                      1.0 - correlated_count * _CORRELATION_DISCOUNT_PER_POS)
     return base_size_usd * multiplier
+
+
+# ─── Sector exposure limits ──────────────────────────────────────────────────
+
+_MAX_SECTOR_EXPOSURE_PCT = 0.30  # max 30% of portfolio in one correlation group
+
+
+def check_sector_exposure(symbol: str, side: str, proposed_size_usd: float,
+                          portfolio_usd: float, open_positions: list) -> float:
+    """Cap position size so total sector exposure doesn't exceed 30% of portfolio."""
+    base_sym = _normalize_symbol(symbol)
+    group = _CORRELATION_GROUPS.get(base_sym)
+    if not group or portfolio_usd <= 0:
+        return proposed_size_usd
+
+    max_sector_usd = portfolio_usd * _MAX_SECTOR_EXPOSURE_PCT
+    current_exposure = _sector_exposure(group, open_positions)
+
+    remaining = max_sector_usd - current_exposure
+    if remaining <= 0:
+        return 0.0
+
+    return min(proposed_size_usd, remaining)
 
 
 def log_kelly_rationale(strategy: str) -> str:

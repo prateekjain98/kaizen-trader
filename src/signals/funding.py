@@ -23,12 +23,7 @@ class FundingData:
 
 _oi_history: dict[str, dict] = {}
 
-SYMBOL_MAP: dict[str, str] = {
-    "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "BNB": "BNBUSDT",
-    "ARB": "ARBUSDT", "OP": "OPUSDT", "AVAX": "AVAXUSDT", "MATIC": "MATICUSDT",
-    "LINK": "LINKUSDT", "UNI": "UNIUSDT", "AAVE": "AAVEUSDT", "DOGE": "DOGEUSDT",
-    "SUI": "SUIUSDT", "APT": "APTUSDT", "SEI": "SEIUSDT", "TIA": "TIAUSDT",
-}
+from src.utils.binance_symbols import BINANCE_SYMBOL_MAP as SYMBOL_MAP  # noqa: E402
 
 _BASE = "https://fapi.binance.com"
 _last_fetch_at: float = 0
@@ -107,7 +102,8 @@ def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
                     open_interest_change_24h=oi_change,
                     sampled_at=now,
                 ))
-            except Exception:
+            except Exception as err:
+                log("warn", f"Failed to parse funding data for a symbol: {err}")
                 continue
 
         _breaker.record_success()

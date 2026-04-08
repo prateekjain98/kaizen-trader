@@ -145,7 +145,11 @@ class MaxDrawdownGuard(ProtectionRule):
 
 
 class CooldownPeriod(ProtectionRule):
-    """Enforce a cooldown period after N consecutive losses."""
+    """Global cooldown after N consecutive losses across ALL strategies.
+
+    Differs from src.risk.loss_cooldown which tracks per-strategy streaks.
+    This is a portfolio-level protection that halts all trading.
+    """
 
     name = "cooldown"
 
@@ -176,6 +180,58 @@ class CooldownPeriod(ProtectionRule):
         self._consecutive_losses = 0
 
 
+class RapidDrawdownHalt(ProtectionRule):
+    """Emergency halt when portfolio drops too fast.
+
+    Tracks rolling daily and weekly P&L. If daily drawdown exceeds
+    daily_halt_pct or weekly exceeds weekly_halt_pct, block all trading.
+    More aggressive than MaxDrawdownGuard — this is for catastrophic events.
+    """
+
+    name = "rapid_drawdown_halt"
+
+    def __init__(self, daily_halt_pct: float = 0.05, weekly_halt_pct: float = 0.10,
+                 starting_equity: float = 10_000):
+        self.daily_halt_pct = daily_halt_pct
+        self.weekly_halt_pct = weekly_halt_pct
+        self._starting_equity = starting_equity
+        self._daily_pnl: float = 0.0
+        self._weekly_pnl: float = 0.0
+        self._trade_count_today: int = 0
+
+    def on_trade_closed(self, position: Position, pnl_usd: float) -> None:
+        self._daily_pnl += pnl_usd
+        self._weekly_pnl += pnl_usd
+        self._trade_count_today += 1
+
+    def check(self, ctx: ProtectionContext) -> ProtectionVerdict:
+        equity = self._starting_equity
+        if equity <= 0:
+            return ProtectionVerdict(allowed=True)
+
+        daily_dd = -self._daily_pnl / equity if self._daily_pnl < 0 else 0
+        weekly_dd = -self._weekly_pnl / equity if self._weekly_pnl < 0 else 0
+
+        if daily_dd >= self.daily_halt_pct:
+            return ProtectionVerdict(
+                allowed=False, rule_name=self.name,
+                reason=f"EMERGENCY HALT: Daily loss {daily_dd*100:.1f}% exceeds {self.daily_halt_pct*100:.0f}% "
+                       f"(${-self._daily_pnl:.2f} on {self._trade_count_today} trades)",
+            )
+        if weekly_dd >= self.weekly_halt_pct:
+            return ProtectionVerdict(
+                allowed=False, rule_name=self.name,
+                reason=f"EMERGENCY HALT: Weekly loss {weekly_dd*100:.1f}% exceeds {self.weekly_halt_pct*100:.0f}% "
+                       f"(${-self._weekly_pnl:.2f})",
+            )
+        return ProtectionVerdict(allowed=True)
+
+    def on_day_reset(self) -> None:
+        self._daily_pnl = 0.0
+        self._trade_count_today = 0
+        # Weekly PnL is NOT reset daily — it accumulates
+
+
 # ── Protection Chain ──────────────────────────────────────────────────────
 
 
@@ -185,6 +241,7 @@ _RULE_TYPES: dict[str, type] = {
     "stoploss_guard": StoplossGuard,
     "max_drawdown": MaxDrawdownGuard,
     "cooldown": CooldownPeriod,
+    "rapid_drawdown_halt": RapidDrawdownHalt,
 }
 
 
@@ -232,4 +289,5 @@ DEFAULT_PROTECTIONS: list[dict] = [
     {"rule_type": "stoploss_guard", "params": {"max_consecutive_stops": 3, "lookback_ms": 3_600_000}},
     {"rule_type": "max_drawdown", "params": {"max_drawdown_pct": 0.15}},
     {"rule_type": "cooldown", "params": {"cooldown_ms": 1_800_000, "trigger_after_n_losses": 4}},
+    {"rule_type": "rapid_drawdown_halt", "params": {"daily_halt_pct": 0.05, "weekly_halt_pct": 0.10}},
 ]
