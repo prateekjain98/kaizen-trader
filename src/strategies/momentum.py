@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from src.indicators.core import compute_atr
+from src.indicators.core import get_atr
 from src.types import TradeSignal, ScannerConfig, MarketContext
 
 
@@ -84,8 +84,8 @@ def _vol_adjusted_threshold(symbol: str, base_threshold: float, current_price: f
     If ATR/price < 1% (low vol coin), lower it.
     Returns the adjusted threshold.
     """
-    atr = compute_atr(symbol)
-    if atr <= 0 or current_price <= 0:
+    atr = get_atr(symbol)
+    if atr is None or atr <= 0 or current_price <= 0:
         return base_threshold
     # ATR as fraction of price (typical: 1-5% for crypto)
     atr_pct = atr / current_price
