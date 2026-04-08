@@ -1,7 +1,5 @@
-"""Coinbase Advanced Trade REST executor."""
+"""Coinbase Advanced Trade REST executor using JWT auth."""
 
-import hashlib
-import hmac
 import json
 import threading
 import time
@@ -35,13 +33,11 @@ class ExchangeError(Exception):
         super().__init__(message)
 
 
-def _sign(timestamp: int, method: str, path: str, body: str) -> str:
-    message = f"{timestamp}{method.upper()}{path}{body}"
-    return hmac.new(
-        (env.coinbase_api_secret or "").encode(),
-        message.encode(),
-        hashlib.sha256,
-    ).hexdigest()
+def _build_jwt(method: str, path: str) -> str:
+    """Build a JWT for Coinbase Advanced Trade API using the official SDK."""
+    from coinbase import jwt_generator
+    uri = f"{method.upper()} {path}"
+    return jwt_generator.build_rest_jwt(uri, env.coinbase_api_key or "", env.coinbase_api_secret or "")
 
 
 def _enforce_rate_limit() -> None:
@@ -70,14 +66,11 @@ def _cb_request(method: str, path: str, body: dict | None = None) -> dict:
     if not env.coinbase_api_key or not env.coinbase_api_secret:
         raise ExchangeError("MISSING_CREDENTIALS", "Coinbase API key/secret not configured")
 
-    timestamp = int(time.time())
     body_str = json.dumps(body) if body else ""
-    signature = _sign(timestamp, method, path, body_str)
+    jwt_token = _build_jwt(method, path)
 
     headers = {
-        "CB-ACCESS-KEY": env.coinbase_api_key,
-        "CB-ACCESS-SIGN": signature,
-        "CB-ACCESS-TIMESTAMP": str(timestamp),
+        "Authorization": f"Bearer {jwt_token}",
         "Content-Type": "application/json",
     }
 

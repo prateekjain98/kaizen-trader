@@ -590,7 +590,8 @@ def _try_scan(scan_fn, ctx: MarketContext) -> None:
         if sig:
             _process_signal(sig, ctx)
     except Exception as err:
-        log("error", f"Strategy scan error: {err}")
+        import traceback
+        log("error", f"Strategy scan error: {err}", data={"traceback": traceback.format_exc()[-500:]})
 
 
 def _try_scan_correlation(symbol: str, product_id: str, price: float, ctx: MarketContext) -> None:
@@ -1192,13 +1193,15 @@ def main() -> None:
     _missing_keys = []
     if not env.coinbase_api_key:
         _missing_keys.append("COINBASE_API_KEY")
-    if not env.lunarcrush_api_key:
-        _missing_keys.append("LUNARCRUSH_API_KEY (required for social signals)")
-    if not env.binance_api_key:
-        log("warn", "BINANCE_API_KEY not set — Binance signals, derivatives, and cross-exchange strategy disabled")
     if _missing_keys:
         log("error", f"Missing required API keys: {', '.join(_missing_keys)}")
         sys.exit(1)
+
+    # Optional API keys — features degrade gracefully without them
+    if not env.lunarcrush_api_key:
+        log("warn", "LUNARCRUSH_API_KEY not set — social signals disabled, narrative_momentum strategy will not fire")
+    if not env.binance_api_key:
+        log("warn", "BINANCE_API_KEY not set — Binance signals, derivatives, and cross-exchange strategy disabled")
 
     # CONFIG_BOUNDS validation at startup
     violations = validate_config(config)

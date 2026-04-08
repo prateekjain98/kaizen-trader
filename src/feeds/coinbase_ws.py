@@ -1,20 +1,13 @@
-"""Coinbase Advanced Trade WebSocket feed."""
+"""Coinbase Advanced Trade WebSocket feed using the official SDK."""
 
 import json
 import threading
 import time
 from typing import Callable, Optional
 
-import websocket
-
+from src.config import env
 from src.storage.database import log
 
-WS_URL = "wss://advanced-trade-ws.coinbase.com"
-MAX_BACKOFF_MS = 30_000
-MAX_RECONNECT_ATTEMPTS = 10
-PING_INTERVAL_S = 20
-PING_TIMEOUT_S = 10
-SUBSCRIPTION_TIMEOUT_S = 10
 BOOK_STALE_S = 60
 
 _book_state: dict[str, dict] = {}
@@ -54,163 +47,178 @@ class CoinbaseWebSocket:
         self.product_ids = product_ids
         self.on_tick = on_tick
         self.on_book = on_book
-        self._ws: Optional[websocket.WebSocketApp] = None
+        self._client = None
         self._status = "disconnected"
-        self._reconnect_attempts = 0
-        self._reconnect_timer: Optional[threading.Timer] = None
-        self._reconnect_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
-        self._subscription_confirmed = False
+        self._tick_count = 0
 
     def connect(self) -> None:
         if self._status in ("connected", "connecting"):
             return
         self._status = "connecting"
-        log("info", f"Coinbase WS connecting (attempt {self._reconnect_attempts + 1})...")
 
-        ws = websocket.WebSocketApp(
-            WS_URL,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
-        self._ws = ws
-        self._thread = threading.Thread(
-            target=ws.run_forever,
-            kwargs={"ping_interval": PING_INTERVAL_S, "ping_timeout": PING_TIMEOUT_S},
-            daemon=True,
-        )
+        try:
+            from coinbase.websocket import WSClient
+        except ImportError:
+            log("error", "coinbase-advanced-py not installed — pip install coinbase-advanced-py")
+            return
+
+        api_key = env.coinbase_api_key or ""
+        api_secret = env.coinbase_api_secret or ""
+
+        if api_key and api_secret:
+            self._client = WSClient(
+                api_key=api_key,
+                api_secret=api_secret,
+                on_message=self._on_message,
+                on_close=self._on_close,
+            )
+        else:
+            self._client = WSClient(
+                on_message=self._on_message,
+                on_close=self._on_close,
+            )
+
+        def _run():
+            try:
+                self._client.open()
+                self._status = "connected"
+                log("info", f"Coinbase WS connected — subscribing to {len(self.product_ids)} products")
+
+                # Subscribe to ticker (public) and level2 (requires auth)
+                self._client.subscribe(
+                    product_ids=self.product_ids,
+                    channels=["ticker", "heartbeats"],
+                )
+                if api_key:
+                    try:
+                        self._client.subscribe(
+                            product_ids=self.product_ids,
+                            channels=["level2"],
+                        )
+                    except Exception as e:
+                        log("warn", f"Coinbase WS level2 subscription failed (auth issue?): {e}")
+
+                log("info", "Coinbase WS subscriptions sent")
+
+                from coinbase.websocket import WSClientConnectionClosedException, WSClientException
+                try:
+                    self._client.run_forever_with_exception_check()
+                except WSClientConnectionClosedException:
+                    log("warn", "Coinbase WS connection closed — will reconnect")
+                except WSClientException as e:
+                    log("warn", f"Coinbase WS error: {e}")
+            except Exception as e:
+                log("error", f"Coinbase WS connection failed: {e}")
+            finally:
+                self._status = "disconnected"
+                self._schedule_reconnect()
+
+        self._thread = threading.Thread(target=_run, daemon=True, name="coinbase-ws")
         self._thread.start()
 
-    def _on_open(self, ws) -> None:
-        self._status = "connected"
-        self._reconnect_attempts = 0
-        log("info", f"Coinbase WS connected — subscribing to {len(self.product_ids)} products")
-        self._subscription_confirmed = False
-        self._subscribe()
-        self._start_subscription_timeout()
-
-    def _on_message(self, ws, raw: str) -> None:
+    def _on_message(self, raw: str) -> None:
         try:
             msg = json.loads(raw)
-        except (json.JSONDecodeError, TypeError) as e:
-            log("error", f"Coinbase WS JSON parse error: {e}", data={"raw": raw[:500]})
+        except (json.JSONDecodeError, TypeError):
             return
-        try:
-            self._handle_message(msg)
-        except Exception as e:
-            log("error", f"Coinbase WS message handling error: {e}", data={"msg_type": msg.get("type")})
 
-    def _on_error(self, ws, err) -> None:
-        log("warn", f"Coinbase WS error: {err}")
+        channel = msg.get("channel")
+        events = msg.get("events", [])
 
-    def _on_close(self, ws, close_status_code, close_msg) -> None:
-        self._status = "disconnected"
-        log("warn", "Coinbase WS disconnected — scheduling reconnect")
-        self._schedule_reconnect()
-
-    def _subscribe(self) -> None:
-        if not self._ws:
-            return
-        self._ws.send(json.dumps({
-            "type": "subscribe",
-            "product_ids": self.product_ids,
-            "channels": ["ticker", "level2"],
-        }))
-
-    def _start_subscription_timeout(self) -> None:
-        """Log a warning if subscription confirmation is not received in time."""
-        def _check():
-            if not self._subscription_confirmed:
-                log("warn", f"Coinbase WS subscription confirmation not received within {SUBSCRIPTION_TIMEOUT_S}s")
-        timer = threading.Timer(SUBSCRIPTION_TIMEOUT_S, _check)
-        timer.daemon = True
-        timer.start()
-
-    def _handle_message(self, msg: dict) -> None:
-        msg_type = msg.get("type")
-
-        if msg_type == "ticker":
-            symbol = msg.get("product_id", "").replace("-USD", "")
-            try:
-                price = float(msg["price"])
-                volume = float(msg["volume_24h"])
-                if price > 0:
-                    self.on_tick(symbol, price, volume)
-            except (KeyError, ValueError) as e:
-                log("warn", f"Coinbase WS ticker parse error: {e}", symbol=symbol,
-                    data={"raw_keys": list(msg.keys())})
-
-        elif msg_type == "l2update":
-            product_id = msg.get("product_id", "")
-            with _book_lock:
-                book = _get_book(product_id)
-                for change in msg.get("changes", []):
+        for event in events:
+            if channel == "ticker":
+                tickers = event.get("tickers", [])
+                for t in tickers:
+                    product_id = t.get("product_id", "")
+                    symbol = product_id.replace("-USD", "")
                     try:
-                        side, price_str, size_str = change
-                        size = float(size_str)
-                        book_side = book["bids"] if side == "buy" else book["asks"]
-                        if size == 0:
-                            book_side.pop(price_str, None)
-                        else:
-                            book_side[price_str] = size
-                    except (ValueError, TypeError) as e:
-                        log("warn", f"Coinbase WS l2update parse error: {e}",
-                            data={"change": str(change)[:200]})
-                book["updated_at"] = time.time()
-                # Snapshot inside lock to prevent race with purge_stale_books()
-                bids_snapshot = list(book["bids"].items())
-                asks_snapshot = list(book["asks"].items())
+                        price = float(t["price"])
+                        volume = float(t.get("volume_24_h", 0))
+                        if price > 0:
+                            self.on_tick(symbol, price, volume)
+                            self._tick_count += 1
+                            if self._tick_count == 1:
+                                log("info", f"First tick received: {symbol} @ ${price:,.2f}")
+                    except (KeyError, ValueError, TypeError):
+                        pass
 
-            symbol = product_id.replace("-USD", "")
-            bids = sorted(
-                [{"price": float(p), "size": s} for p, s in bids_snapshot],
-                key=lambda x: x["price"], reverse=True,
-            )[:20]
-            asks = sorted(
-                [{"price": float(p), "size": s} for p, s in asks_snapshot],
-                key=lambda x: x["price"],
-            )[:20]
-            self.on_book(symbol, bids, asks)
+            elif channel == "l2_data":
+                product_id = event.get("product_id", "")
+                updates = event.get("updates", [])
+                if not updates:
+                    continue
+                with _book_lock:
+                    book = _get_book(product_id)
+                    for update in updates:
+                        try:
+                            side = update.get("side", "")
+                            price_str = update.get("price_level", "")
+                            size = float(update.get("new_quantity", 0))
+                            book_side = book["bids"] if side == "bid" else book["asks"]
+                            if size == 0:
+                                book_side.pop(price_str, None)
+                            else:
+                                book_side[price_str] = size
+                        except (ValueError, TypeError):
+                            pass
+                    book["updated_at"] = time.time()
+                    bids_snapshot = list(book["bids"].items())
+                    asks_snapshot = list(book["asks"].items())
 
-        elif msg_type == "subscriptions":
-            self._subscription_confirmed = True
-            log("info", "Coinbase WS subscriptions confirmed")
+                symbol = product_id.replace("-USD", "")
+                bids = sorted(
+                    [{"price": float(p), "size": s} for p, s in bids_snapshot],
+                    key=lambda x: x["price"], reverse=True,
+                )[:20]
+                asks = sorted(
+                    [{"price": float(p), "size": s} for p, s in asks_snapshot],
+                    key=lambda x: x["price"],
+                )[:20]
+                self.on_book(symbol, bids, asks)
+
+    def _on_close(self) -> None:
+        self._status = "disconnected"
+        log("warn", "Coinbase WS disconnected")
 
     def _schedule_reconnect(self) -> None:
-        with self._reconnect_lock:
-            if self._reconnect_timer:
-                return
-            if self._reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
-                log("error", f"Coinbase WS giving up after {MAX_RECONNECT_ATTEMPTS} reconnect attempts")
-                return
-            backoff_ms = min(MAX_BACKOFF_MS, 1000 * (2 ** self._reconnect_attempts))
-            self._reconnect_attempts += 1
-            log("info", f"Coinbase WS reconnecting in {backoff_ms}ms (attempt {self._reconnect_attempts})")
-
-            def do_reconnect():
-                with self._reconnect_lock:
-                    self._reconnect_timer = None
+        """Reconnect after a brief delay."""
+        def _reconnect():
+            time.sleep(5)
+            if self._status == "disconnected":
+                log("info", "Coinbase WS reconnecting...")
                 self.connect()
-
-            self._reconnect_timer = threading.Timer(backoff_ms / 1000, do_reconnect)
-            self._reconnect_timer.daemon = True
-            self._reconnect_timer.start()
+        t = threading.Thread(target=_reconnect, daemon=True)
+        t.start()
 
     def disconnect(self) -> None:
-        with self._reconnect_lock:
-            if self._reconnect_timer:
-                self._reconnect_timer.cancel()
-                self._reconnect_timer = None
-        if self._ws:
-            self._ws.close()
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
         self._status = "disconnected"
 
     def is_connected(self) -> bool:
         return self._status == "connected"
 
     def update_products(self, product_ids: list[str]) -> None:
+        old = set(self.product_ids)
+        new = set(product_ids)
         self.product_ids = product_ids
-        if self._status == "connected":
-            self._subscribe()
+
+        if not self._client or self._status != "connected":
+            return
+
+        unsub = list(old - new)
+        sub = list(new - old)
+        if unsub:
+            try:
+                self._client.unsubscribe(product_ids=unsub, channels=["ticker"])
+            except Exception:
+                pass
+        if sub:
+            try:
+                self._client.subscribe(product_ids=sub, channels=["ticker"])
+            except Exception:
+                pass
