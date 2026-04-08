@@ -102,8 +102,13 @@ class ConvexStorage:
                         print(f"[CONVEX ERROR] Failed to call {mutation_name} "
                               f"after {retries} attempt(s): {exc}")
 
+    @staticmethod
+    def _strip_none(d: dict) -> dict:
+        """Remove keys with None values — Convex rejects null for optional fields."""
+        return {k: v for k, v in d.items() if v is not None}
+
     def _enqueue(self, mutation_name: str, args: dict) -> None:
-        self._queue.put((mutation_name, args))
+        self._queue.put((mutation_name, self._strip_none(args)))
 
     @property
     def pending_count(self) -> int:

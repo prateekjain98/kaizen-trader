@@ -1163,6 +1163,13 @@ def _start_health_server() -> None:
 # ─── Main entry point ────────────────────────────────────────────────────────
 
 def main() -> None:
+    # ── Initialize Convex database (must be first — everything else calls log()) ──
+    if not env.convex_url:
+        print("[FATAL] CONVEX_URL not set. Set it in your .env file.")
+        sys.exit(1)
+    _db_mod.init(env.convex_url)
+    log("info", "Database: Convex initialized")
+
     # Initialize declarative protection chain
     init_protections(DEFAULT_PROTECTIONS)
 
@@ -1208,13 +1215,6 @@ def main() -> None:
     # Initialize portfolio peak with configured portfolio size
     portfolio_usd = get_paper_balance() if env.paper_trading else env.portfolio_usd
     update_peak(portfolio_usd)
-
-    # ── Initialize Convex database ──────────────────────────────────────────
-    if not env.convex_url:
-        print("[FATAL] CONVEX_URL not set. Set it in your .env file.")
-        sys.exit(1)
-    _db_mod.init(env.convex_url)
-    log("info", "Database: Convex initialized")
 
     # ── Start health check server (for Railway) ────────────────────────────
     _start_health_server()
