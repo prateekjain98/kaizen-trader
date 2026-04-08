@@ -46,8 +46,7 @@ export const updatePositionClose = mutation({
   handler: async (ctx, args) => {
     const existing = await ctx.db
       .query("positions")
-      .withIndex("by_status")
-      .filter((q) => q.eq(q.field("positionId"), args.positionId))
+      .withIndex("by_positionId", (q) => q.eq("positionId", args.positionId))
       .first();
     if (!existing) {
       throw new Error(`Position ${args.positionId} not found`);
@@ -180,6 +179,28 @@ export const insertGithubIssue = mutation({
   },
   handler: async (ctx, args) => {
     await ctx.db.insert("githubIssues", args);
+  },
+});
+
+export const insertTradeJournal = mutation({
+  args: {
+    positionId: v.string(),
+    symbol: v.string(),
+    strategy: v.string(),
+    rMultiple: v.optional(v.float64()),
+    holdHours: v.optional(v.float64()),
+    maePct: v.optional(v.float64()),
+    mfePct: v.optional(v.float64()),
+    partialExitPct: v.optional(v.float64()),
+    exitReason: v.optional(v.string()),
+    pnlPct: v.optional(v.float64()),
+    regimeAtEntry: v.optional(v.string()),
+    regimeAtExit: v.optional(v.string()),
+    wasPartialBeneficial: v.optional(v.float64()),
+    timestamp: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("tradeJournal", args);
   },
 });
 

@@ -1,4 +1,4 @@
-import { internalMutation } from "./_generated/server";
+import { internalMutation, internalQuery } from "./_generated/server";
 
 /**
  * Compute aggregated metrics over the last hour for the dashboard health panel.
@@ -61,5 +61,42 @@ export const computeMetrics = internalMutation({
       winRate,
       computedAt: now,
     });
+  },
+});
+
+/**
+ * Delete logs older than 7 days to prevent unbounded storage growth.
+ * Called by the cron job every 6 hours.
+ */
+export const cleanupOldLogs = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const oldLogs = await ctx.db
+      .query("logs")
+      .withIndex("by_ts", (q) => q.lt("ts", sevenDaysAgo))
+      .take(500); // batch to stay within write limits
+
+    for (const log of oldLogs) {
+      await ctx.db.delete(log._id);
+    }
+  },
+});
+
+/**
+ * Delete old metrics (older than 30 days) to prevent storage growth.
+ */
+export const cleanupOldMetrics = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const old = await ctx.db
+      .query("metrics")
+      .withIndex("by_computed_at", (q) => q.lt("computedAt", thirtyDaysAgo))
+      .take(100);
+
+    for (const m of old) {
+      await ctx.db.delete(m._id);
+    }
   },
 });

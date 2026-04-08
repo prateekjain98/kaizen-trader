@@ -8,70 +8,20 @@ A Python autonomous crypto trading system that:
 1. Runs multiple trading strategies in parallel
 2. Heals itself in real-time: after each loss, it diagnoses WHY and patches its own parameters
 3. Periodically calls Claude via the Anthropic SDK to do deeper log analysis
-4. Stores all trades, logs, and parameter change history in `trader.db` (SQLite)
+4. Stores all trades, logs, and parameter change history in Convex (cloud database)
 
 ## How to analyze trading logs
 
-When asked to analyze logs or improve the trader, do this:
+All data is stored in Convex. Use the Convex dashboard or the bot's read APIs to query data.
 
-### Step 1: Read the recent trade history
-```bash
-sqlite3 trader.db "
-  SELECT strategy, side, tier, pnl_pct, hold_ms/3600000.0 as hold_h, exit_reason, qual_score
-  FROM positions
-  WHERE status='closed'
-  ORDER BY closed_at DESC
-  LIMIT 100;
-"
-```
+The `src/storage/database.py` facade exposes these read functions:
+- `get_open_positions()` — all currently open positions
+- `get_closed_trades(limit=200)` — recent closed positions with P&L
+- `get_recent_logs(limit=500, level=None)` — system logs, optionally filtered by level
+- `get_recent_diagnoses(limit=50)` — self-healer diagnosis records
+- `get_trade_journal(limit=50)` — structured exit analysis entries
 
-### Step 2: Check win rates by strategy
-```bash
-sqlite3 trader.db "
-  SELECT
-    strategy,
-    COUNT(*) as total,
-    SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) as wins,
-    ROUND(100.0 * SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) / COUNT(*), 1) as win_rate_pct,
-    ROUND(AVG(pnl_pct) * 100, 2) as avg_pnl_pct,
-    ROUND(SUM(pnl_usd), 2) as total_pnl_usd
-  FROM positions
-  WHERE status='closed'
-  GROUP BY strategy
-  ORDER BY total_pnl_usd DESC;
-"
-```
-
-### Step 3: Review self-healer diagnoses
-```bash
-sqlite3 trader.db "
-  SELECT symbol, strategy, pnl_pct, loss_reason, action, timestamp
-  FROM diagnoses
-  ORDER BY timestamp DESC
-  LIMIT 20;
-"
-```
-
-### Step 4: Look for patterns in errors/warnings
-```bash
-sqlite3 trader.db "
-  SELECT level, message, symbol, ts
-  FROM logs
-  WHERE level IN ('error', 'warn')
-  ORDER BY ts DESC
-  LIMIT 50;
-"
-```
-
-### Step 5: Check config evolution
-```bash
-sqlite3 trader.db "
-  SELECT reason, config, timestamp
-  FROM scanner_config_history
-  ORDER BY timestamp DESC
-  LIMIT 20;
-"
-```
+For direct Convex queries, use the Convex dashboard at your `CONVEX_URL`.
 
 ## What to look for
 
@@ -125,8 +75,8 @@ python3 scripts/performance.py --csv
 | `src/self_healing/healer.py` | Real-time loss diagnosis + parameter patching |
 | `src/self_healing/log_analyzer.py` | Claude-powered deep analysis loop |
 | `src/strategies/` | One file per trading strategy |
-| `src/storage/database.py` | SQLite storage layer |
-| `trader.db` | SQLite: all trades, logs, config history |
+| `src/storage/database.py` | Storage facade — delegates to Convex |
+| `src/storage/convex_client.py` | Convex SDK wrapper with background flush |
 
 ## Safety rules for Claude Code
 
@@ -135,3 +85,11 @@ python3 scripts/performance.py --csv
 - **Never** change exchange API keys
 - **Always** read the current config before suggesting changes
 - When suggesting parameter changes, show the current value, proposed value, and evidence from the data
+
+<!-- convex-ai-start -->
+This project uses [Convex](https://convex.dev) as its backend.
+
+When working on Convex code, **always read `convex/_generated/ai/guidelines.md` first** for important guidelines on how to correctly use Convex APIs and patterns. The file contains rules that override what you may have learned about Convex from training data.
+
+Convex agent skills for common tasks can be installed by running `npx convex ai-files install`.
+<!-- convex-ai-end -->

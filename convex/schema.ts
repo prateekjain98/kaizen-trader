@@ -30,6 +30,7 @@ export default defineSchema({
     paperTrading: v.boolean(),
   })
     .index("by_status", ["status"])
+    .index("by_positionId", ["positionId"])
     .index("by_symbol", ["symbol"])
     .index("by_closed_at", ["closedAt"]),
 
@@ -58,7 +59,7 @@ export default defineSchema({
     ts: v.float64(),
   })
     .index("by_ts", ["ts"])
-    .index("by_level", ["level"]),
+    .index("by_level_ts", ["level", "ts"]),
 
   diagnoses: defineTable({
     positionId: v.string(),
@@ -108,6 +109,25 @@ export default defineSchema({
   })
     .index("by_trigger", ["triggerType", "triggerData"])
     .index("by_status", ["status"]),
+
+  tradeJournal: defineTable({
+    positionId: v.string(),
+    symbol: v.string(),
+    strategy: v.string(),
+    rMultiple: v.optional(v.float64()),
+    holdHours: v.optional(v.float64()),
+    maePct: v.optional(v.float64()),
+    mfePct: v.optional(v.float64()),
+    partialExitPct: v.optional(v.float64()),
+    exitReason: v.optional(v.string()),
+    pnlPct: v.optional(v.float64()),
+    regimeAtEntry: v.optional(v.string()),
+    regimeAtExit: v.optional(v.string()),
+    wasPartialBeneficial: v.optional(v.float64()),
+    timestamp: v.float64(),
+  })
+    .index("by_timestamp", ["timestamp"])
+    .index("by_strategy", ["strategy"]),
 
   // Aggregated metrics computed by cron for dashboard health panel
   metrics: defineTable({

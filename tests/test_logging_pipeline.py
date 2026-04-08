@@ -8,13 +8,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Force in-memory DB before importing
-os.environ["DB_PATH"] = ":memory:"
-os.environ["PAPER_TRADING"] = "true"
-
 from src.storage.database import (
-    db, log, insert_position, insert_trade, insert_diagnosis,
-    snapshot_config, init_dual_write, get_recent_logs, _backend,
+    log, insert_position, insert_trade, insert_diagnosis,
+    snapshot_config, get_recent_logs,
 )
 import src.storage.database as db_mod
 from src.self_healing.log_analyzer import (
@@ -25,16 +21,6 @@ from src.self_healing.delta_evaluator import DeltaEvaluator, ParameterDelta, Tra
 from src.self_healing.blind_spots import BlindSpotDetector, BlindSpotConfig, UnknownFingerprint
 from src.evaluation.strategy_selector import StrategySelector, SelectionConfig, StrategyHealth
 from src.types import ScannerConfig, Position, TradeDiagnosis
-
-
-@pytest.fixture(autouse=True)
-def fresh_db():
-    """Reset the DB connection and backend for each test."""
-    db_mod._conn = None
-    db_mod._backend = None
-    db_mod.DB_PATH = ":memory:"
-    yield
-    db_mod._backend = None
 
 
 def _make_position(symbol="ETH", strategy="momentum_swing", pnl_pct=None,
@@ -52,69 +38,30 @@ def _make_position(symbol="ETH", strategy="momentum_swing", pnl_pct=None,
     )
 
 
-# ─── Test 1: init_dual_write sets up the backend ─────────────────────────────
+# ─── Test 1: database facade delegates to ConvexStorage ──────────────────────
 
-class TestInitDualWrite:
-    def test_init_dual_write_sets_backend(self):
-        """init_dual_write should set the module-level _backend."""
-        assert db_mod._backend is None
-
-        mock_convex = MagicMock()
-        with patch("src.storage.convex_client.ConvexStorage", return_value=mock_convex):
-            with patch("src.storage.backend.DualWriteBackend") as MockDualWrite:
-                mock_dual = MagicMock()
-                MockDualWrite.return_value = mock_dual
-                init_dual_write("https://fake-convex.example.com")
-
-        assert db_mod._backend is mock_dual
-        mock_convex.start.assert_called_once()
-
-    def test_init_dual_write_not_set_by_default(self):
-        """Without calling init_dual_write, _backend should remain None."""
-        assert db_mod._backend is None
-
-
-# ─── Test 2: log() forwards to dual-write backend ────────────────────────────
-
-class TestDualWriteForwarding:
-    def test_log_forwards_to_backend_when_set(self):
-        """When _backend is set, log() should delegate to _backend.log()."""
-        mock_backend = MagicMock()
-        db_mod._backend = mock_backend
-
-        log("info", "test dual write", symbol="ETH", data={"key": "val"})
-
-        mock_backend.log.assert_called_once_with(
-            "info", "test dual write", symbol="ETH", strategy=None, data={"key": "val"}
+class TestDatabaseDelegation:
+    def test_log_delegates_to_storage(self, _mock_convex_storage):
+        """log() should delegate to the ConvexStorage instance."""
+        log("info", "test message", symbol="ETH", data={"key": "val"})
+        _mock_convex_storage.log.assert_called_once_with(
+            "info", "test message", symbol="ETH", strategy=None, data={"key": "val"}
         )
 
-    def test_log_writes_sqlite_when_no_backend(self):
-        """Without dual-write, log() should write directly to SQLite."""
-        assert db_mod._backend is None
-        log("info", "sqlite only")
-        logs = get_recent_logs(10)
-        assert any(l.message == "sqlite only" for l in logs)
-
-    def test_insert_position_forwards_to_backend(self):
-        """insert_position should delegate to _backend when set."""
-        mock_backend = MagicMock()
-        db_mod._backend = mock_backend
+    def test_insert_position_delegates_to_storage(self, _mock_convex_storage):
+        """insert_position should delegate to ConvexStorage."""
         p = _make_position()
         insert_position(p)
-        mock_backend.insert_position.assert_called_once_with(p)
+        _mock_convex_storage.insert_position.assert_called_once_with(p)
 
-    def test_snapshot_config_forwards_to_backend(self):
-        """snapshot_config should delegate to _backend when set."""
-        mock_backend = MagicMock()
-        db_mod._backend = mock_backend
+    def test_snapshot_config_delegates_to_storage(self, _mock_convex_storage):
+        """snapshot_config should delegate to ConvexStorage."""
         config = ScannerConfig()
         snapshot_config(config, "test reason")
-        mock_backend.snapshot_config.assert_called_once_with(config, "test reason")
+        _mock_convex_storage.snapshot_config.assert_called_once_with(config, "test reason")
 
-    def test_insert_diagnosis_forwards_to_backend(self):
-        """insert_diagnosis should delegate to _backend when set."""
-        mock_backend = MagicMock()
-        db_mod._backend = mock_backend
+    def test_insert_diagnosis_delegates_to_storage(self, _mock_convex_storage):
+        """insert_diagnosis should delegate to ConvexStorage."""
         d = TradeDiagnosis(
             position_id="pos-1", symbol="ETH", strategy="momentum_swing",
             pnl_pct=-0.03, hold_ms=3_600_000, exit_reason="trailing_stop",
@@ -123,10 +70,10 @@ class TestDualWriteForwarding:
             parameter_changes={}, timestamp=int(time.time() * 1000),
         )
         insert_diagnosis(d)
-        mock_backend.insert_diagnosis.assert_called_once_with(d)
+        _mock_convex_storage.insert_diagnosis.assert_called_once_with(d)
 
 
-# ─── Test 3: Claude prompt includes delta section ────────────────────────────
+# ─── Test 2: Claude prompt includes delta section ────────────────────────────
 
 class TestPromptSections:
     def test_delta_section_empty_when_no_deltas(self):
@@ -218,7 +165,7 @@ class TestPromptSections:
         assert "dataSourceSuggestions" in prompt
 
 
-# ─── Test 4: Analysis model accepts dataSourceSuggestions ─────────────────────
+# ─── Test 3: Analysis model accepts dataSourceSuggestions ─────────────────────
 
 class TestAnalysisModel:
     def test_analysis_with_data_source_suggestions(self):

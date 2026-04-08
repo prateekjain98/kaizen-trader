@@ -2,30 +2,40 @@ import { query } from "./_generated/server";
 import { v } from "convex/values";
 
 export const getOpenPositions = query({
-  args: {},
-  handler: async (ctx) => {
-    const open = await ctx.db
+  args: { paperTrading: v.optional(v.boolean()) },
+  handler: async (ctx, args) => {
+    let open = await ctx.db
       .query("positions")
       .withIndex("by_status", (q) => q.eq("status", "open"))
       .collect();
-    const closing = await ctx.db
+    let closing = await ctx.db
       .query("positions")
       .withIndex("by_status", (q) => q.eq("status", "closing"))
       .collect();
+    if (args.paperTrading !== undefined) {
+      open = open.filter((p) => p.paperTrading === args.paperTrading);
+      closing = closing.filter((p) => p.paperTrading === args.paperTrading);
+    }
     return [...open, ...closing];
   },
 });
 
 export const getClosedTrades = query({
-  args: { limit: v.optional(v.float64()) },
+  args: {
+    limit: v.optional(v.float64()),
+    paperTrading: v.optional(v.boolean()),
+  },
   handler: async (ctx, args) => {
     const limit = args.limit ?? 200;
-    const results = await ctx.db
+    let q = ctx.db
       .query("positions")
-      .withIndex("by_status", (q) => q.eq("status", "closed"))
+      .withIndex("by_closed_at")
       .order("desc")
-      .take(limit);
-    return results;
+      .filter((q) => q.eq(q.field("status"), "closed"));
+    if (args.paperTrading !== undefined) {
+      q = q.filter((f) => f.eq(f.field("paperTrading"), args.paperTrading!));
+    }
+    return await q.take(limit);
   },
 });
 
@@ -39,7 +49,7 @@ export const getRecentLogs = query({
     if (args.level) {
       return await ctx.db
         .query("logs")
-        .withIndex("by_level", (q) => q.eq("level", args.level!))
+        .withIndex("by_level_ts", (q) => q.eq("level", args.level!))
         .order("desc")
         .take(limit);
     }
@@ -107,6 +117,18 @@ export const getLatestMetrics = query({
   },
 });
 
+export const getTradeJournal = query({
+  args: { limit: v.optional(v.float64()) },
+  handler: async (ctx, args) => {
+    const limit = args.limit ?? 50;
+    return await ctx.db
+      .query("tradeJournal")
+      .withIndex("by_timestamp")
+      .order("desc")
+      .take(limit);
+  },
+});
+
 export const getTradesByPosition = query({
   args: { positionId: v.string() },
   handler: async (ctx, args) => {
@@ -118,12 +140,15 @@ export const getTradesByPosition = query({
 });
 
 export const getWinRateByStrategy = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { limit: v.optional(v.float64()) },
+  handler: async (ctx, args) => {
+    const limit = args.limit ?? 500;
     const closed = await ctx.db
       .query("positions")
-      .withIndex("by_status", (q) => q.eq("status", "closed"))
-      .collect();
+      .withIndex("by_closed_at")
+      .order("desc")
+      .filter((q) => q.eq(q.field("status"), "closed"))
+      .take(limit);
 
     const byStrategy: Record<
       string,

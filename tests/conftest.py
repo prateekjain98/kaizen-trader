@@ -4,12 +4,30 @@ import os
 import time
 import pytest
 
-# Use in-memory DB for all tests
-os.environ["DB_PATH"] = ":memory:"
+# Set test environment
 os.environ["PAPER_TRADING"] = "true"
+os.environ.setdefault("CONVEX_URL", "https://test.convex.cloud")
 os.environ.setdefault("GITHUB_REPO", "prateekjain98/kaizen-trader")
 
+from unittest.mock import MagicMock
 from src.types import TradeSignal, Position, ScannerConfig, MarketContext
+
+
+@pytest.fixture(autouse=True)
+def _mock_convex_storage():
+    """Provide a mock ConvexStorage for all tests so database calls don't hit real Convex."""
+    import src.storage.database as db
+    from src.storage.convex_client import ConvexStorage
+    mock_storage = MagicMock(spec=ConvexStorage)
+    mock_storage.get_open_positions.return_value = []
+    mock_storage.get_closed_trades.return_value = []
+    mock_storage.get_recent_logs.return_value = []
+    mock_storage.get_recent_diagnoses.return_value = []
+    mock_storage.get_trade_journal.return_value = []
+    old = db._storage
+    db._storage = mock_storage
+    yield mock_storage
+    db._storage = old
 
 
 def _now_ms() -> float:

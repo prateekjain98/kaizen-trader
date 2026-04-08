@@ -21,7 +21,7 @@
 
 Most trading systems are static: they run the same rules until you manually tune them. kaizen-trader takes a different approach — it continuously analyzes its own trade history, patches its parameters, tracks whether those changes helped or hurt, and creates GitHub issues when it identifies missing data or blind spots.
 
-The full audit trail — every trade, every diagnosis, every config snapshot, every parameter delta — is stored in SQLite locally, with optional dual-write to Convex for a real-time dashboard.
+The full audit trail — every trade, every diagnosis, every config snapshot, every parameter delta — is stored in Convex, providing real-time subscriptions for the dashboard and queryable history for self-healing analysis.
 
 ## Architecture
 
@@ -189,15 +189,13 @@ Main thread
 └── Thread health monitor          (every 30s — detect and restart dead threads)
 ```
 
-Coordination: `threading.Event` for shutdown, `Lock`/`RLock` on shared state, `threading.local()` for batch flags, `queue.Queue` for Convex background flush.
+Coordination: `threading.Event` for shutdown, `Lock`/`RLock` on shared state, `queue.Queue` for Convex background flush.
 
 ---
 
 ## Storage
 
-**SQLite** (primary) — WAL mode, append-only audit trail, zero infrastructure. Tables: `positions`, `trades`, `logs`, `diagnoses`, `scanner_config_history`.
-
-**Convex** (optional) — real-time subscriptions for the dashboard via `useQuery`. Fire-and-forget dual-write: if Convex is down, SQLite continues. Includes 15-minute metric aggregation cron.
+**Convex** — the sole database. Writes are async (queued, flushed every 1s via background thread). Reads are sync (blocking Convex queries). Tables: `positions`, `trades`, `logs`, `diagnoses`, `scanner_config_history`, `parameter_deltas`, `github_issues`, `trade_journal`. Real-time subscriptions for the dashboard via `useQuery`. 15-minute metric aggregation cron.
 
 ---
 
@@ -266,8 +264,7 @@ src/
 │   └── github_issues.py             Auto issue creation (blind spots, data gaps, underperformers)
 │
 ├── storage/
-│   ├── database.py                  SQLite — WAL mode, write locks, batch commits
-│   ├── backend.py                   StorageBackend protocol + DualWriteBackend
+│   ├── database.py                  Storage facade — delegates to Convex
 │   └── convex_client.py             Convex SDK wrapper with background flush
 │
 └── utils/
