@@ -14,15 +14,16 @@ from typing import Optional
 
 from src.config import env, default_scanner_config, validate_config
 from src.evaluation.strategy_selector import StrategySelector, SelectionConfig
-from src.execution.paper import paper_buy, paper_sell, get_paper_balance
-from src.execution.coinbase import place_buy_order, place_sell_order
+from src.execution.paper import get_paper_balance
+from src.execution.router import execute_buy, execute_sell
 from src.feeds.coinbase_ws import CoinbaseWebSocket
 from src.qualification.scorer import qualify
 from src.risk.portfolio import (
     init_protections, can_open_position, register_open, register_close,
-    update_position_price, get_open_positions,
+    update_position_price, get_open_positions, compute_sharpe, compute_max_drawdown,
+    compute_cvar,
 )
-from src.risk.position_sizer import kelly_size, apply_correlation_discount
+from src.risk.position_sizer import kelly_size, apply_correlation_discount, check_sector_exposure, update_peak, log_kelly_rationale
 from src.risk.protections import DEFAULT_PROTECTIONS
 from src.self_healing.log_analyzer import run_analysis
 from src.self_healing.healer import on_position_closed
@@ -36,7 +37,7 @@ from src.signals.protocol import fetch_protocol_revenue
 from src.signals.token_unlocks import fetch_token_unlocks, is_unlock_risk, TokenUnlock
 from src.signals.options import fetch_options_sentiment, OptionsSentiment
 from src.signals.stablecoin import fetch_stablecoin_flows, StablecoinFlows
-from src.signals.derivatives import fetch_derivatives_data, DerivativesData
+from src.signals.derivatives import fetch_derivatives_data, fetch_leverage_profile, DerivativesData
 from src.storage.database import (
     log, insert_position, insert_trade, update_position_close,
     get_closed_trades, batch_writes, close as close_db,
@@ -46,13 +47,14 @@ from src.strategies.registry import get_registry
 from src.strategies.momentum import push_price_sample, scan_momentum
 from src.strategies.mean_reversion import push_ohlcv_sample, scan_mean_reversion
 from src.strategies.orderbook_imbalance import (
-    update_order_book, scan_orderbook_imbalance, OrderBookLevel,
+    update_order_book, scan_orderbook_imbalance, OrderBookLevel, get_bid_ask_spread,
 )
 from src.strategies.funding_extreme import scan_funding_extreme, update_funding_data, FundingRateData
 from src.strategies.whale_tracker import scan_whale_accumulation
 from src.strategies.liquidation_cascade import scan_liquidation_cascade
 from src.strategies.fear_greed_contrarian import scan_fear_greed_contrarian
 from src.strategies.correlation_break import scan_correlation_break
+from src.strategies.cross_exchange_divergence import scan_cross_exchange_divergence
 from src.strategies.narrative_momentum import scan_narrative_momentum
 from src.strategies.protocol_revenue import scan_protocol_revenue, ProtocolMetrics
 from src.indicators.core import (
@@ -62,6 +64,12 @@ from src.indicators.core import (
 from src.indicators.cvd import push_trade as push_cvd_trade, get_cvd_snapshot
 from src.indicators.regime import classify_regime, get_regime_score
 from src.types import ScannerConfig, MarketContext, Position, TradeSignal
+from src.risk.loss_cooldown import is_on_cooldown, record_trade_result
+from src.risk.regime_gate import is_regime_blocked
+from src.risk.scaling import get_initial_fraction, get_max_tranches, should_add_tranche, compute_tranche_size_usd
+from src.risk.adaptive_stops import compute_adaptive_stop
+from src.storage.database import insert_trade_journal
+from src.evaluation.metrics import monte_carlo_significance
 
 # ─── Default watchlist (Coinbase product IDs) ────────────────────────────────
 DEFAULT_WATCHLIST = [
@@ -83,6 +91,8 @@ _SCALP_EXIT_CHECK_INTERVAL_S = 1  # check scalp exits every 1 second
 _MARKET_CONTEXT_INTERVAL_S = 120  # refresh market context every 2 minutes
 _SIGNAL_REFRESH_INTERVAL_S = 150  # refresh external signals every 2.5 minutes
 _BOOK_PURGE_INTERVAL_S = 120      # purge stale order books every 2 minutes
+_WARMUP_PERIOD_S = 300  # 5 minutes — collect data before trading
+_last_mc_run = [0.0]  # mutable container for last Monte Carlo run timestamp
 
 # Graceful shutdown event — background threads check this to exit promptly
 _shutdown_event = threading.Event()
@@ -265,6 +275,13 @@ def _refresh_signals() -> None:
         except Exception as err:
             log("error", f"Derivatives fetch failed for {sym}: {err}")
 
+    # Leverage profiles (separate from derivatives to avoid hot-path bloat)
+    for sym in symbols[:10]:
+        try:
+            fetch_leverage_profile(sym)
+        except Exception as err:
+            log("error", f"Leverage profile fetch failed for {sym}: {err}")
+
 
 def _scan_protocol_revenue_signals() -> None:
     """Fetch protocol revenue data and scan for trade signals."""
@@ -295,6 +312,50 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     """Qualify a signal and open a position if it passes all checks."""
     # Check if strategy is enabled
     if not strategy_selector.is_strategy_enabled(signal.strategy):
+        return
+
+    # Warm-up period: don't trade until we have enough data
+    if time.time() - _start_time < _WARMUP_PERIOD_S:
+        return
+
+    # Consecutive loss cooldown check
+    if is_on_cooldown(signal.strategy):
+        return
+
+    # Regime-based hard gating: completely block strategy in wrong regime
+    if is_regime_blocked(signal.strategy, signal.symbol):
+        return
+
+    # Signal staleness check: reject signals older than 30s (price may have moved)
+    now_ms = time.time() * 1000
+    if signal.created_at > 0:
+        age_s = (now_ms - signal.created_at) / 1000
+        if age_s > 30:
+            log("info", f"Stale signal rejected ({age_s:.0f}s old): {signal.strategy} {signal.symbol}",
+                symbol=signal.symbol, strategy=signal.strategy)
+            return
+
+    # Signal age decay: reduce score linearly over 30s (fresh=100%, 15s=75%, 30s=50%)
+    if signal.created_at > 0:
+        age_s = (now_ms - signal.created_at) / 1000
+        decay_factor = max(0.5, 1.0 - (age_s / 60.0))  # linear decay, floor at 50%
+        signal.score *= decay_factor
+
+    # Price sanity check: verify signal entry price is close to latest price
+    with _price_lock:
+        latest = _latest_prices.get(signal.symbol)
+    if latest and signal.entry_price > 0:
+        deviation = abs(signal.entry_price - latest) / latest
+        if deviation > 0.02:  # >2% deviation = price has moved too far
+            log("info", f"Signal price stale ({deviation:.1%} off): {signal.strategy} {signal.symbol}",
+                symbol=signal.symbol, strategy=signal.strategy)
+            return
+
+    # Liquidity check: reject signals when bid-ask spread is too wide (>0.5%)
+    spread = get_bid_ask_spread(signal.symbol)
+    if spread is not None and spread > 0.005:
+        log("info", f"Signal rejected — illiquid spread ({spread:.2%}): {signal.strategy} {signal.symbol}",
+            symbol=signal.symbol, strategy=signal.strategy)
         return
 
     # Get signal data for qualification
@@ -345,6 +406,17 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     open_pos = get_open_positions()
     size_usd = apply_correlation_discount(size_usd, signal.symbol, signal.side, open_pos)
 
+    # Sector exposure cap: don't exceed 30% portfolio in one group
+    size_usd = check_sector_exposure(signal.symbol, signal.side, size_usd, portfolio_usd, open_pos)
+    if size_usd <= 0:
+        log("info", f"Sector exposure cap reached for {signal.symbol}", symbol=signal.symbol)
+        return
+
+    # DCA: swing positions enter with initial tranche fraction only
+    initial_fraction = get_initial_fraction(signal.tier)
+    full_size_usd = size_usd
+    size_usd = size_usd * initial_fraction
+
     # Determine trail and hold time based on tier
     if signal.tier == "scalp":
         trail_pct = config.base_trail_pct_scalp
@@ -358,13 +430,10 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     position_id = str(uuid.uuid4())
 
     try:
-        if env.paper_trading:
-            trade = paper_buy(
-                signal.symbol, signal.product_id, size_usd,
-                position_id, signal.entry_price,
-            )
-        else:
-            trade = place_buy_order(signal.product_id, size_usd, position_id)
+        trade = execute_buy(
+            signal.symbol, signal.product_id, size_usd,
+            position_id, signal.entry_price,
+        )
     except Exception as err:
         log("error", f"Execution failed for {signal.symbol}: {err}",
             symbol=signal.symbol, strategy=signal.strategy)
@@ -384,6 +453,16 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         signal.symbol, entry_price, signal.side, signal.strategy,
         fallback_trail_pct=trail_pct,
     )
+
+    # Adaptive stop: use historical MAE if available (may tighten or widen the ATR stop)
+    adaptive_trail = compute_adaptive_stop(signal.strategy, trail_pct)
+    if adaptive_trail != trail_pct:
+        # Use the tighter of ATR stop and adaptive stop
+        trail_pct = min(trail_pct, adaptive_trail)
+        if signal.side == "long":
+            stop_price = entry_price * (1 - trail_pct)
+        else:
+            stop_price = entry_price * (1 + trail_pct)
 
     # Create position
     position = Position(
@@ -408,6 +487,9 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         status="open",
         paper_trading=env.paper_trading,
         original_quantity=quantity,
+        tranche_count=1,
+        max_tranches=get_max_tranches(signal.tier),
+        avg_entry_price=entry_price,
     )
 
     # Persist and register
@@ -497,6 +579,9 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
     # 8. Orderbook imbalance (scanned on book updates, but also scan here)
     _try_scan(lambda: scan_orderbook_imbalance(symbol, product_id, price, config), ctx)
 
+    # 9. Cross-exchange divergence (Coinbase vs Binance price dislocation)
+    _try_scan(lambda: scan_cross_exchange_divergence(symbol, product_id, price, config, ctx), ctx)
+
 
 def _try_scan(scan_fn, ctx: MarketContext) -> None:
     """Execute a scan function, process any signal returned."""
@@ -584,10 +669,7 @@ def _execute_partial_exit(pos: Position, current_price: float, now: float, fract
         return
 
     try:
-        if env.paper_trading:
-            trade = paper_sell(pos.symbol, pos.product_id, partial_qty, pos.id, current_price)
-        else:
-            trade = place_sell_order(pos.product_id, partial_qty, pos.id)
+        trade = execute_sell(pos.symbol, pos.product_id, partial_qty, pos.id, current_price)
     except Exception as err:
         log("warn", f"Partial exit failed for {pos.symbol}: {err}",
             symbol=pos.symbol, strategy=pos.strategy)
@@ -648,11 +730,91 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
             pos.stop_price, pos.trail_pct,
         )
 
+    # Regime-aware stop adjustment: widen in high vol, tighten in low vol
+    try:
+        regime = classify_regime(pos.symbol)
+        if regime.volatility == "high_vol":
+            # High vol: don't tighten stops as aggressively (give room for noise)
+            # Widen stop by 20% from current trail
+            if pos.side == "long":
+                widened = pos.high_watermark * (1 - pos.trail_pct * 1.2)
+                if widened < pos.stop_price:
+                    pos.stop_price = widened
+            else:
+                widened = pos.low_watermark * (1 + pos.trail_pct * 1.2)
+                if widened > pos.stop_price:
+                    pos.stop_price = widened
+        elif regime.volatility == "low_vol":
+            # Low vol: tighten stops — less room for noise needed
+            if pos.side == "long":
+                tightened = pos.high_watermark * (1 - pos.trail_pct * 0.8)
+                if tightened > pos.stop_price:
+                    pos.stop_price = tightened
+            else:
+                tightened = pos.low_watermark * (1 + pos.trail_pct * 0.8)
+                if tightened < pos.stop_price:
+                    pos.stop_price = tightened
+    except Exception:
+        pass  # regime detection is best-effort
+
+    # DCA scaling-in: check if we should add another tranche
+    if pos.tranche_count < pos.max_tranches:
+        tranche = should_add_tranche(pos, current_price)
+        if tranche:
+            try:
+                tranche_usd = compute_tranche_size_usd(pos, tranche["fraction"])
+
+                trade = execute_buy(pos.symbol, pos.product_id, tranche_usd, pos.id, current_price)
+
+                if trade.status != "failed" and trade.quantity > 0:
+                    # Update position with new tranche
+                    old_qty = pos.quantity
+                    pos.quantity += trade.quantity
+                    pos.size_usd += trade.size_usd
+                    pos.tranche_count += 1
+                    # Update average entry price
+                    pos.avg_entry_price = (
+                        (pos.avg_entry_price * old_qty + current_price * trade.quantity)
+                        / pos.quantity
+                    )
+                    insert_trade(trade)
+                    log("trade",
+                        f"DCA TRANCHE {pos.tranche_count}/{pos.max_tranches} {pos.symbol} "
+                        f"+${trade.size_usd:.0f} @ {current_price:.4f} ({tranche['reason']})",
+                        symbol=pos.symbol, strategy=pos.strategy)
+            except Exception as err:
+                log("warn", f"DCA tranche failed for {pos.symbol}: {err}",
+                    symbol=pos.symbol, strategy=pos.strategy)
+
+    # Breakeven stop: once trade reaches 1R profit, move stop to entry price
+    if pos.entry_price > 0:
+        r_multiple = _compute_r_multiple(pos, current_price)
+        if r_multiple >= 1.0:
+            if pos.side == "long" and pos.stop_price < pos.entry_price:
+                pos.stop_price = pos.entry_price
+            elif pos.side == "short" and pos.stop_price > pos.entry_price:
+                pos.stop_price = pos.entry_price
+
     # Partial take-profit: sell 50% at 1.5R, trail the rest
     if pos.partial_exit_pct == 0.0 and pos.entry_price > 0:
         r_multiple = _compute_r_multiple(pos, current_price)
         if r_multiple >= 1.5:
             _execute_partial_exit(pos, current_price, now, fraction=0.5)
+
+    # Stale position tightening: if >50% of max hold and MFE < 1%,
+    # tighten trailing stop by 30% to encourage exit
+    hold_elapsed = now - pos.opened_at
+    if pos.max_hold_ms > 0 and hold_elapsed > pos.max_hold_ms * 0.5:
+        if pos.mfe_pct < 0.01:  # hasn't moved 1% favorably
+            tightened = pos.trail_pct * 0.7
+            if pos.side == "long":
+                tight_stop = pos.high_watermark * (1 - tightened)
+                if tight_stop > pos.stop_price:
+                    pos.stop_price = tight_stop
+            else:
+                tight_stop = pos.low_watermark * (1 + tightened)
+                if tight_stop < pos.stop_price:
+                    pos.stop_price = tight_stop
 
     # Determine exit reason
     exit_reason = None
@@ -673,13 +835,10 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
 
     # Execute sell
     try:
-        if env.paper_trading:
-            trade = paper_sell(
-                pos.symbol, pos.product_id, pos.quantity,
-                pos.id, current_price,
-            )
-        else:
-            trade = place_sell_order(pos.product_id, pos.quantity, pos.id)
+        trade = execute_sell(
+            pos.symbol, pos.product_id, pos.quantity,
+            pos.id, current_price,
+        )
     except Exception as err:
         log("error", f"Exit execution failed for {pos.symbol}: {err}",
             symbol=pos.symbol, strategy=pos.strategy)
@@ -715,8 +874,43 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
     # Register close with risk manager
     register_close(pos, pnl_usd)
 
+    # Update peak portfolio for drawdown-based sizing
+    portfolio_usd = get_paper_balance() if env.paper_trading else env.max_position_usd * env.max_open_positions
+    update_peak(portfolio_usd)
+
     # Self-healing: diagnose the trade
     on_position_closed(pos, config, ctx.phase)
+
+    # Track consecutive losses for cooldown
+    record_trade_result(pos.strategy, pnl_pct >= 0)
+
+    # Trade journal: structured exit analysis
+    try:
+        regime_now = classify_regime(pos.symbol)
+        r_mult = _compute_r_multiple(pos, exit_price)
+        hold_hours = (now - pos.opened_at) / 3_600_000
+        was_partial_beneficial = (
+            pos.partial_exit_pct > 0 and pos.pnl_pct is not None and pos.pnl_pct < 0
+        )  # partial helped if we lost money (sold some earlier)
+        insert_trade_journal({
+            "id": str(uuid.uuid4()),
+            "position_id": pos.id,
+            "symbol": pos.symbol,
+            "strategy": pos.strategy,
+            "r_multiple": r_mult,
+            "hold_hours": hold_hours,
+            "mae_pct": pos.mae_pct,
+            "mfe_pct": pos.mfe_pct,
+            "partial_exit_pct": pos.partial_exit_pct,
+            "exit_reason": exit_reason,
+            "pnl_pct": pnl_pct,
+            "regime_at_entry": "unknown",  # would need to store at entry time
+            "regime_at_exit": f"{regime_now.trend}/{regime_now.volatility}",
+            "was_partial_beneficial": 1 if was_partial_beneficial else 0,
+            "timestamp": now,
+        })
+    except Exception as err:
+        log("warn", f"Trade journal insert failed: {err}")
 
     # Darwinian strategy evaluation
     strategy_selector.on_trade_closed(pos)
@@ -766,6 +960,26 @@ def _strategy_eval_loop() -> None:
                     data={"disabled": reasons})
             else:
                 log("info", f"Strategy evaluation complete — all {len(results)} strategies healthy")
+
+            # Monte Carlo significance test (at most once per hour)
+            if time.time() - _last_mc_run[0] >= 3600:
+                _last_mc_run[0] = time.time()
+                try:
+                    sig_results = monte_carlo_significance(num_simulations=2000)
+                    for sr in sig_results:
+                        if not sr.significant and sr.num_trades >= 30:
+                            log("warn",
+                                f"Strategy {sr.strategy} NOT significant: "
+                                f"Sharpe={sr.actual_sharpe:.2f}, p={sr.p_value:.3f}, "
+                                f"trades={sr.num_trades}",
+                                strategy=sr.strategy)
+                        elif sr.significant:
+                            log("info",
+                                f"Strategy {sr.strategy} significant: "
+                                f"Sharpe={sr.actual_sharpe:.2f}, p={sr.p_value:.3f}",
+                                strategy=sr.strategy)
+                except Exception as mc_err:
+                    log("warn", f"Monte Carlo test failed: {mc_err}")
 
             # Evaluate pending parameter deltas and auto-revert worsened ones
             evaluated = get_evaluator().evaluate_pending_deltas(config)
@@ -906,6 +1120,11 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+            # Portfolio metrics
+            sharpe = compute_sharpe()
+            max_dd = compute_max_drawdown()
+            cvar = compute_cvar()
+
             status = {
                 "status": "healthy",
                 "uptime_seconds": round(time.time() - _start_time),
@@ -914,6 +1133,9 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
                 "strategies_count": len(registry),
                 "last_trade_at": last_trade_at,
                 "daily_pnl": round(daily_pnl, 2),
+                "sharpe_ratio": round(sharpe, 2) if sharpe is not None else None,
+                "max_drawdown_pct": round(max_dd * 100, 1),
+                "cvar_95_daily": round(cvar, 2) if cvar is not None else None,
                 "threads_alive": threads_alive,
             }
 
@@ -963,6 +1185,15 @@ def main() -> None:
         log("warn", f"Config bounds violations at startup: {'; '.join(violations)}")
     else:
         log("info", "Config bounds validation passed")
+
+    # Log Kelly sizing rationale for each strategy at startup
+    registry = get_registry()
+    for entry in registry.values():
+        log("info", log_kelly_rationale(entry.strategy_id))
+
+    # Initialize portfolio peak with current balance
+    portfolio_usd = get_paper_balance() if env.paper_trading else env.max_position_usd * env.max_open_positions
+    update_peak(portfolio_usd)
 
     # ── Initialize dual-write backend (SQLite + Convex) if configured ─────
     convex_url = os.environ.get("CONVEX_URL")

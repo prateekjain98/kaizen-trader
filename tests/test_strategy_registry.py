@@ -7,12 +7,27 @@ from src.strategies.registry import (
     STRATEGY_REGISTRY, StrategyEntry,
 )
 
+# Canonical set of strategies the system must discover.
+# Update this when adding or removing a strategy module.
+EXPECTED_STRATEGIES = {
+    "correlation_break", "cross_exchange_divergence", "fear_greed_contrarian",
+    "funding_extreme", "liquidation_cascade", "liquidation_event",
+    "listing_announcement", "mean_reversion", "momentum",
+    "narrative_momentum", "orderbook_imbalance", "protocol_revenue",
+    "whale_accumulation", "whale_transfer",
+}
+
 
 class TestDiscovery:
-    def test_discovers_all_strategies(self):
+    def test_discovers_all_expected_strategies(self):
         registry = discover_strategies()
-        # We expect at least the 11 known scan/on functions
-        assert len(registry) >= 11
+        missing = EXPECTED_STRATEGIES - set(registry.keys())
+        assert not missing, f"Missing strategies: {missing}"
+
+    def test_no_unexpected_strategies(self):
+        registry = discover_strategies()
+        extra = set(registry.keys()) - EXPECTED_STRATEGIES
+        assert not extra, f"Unexpected strategies found (update EXPECTED_STRATEGIES): {extra}"
 
     def test_each_entry_has_callable(self):
         registry = discover_strategies()
@@ -21,7 +36,6 @@ class TestDiscovery:
 
     def test_known_strategies_present(self):
         registry = discover_strategies()
-        # Check a few known strategy IDs by function name pattern
         func_names = {e.scan_function.__name__ for e in registry.values()}
         assert "scan_momentum" in func_names
         assert "scan_mean_reversion" in func_names
@@ -36,9 +50,9 @@ class TestDiscovery:
 
 
 class TestGetRegistry:
-    def test_returns_populated(self):
+    def test_returns_all_strategies(self):
         registry = get_registry()
-        assert len(registry) >= 11
+        assert set(registry.keys()) == EXPECTED_STRATEGIES
 
     def test_idempotent(self):
         r1 = get_registry()
@@ -49,7 +63,7 @@ class TestGetRegistry:
 class TestGetScanFunctions:
     def test_returns_list_of_callables(self):
         funcs = get_scan_functions()
-        assert len(funcs) >= 11
+        assert len(funcs) == len(EXPECTED_STRATEGIES)
         for f in funcs:
             assert callable(f)
 

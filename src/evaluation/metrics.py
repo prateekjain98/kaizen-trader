@@ -1,6 +1,7 @@
 """Performance metrics engine."""
 
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -231,3 +232,87 @@ def format_metrics(m: PortfolioMetrics) -> str:
             f"pnl=${s.total_pnl_usd:>8.0f}  kelly={s.kelly_fraction*100:.1f}%"
         )
     return "\n".join(lines)
+
+
+# ─── Monte Carlo Significance Test ───────────────────────────────────────────
+
+@dataclass
+class SignificanceResult:
+    strategy: str
+    actual_sharpe: float
+    p_value: float          # fraction of random shuffles with higher Sharpe
+    significant: bool       # True if p < 0.05
+    num_trades: int
+    num_simulations: int
+
+
+def monte_carlo_significance(
+    strategy: Optional[str] = None,
+    num_simulations: int = 5000,
+    limit: int = 500,
+) -> list[SignificanceResult]:
+    """Test whether strategy returns are statistically significant vs. random.
+
+    Shuffles trade returns N times, computes Sharpe each time, and reports
+    the p-value (fraction of random shuffles with Sharpe >= actual).
+
+    Args:
+        strategy: Test a specific strategy, or None to test all.
+        num_simulations: Number of random permutations.
+        limit: Max trades to consider.
+
+    Returns:
+        List of SignificanceResult per strategy.
+    """
+    trades = get_closed_trades(limit)
+    trades = [t for t in trades if t.pnl_pct is not None]
+
+    if strategy:
+        groups = {strategy: [t for t in trades if t.strategy == strategy]}
+    else:
+        groups: dict[str, list] = {}
+        for t in trades:
+            groups.setdefault(t.strategy, []).append(t)
+
+    results = []
+    for strat, strat_trades in groups.items():
+        returns = [t.pnl_pct for t in strat_trades if t.pnl_pct is not None]
+        if len(returns) < 20:
+            continue
+
+        actual_sharpe = _compute_sharpe(returns)
+        if actual_sharpe is None:
+            continue
+
+        # Monte Carlo: shuffle returns and compute Sharpe each time
+        count_better = 0
+        for _ in range(num_simulations):
+            shuffled = returns.copy()
+            random.shuffle(shuffled)
+            sim_sharpe = _compute_sharpe(shuffled)
+            if sim_sharpe is not None and sim_sharpe >= actual_sharpe:
+                count_better += 1
+
+        p_value = count_better / num_simulations
+
+        results.append(SignificanceResult(
+            strategy=strat,
+            actual_sharpe=actual_sharpe,
+            p_value=p_value,
+            significant=p_value < 0.05,
+            num_trades=len(returns),
+            num_simulations=num_simulations,
+        ))
+
+    return results
+
+
+def _compute_sharpe(returns: list[float]) -> Optional[float]:
+    """Compute Sharpe ratio from a list of per-trade returns."""
+    if len(returns) < 5:
+        return None
+    avg = _mean(returns)
+    std = _std_dev(returns, avg)
+    if std < 1e-12:
+        return None
+    return safe_ratio(avg / std)

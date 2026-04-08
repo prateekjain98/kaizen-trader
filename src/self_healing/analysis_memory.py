@@ -1,7 +1,11 @@
-"""Layered LLM memory for the analysis loop.
+"""Layered LLM memory for the analysis loop (FinMem-inspired 3-layer architecture).
 
-Working memory: last 3 analysis summaries (short-term context).
-Long-term memory: key insights with daily decay. Prune when weight < 0.1.
+Layer 1 — Working memory: last 3 analysis summaries (hours).
+Layer 2 — Short-term insights: recent observations with moderate decay (days).
+Layer 3 — Long-term insights: validated patterns with slow decay (weeks).
+
+Insights earn profundity scores based on whether they lead to profitable changes.
+High-profundity insights get promoted from short-term to long-term.
 """
 
 import json
@@ -15,8 +19,13 @@ from src.storage.database import log
 
 _MEMORY_FILE = "data/analysis_memory.json"
 _MAX_WORKING_MEMORY = 3
-_DAILY_DECAY = 0.10  # 10% weight decay per day
+
+# Tiered decay rates (per day)
+_SHORT_TERM_DECAY = 0.10    # 10%/day — insights fade in ~7 days
+_LONG_TERM_DECAY = 0.02     # 2%/day — validated patterns last ~35 days
 _MIN_WEIGHT = 0.10
+_PROMOTION_THRESHOLD = 2.0  # profundity score needed to promote to long-term
+_REINFORCEMENT_BOOST = 0.3  # weight boost when an insight is referenced in a profitable change
 
 
 @dataclass
@@ -24,12 +33,16 @@ class Insight:
     text: str
     timestamp: float
     weight: float = 1.0
+    profundity: float = 0.0   # accumulated evidence of usefulness
+    layer: str = "short_term"  # "short_term" or "long_term"
     tags: list[str] = field(default_factory=list)
+    times_referenced: int = 0
+    times_profitable: int = 0
 
 
 @dataclass
 class MemoryState:
-    working_memory: list[str] = field(default_factory=list)  # last N summaries
+    working_memory: list[str] = field(default_factory=list)
     insights: list[Insight] = field(default_factory=list)
     last_decay_at: float = 0
 
@@ -49,7 +62,8 @@ class AnalysisMemory:
                 data = json.load(f)
             self._state.working_memory = data.get("working_memory", [])
             self._state.insights = [
-                Insight(**i) for i in data.get("insights", [])
+                Insight(**{k: v for k, v in i.items() if k in Insight.__dataclass_fields__})
+                for i in data.get("insights", [])
             ]
             self._state.last_decay_at = data.get("last_decay_at", 0)
         except Exception as err:
@@ -77,25 +91,78 @@ class AnalysisMemory:
             if len(self._state.working_memory) > _MAX_WORKING_MEMORY:
                 self._state.working_memory.pop(0)
 
-            # Long-term insights
+            # Short-term insights
             now = time.time() * 1000
             for text in insights:
-                # Extract simple tags from text
                 tags = _extract_tags(text)
                 self._state.insights.append(Insight(
-                    text=text, timestamp=now, weight=1.0, tags=tags,
+                    text=text, timestamp=now, weight=1.0,
+                    profundity=0.0, layer="short_term", tags=tags,
                 ))
 
             self._save()
 
+    def reinforce(self, keyword: str, profitable: bool) -> int:
+        """Reinforce insights matching a keyword after a parameter change outcome.
+
+        Called by delta_evaluator when a change is evaluated.
+        If profitable, boosts weight and profundity. If not, decays slightly.
+        Returns the number of insights reinforced.
+        """
+        with self._lock:
+            count = 0
+            keyword_lower = keyword.lower()
+            for insight in self._state.insights:
+                if keyword_lower in insight.text.lower() or any(keyword_lower in t for t in insight.tags):
+                    insight.times_referenced += 1
+                    if profitable:
+                        insight.weight = min(2.0, insight.weight + _REINFORCEMENT_BOOST)
+                        insight.profundity += 1.0
+                        insight.times_profitable += 1
+                    else:
+                        insight.profundity -= 0.3
+                    count += 1
+
+            # Check for promotions: short-term insights with high profundity -> long-term
+            for insight in self._state.insights:
+                if insight.layer == "short_term" and insight.profundity >= _PROMOTION_THRESHOLD:
+                    insight.layer = "long_term"
+                    log("info", f"Insight promoted to long-term: {insight.text[:80]}")
+
+            if count:
+                self._save()
+            return count
+
     def get_working_context(self) -> str:
         """Get formatted working memory for injection into the analysis prompt."""
         with self._lock:
-            if not self._state.working_memory:
-                return "(no prior analyses yet)"
             lines = []
-            for i, summary in enumerate(self._state.working_memory, 1):
-                lines.append(f"Analysis {i}: {summary}")
+
+            # Working memory (recent summaries)
+            if self._state.working_memory:
+                for i, summary in enumerate(self._state.working_memory, 1):
+                    lines.append(f"Analysis {i}: {summary}")
+            else:
+                lines.append("(no prior analyses yet)")
+
+            # Long-term validated patterns (high value)
+            lt_insights = [i for i in self._state.insights
+                           if i.layer == "long_term" and i.weight >= _MIN_WEIGHT]
+            if lt_insights:
+                lt_insights.sort(key=lambda x: x.profundity, reverse=True)
+                lines.append("\n## Validated Patterns (long-term memory)")
+                for ins in lt_insights[:5]:
+                    lines.append(f"- [{ins.profundity:.1f}p] {ins.text}")
+
+            # Top short-term insights
+            st_insights = [i for i in self._state.insights
+                           if i.layer == "short_term" and i.weight >= 0.5]
+            if st_insights:
+                st_insights.sort(key=lambda x: x.weight, reverse=True)
+                lines.append("\n## Recent Insights (short-term)")
+                for ins in st_insights[:5]:
+                    lines.append(f"- [{ins.weight:.1f}w] {ins.text}")
+
             return "\n".join(lines)
 
     def get_relevant_insights(self, topic: str, limit: int = 5) -> list[str]:
@@ -106,33 +173,38 @@ class AnalysisMemory:
             for insight in self._state.insights:
                 if insight.weight < _MIN_WEIGHT:
                     continue
-                # Simple relevance: keyword overlap
                 relevance = 0
                 for word in topic_lower.split():
                     if word in insight.text.lower():
                         relevance += 1
                     if word in [t.lower() for t in insight.tags]:
                         relevance += 2
+                # Long-term insights get a relevance boost
+                layer_boost = 1.5 if insight.layer == "long_term" else 1.0
                 if relevance > 0:
-                    scored.append((insight.weight * relevance, insight.text))
+                    scored.append((insight.weight * relevance * layer_boost, insight.text))
 
             scored.sort(reverse=True)
             return [text for _, text in scored[:limit]]
 
     def decay_and_prune(self) -> int:
-        """Apply daily decay to insights and prune stale ones. Returns count pruned."""
+        """Apply tiered daily decay and prune stale insights. Returns count pruned."""
         with self._lock:
             now = time.time() * 1000
             days_since_decay = (now - self._state.last_decay_at) / 86_400_000
 
             if days_since_decay < 0.5:
-                return 0  # don't decay more than twice a day
+                return 0
 
             pruned = 0
             surviving = []
             for insight in self._state.insights:
+                # Use tiered decay rate based on layer
+                decay_rate = _LONG_TERM_DECAY if insight.layer == "long_term" else _SHORT_TERM_DECAY
                 days_old = (now - insight.timestamp) / 86_400_000
-                insight.weight *= (1 - _DAILY_DECAY) ** max(1, int(days_old - days_since_decay + 1))
+                decay_steps = max(1, int(days_old - days_since_decay + 1))
+                insight.weight *= (1 - decay_rate) ** decay_steps
+
                 if insight.weight >= _MIN_WEIGHT:
                     surviving.append(insight)
                 else:
@@ -143,17 +215,27 @@ class AnalysisMemory:
             self._save()
 
             if pruned:
-                log("info", f"Analysis memory: pruned {pruned} stale insights, {len(surviving)} remaining")
+                log("info", f"Analysis memory: pruned {pruned} stale insights, "
+                    f"{len(surviving)} remaining "
+                    f"({sum(1 for i in surviving if i.layer == 'long_term')} long-term)")
             return pruned
 
     def get_stats(self) -> dict:
         """Get memory stats for logging."""
         with self._lock:
+            lt = [i for i in self._state.insights if i.layer == "long_term"]
+            st = [i for i in self._state.insights if i.layer == "short_term"]
             return {
                 "working_memory_size": len(self._state.working_memory),
+                "short_term_insights": len(st),
+                "long_term_insights": len(lt),
                 "total_insights": len(self._state.insights),
                 "avg_weight": (
                     sum(i.weight for i in self._state.insights) / len(self._state.insights)
+                    if self._state.insights else 0
+                ),
+                "avg_profundity": (
+                    sum(i.profundity for i in self._state.insights) / len(self._state.insights)
                     if self._state.insights else 0
                 ),
             }

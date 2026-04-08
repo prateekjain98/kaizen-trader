@@ -27,6 +27,7 @@ LossReason = Literal[
     "liquidation_cascade_against", "repeated_symbol_loss", "unknown",
 ]
 
+Confidence = Literal["low", "medium", "high"]
 LogLevel = Literal["info", "signal", "trade", "heal", "error", "warn"]
 
 
@@ -35,12 +36,12 @@ class TradeSignal:
     id: str
     symbol: str
     product_id: str
-    strategy: str
-    side: str
-    tier: str
+    strategy: StrategyId
+    side: Side
+    tier: Tier
     score: float
-    confidence: str
-    sources: list[str]
+    confidence: Confidence
+    sources: list[SignalSource]
     reasoning: str
     entry_price: float
     expires_at: float
@@ -55,9 +56,9 @@ class Position:
     id: str
     symbol: str
     product_id: str
-    strategy: str
-    side: str
-    tier: str
+    strategy: StrategyId
+    side: Side
+    tier: Tier
     entry_price: float
     quantity: float
     size_usd: float
@@ -75,7 +76,7 @@ class Position:
     closed_at: Optional[float] = None
     pnl_usd: Optional[float] = None
     pnl_pct: Optional[float] = None
-    exit_reason: Optional[str] = None
+    exit_reason: Optional[ExitReason] = None
     paper_trading: bool = True
     # Partial take-profit tracking
     partial_exit_pct: float = 0.0        # fraction already sold (0.0 to 1.0)
@@ -83,6 +84,10 @@ class Position:
     # MAE/MFE tracking (Maximum Adverse/Favorable Excursion as % from entry)
     mae_pct: float = 0.0  # worst drawdown from entry (always <= 0 for longs)
     mfe_pct: float = 0.0  # best excursion from entry (always >= 0 for longs)
+    # DCA scaling-in tracking
+    tranche_count: int = 1  # how many entries so far (1 = initial, max 3)
+    max_tranches: int = 1  # max tranches for this position (1 for scalp, 3 for swing)
+    avg_entry_price: float = 0.0  # volume-weighted average entry
 
 
 @dataclass

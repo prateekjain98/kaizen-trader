@@ -305,7 +305,7 @@ class TestBacktestEngine:
 
     @patch("src.backtesting.engine.load_klines")
     def test_run_with_flat_candles(self, mock_load):
-        """Flat candles should produce few or no trades."""
+        """Flat candles should produce no trades — no momentum or mean-reversion signal."""
         candles = _make_candles(50, start_price=100, trend=0.0, start_ms=_date_to_ms("2025-01-01"))
         mock_load.return_value = candles
 
@@ -313,13 +313,13 @@ class TestBacktestEngine:
         engine = BacktestEngine(config)
         result = engine.run()
 
-        # With flat prices, strategies shouldn't trigger
-        assert result.final_balance > 0
-        assert len(result.equity_curve) > 0
+        assert result.total_trades == 0
+        assert result.final_balance == 10000.0  # unchanged without trades
+        assert len(result.equity_curve) == 50
 
     @patch("src.backtesting.engine.load_klines")
     def test_run_with_volatile_candles(self, mock_load):
-        """Volatile candles should produce some trades."""
+        """Volatile candles should produce trades and close all positions."""
         candles = _make_volatile_candles(200, start_price=100, start_ms=_date_to_ms("2025-01-01"))
         mock_load.return_value = candles
 
@@ -328,10 +328,11 @@ class TestBacktestEngine:
         result = engine.run()
 
         assert isinstance(result, BacktestResult)
+        assert result.total_trades > 0, "Volatile candles should trigger at least one trade"
         assert result.final_balance > 0
-        assert len(result.equity_curve) > 0
-        # All positions should be closed
-        assert len(engine.open_positions) == 0
+        assert len(result.equity_curve) == 200
+        assert len(engine.open_positions) == 0  # all positions closed at end
+        assert len(result.positions) == result.total_trades
 
     @patch("src.backtesting.engine.load_klines")
     def test_equity_curve_length(self, mock_load):
@@ -394,16 +395,13 @@ class TestBacktestEngine:
         engine = BacktestEngine(config)
         result = engine.run()
 
-        # If any trades occurred, final balance should reflect commission costs
-        if result.total_trades > 0:
-            # Commission is charged on entry and exit, so balance should differ from
-            # what it would be without any commission
-            total_commission_paid = sum(
-                config.commission_pct * (p.size_usd * 2)  # entry + exit approximation
-                for p in result.positions
-            )
-            # At least some commission was paid
-            assert total_commission_paid > 0
+        assert result.total_trades > 0, "Test candles must trigger at least one trade"
+        # Commission is charged on entry and exit, so balance should reflect costs
+        total_commission_paid = sum(
+            config.commission_pct * (p.size_usd * 2)  # entry + exit approximation
+            for p in result.positions
+        )
+        assert total_commission_paid > 0
 
     @patch("src.backtesting.engine.load_klines")
     def test_max_positions_respected(self, mock_load):

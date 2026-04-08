@@ -3,30 +3,38 @@
 import pytest
 
 from src.qualification.scorer import (
-    _clamp, _news_adjustment, _social_adjustment,
+    _news_adjustment, _social_adjustment,
     _context_adjustment, _fear_greed_adjustment, qualify,
+    _cvd_adjustment, _regime_adjustment, _options_adjustment,
+    _derivatives_adjustment, _stablecoin_adjustment, _unlock_risk_adjustment,
 )
+from src.utils.safe_math import safe_score
+from src.indicators.cvd import CVDSnapshot
+from src.indicators.regime import RegimeSnapshot
 from src.signals.news import NewsSentiment
+from src.signals.options import OptionsSentiment
+from src.signals.stablecoin import StablecoinFlows
+from src.signals.derivatives import DerivativesData
 from src.signals.social import SocialSentiment
 from src.types import ScannerConfig, MarketContext
 from tests.conftest import make_signal
 
 
-# ── _clamp ─────────────────────────────────────────────────────────────────
+# ── safe_score (was _clamp) ────────────────────────────────────────────────
 
 class TestClamp:
     def test_within_range(self):
-        assert _clamp(5, 0, 10) == 5
+        assert safe_score(5, 0, 10) == 5
 
     def test_below_min(self):
-        assert _clamp(-5, 0, 10) == 0
+        assert safe_score(-5, 0, 10) == 0
 
     def test_above_max(self):
-        assert _clamp(15, 0, 10) == 10
+        assert safe_score(15, 0, 10) == 10
 
     def test_at_boundaries(self):
-        assert _clamp(0, 0, 10) == 0
-        assert _clamp(10, 0, 10) == 10
+        assert safe_score(0, 0, 10) == 0
+        assert safe_score(10, 0, 10) == 10
 
 
 # ── _news_adjustment ───────────────────────────────────────────────────────
@@ -261,3 +269,190 @@ class TestQualify:
         # base=60 + news(6) + social(3.2) + ctx(8) + fgi(6) = 83.2
         assert result.passed is True
         assert result.score > 70
+
+    def test_qualify_with_all_10_signals(self, config):
+        signal = make_signal(score=60, side="long", symbol="ETH")
+        ctx = MarketContext(phase="bull", btc_dominance=45,
+                            fear_greed_index=50, total_market_cap_change_d1=1,
+                            timestamp=0)
+        cvd = CVDSnapshot(symbol="ETH", ts=0, cvd=100, divergence_score=-0.5,
+                          buy_volume_1m=1000, sell_volume_1m=400)
+        regime = RegimeSnapshot(ts=0, trend="trending_up", trend_strength=40,
+                                volatility="normal_vol")
+        options = OptionsSentiment(symbol="ETH", put_call_ratio=0.6,
+                                  total_put_oi=100, total_call_oi=200,
+                                  implied_vol_avg=0.5, skew_25d=5.0)
+        deriv = DerivativesData(symbol="ETH", futures_basis_pct=0.1,
+                                open_interest_usd=1e9, funding_rate=0.0001,
+                                mark_price=3000, index_price=2999)
+        stable = StablecoinFlows(total_stablecoin_mcap=150e9,
+                                 mcap_change_24h_pct=0.2, mcap_change_7d_pct=0.5,
+                                 usdt_dominance=0.65, usdt_mcap=100e9, usdc_mcap=50e9)
+        result = qualify(signal, ctx, config, cvd=cvd, regime=regime,
+                         options=options, derivatives=deriv, stablecoin=stable,
+                         has_unlock_risk=False)
+        assert result.passed is True
+        assert "cvd" in result.breakdown or result.breakdown.get("cvd_adjustment", 0) != 0
+
+
+# ── _cvd_adjustment ──────────────────────────────────────────────────────
+
+class TestCVDAdjustment:
+    def test_none_cvd(self):
+        assert _cvd_adjustment(make_signal(side="long"), None) == 0
+
+    def test_bearish_divergence_penalizes_long(self):
+        cvd = CVDSnapshot(symbol="ETH", ts=0, cvd=100, divergence_score=0.5)
+        adj = _cvd_adjustment(make_signal(side="long"), cvd)
+        assert adj == -6
+
+    def test_bullish_divergence_boosts_long(self):
+        cvd = CVDSnapshot(symbol="ETH", ts=0, cvd=100, divergence_score=-0.5)
+        adj = _cvd_adjustment(make_signal(side="long"), cvd)
+        assert adj == 5
+
+    def test_bearish_divergence_boosts_short(self):
+        cvd = CVDSnapshot(symbol="ETH", ts=0, cvd=100, divergence_score=0.5)
+        adj = _cvd_adjustment(make_signal(side="short"), cvd)
+        assert adj == 5
+
+    def test_buy_pressure_confirms_long(self):
+        cvd = CVDSnapshot(symbol="ETH", ts=0, cvd=100, divergence_score=0,
+                          buy_volume_1m=2100, sell_volume_1m=1000)
+        adj = _cvd_adjustment(make_signal(side="long"), cvd)
+        assert adj == 3  # ratio > 2.0 confirms long
+
+    def test_sell_pressure_confirms_short(self):
+        cvd = CVDSnapshot(symbol="ETH", ts=0, cvd=100, divergence_score=0,
+                          buy_volume_1m=400, sell_volume_1m=1000)
+        adj = _cvd_adjustment(make_signal(side="short"), cvd)
+        assert adj == 3  # ratio < 0.5 confirms short
+
+
+# ── _regime_adjustment ───────────────────────────────────────────────────
+
+class TestRegimeAdjustment:
+    def test_none_regime(self):
+        assert _regime_adjustment(make_signal(), None) == 0
+
+    def test_mean_reversion_penalized_in_strong_trend(self):
+        regime = RegimeSnapshot(ts=0, trend="trending_up", trend_strength=50)
+        adj = _regime_adjustment(make_signal(strategy="mean_reversion"), regime)
+        assert adj == -8
+
+    def test_momentum_boosted_in_trend(self):
+        regime = RegimeSnapshot(ts=0, trend="trending_up", trend_strength=40)
+        adj = _regime_adjustment(make_signal(side="long", strategy="momentum_swing"), regime)
+        assert adj == 5
+
+    def test_momentum_penalized_in_ranging(self):
+        regime = RegimeSnapshot(ts=0, trend="ranging", trend_strength=10)
+        adj = _regime_adjustment(make_signal(side="long", strategy="momentum_swing"), regime)
+        assert adj == -4
+
+    def test_squeeze_boosts_momentum(self):
+        regime = RegimeSnapshot(ts=0, trend="ranging", trend_strength=10, bb_squeeze=True)
+        adj = _regime_adjustment(make_signal(side="long", strategy="momentum_swing"), regime)
+        # ranging -4, squeeze +4 = 0
+        assert adj == 0
+
+    def test_low_vol_penalty(self):
+        regime = RegimeSnapshot(ts=0, trend="ranging", volatility="low_vol", bb_squeeze=False)
+        adj = _regime_adjustment(make_signal(strategy="momentum_swing"), regime)
+        # ranging -4, low_vol -3 = -7
+        assert adj == -7
+
+    def test_high_vol_penalizes_scalp(self):
+        regime = RegimeSnapshot(ts=0, trend="ranging", volatility="high_vol")
+        adj = _regime_adjustment(make_signal(strategy="momentum_scalp"), regime)
+        # ranging -4, high_vol scalp -4 = -8
+        assert adj == -8
+
+    def test_high_vol_boosts_mean_reversion(self):
+        regime = RegimeSnapshot(ts=0, trend="ranging", volatility="high_vol")
+        adj = _regime_adjustment(make_signal(strategy="mean_reversion"), regime)
+        # ranging: no penalty for MR, high_vol MR +3 = 3
+        assert adj == 3
+
+
+# ── _options_adjustment ──────────────────────────────────────────────────
+
+class TestOptionsAdjustment:
+    def test_none_options(self):
+        assert _options_adjustment(make_signal(), None) == 0
+
+    def test_high_put_call_penalizes_long(self):
+        options = OptionsSentiment(symbol="ETH", put_call_ratio=1.5,
+                                  total_put_oi=100, total_call_oi=50,
+                                  implied_vol_avg=0.5, skew_25d=None)
+        adj = _options_adjustment(make_signal(side="long"), options)
+        assert adj == -4
+
+    def test_low_put_call_boosts_long(self):
+        options = OptionsSentiment(symbol="ETH", put_call_ratio=0.5,
+                                  total_put_oi=50, total_call_oi=100,
+                                  implied_vol_avg=0.5, skew_25d=None)
+        adj = _options_adjustment(make_signal(side="long"), options)
+        assert adj == 4
+
+    def test_negative_skew_penalizes_long(self):
+        options = OptionsSentiment(symbol="ETH", put_call_ratio=1.0,
+                                  total_put_oi=100, total_call_oi=100,
+                                  implied_vol_avg=0.5, skew_25d=-15)
+        adj = _options_adjustment(make_signal(side="long"), options)
+        assert adj == -3
+
+
+# ── _derivatives_adjustment ──────────────────────────────────────────────
+
+class TestDerivativesAdjustment:
+    def test_none_derivatives(self):
+        assert _derivatives_adjustment(make_signal(), None) == 0
+
+    def test_crowded_longs_penalize_long(self):
+        deriv = DerivativesData(symbol="ETH", futures_basis_pct=0.8,
+                                open_interest_usd=1e9, funding_rate=0.001,
+                                mark_price=3000, index_price=2990)
+        adj = _derivatives_adjustment(make_signal(side="long"), deriv)
+        assert adj == -5
+
+    def test_crowded_shorts_boost_long(self):
+        deriv = DerivativesData(symbol="ETH", futures_basis_pct=-0.5,
+                                open_interest_usd=1e9, funding_rate=-0.001,
+                                mark_price=2990, index_price=3000)
+        adj = _derivatives_adjustment(make_signal(side="long"), deriv)
+        assert adj == 5
+
+
+# ── _stablecoin_adjustment ───────────────────────────────────────────────
+
+class TestStablecoinAdjustment:
+    def test_none_stablecoin(self):
+        assert _stablecoin_adjustment(make_signal(), None) == 0
+
+    def test_capital_inflow_boosts_long(self):
+        flows = StablecoinFlows(total_stablecoin_mcap=150e9,
+                                mcap_change_24h_pct=0.5, mcap_change_7d_pct=1.0,
+                                usdt_dominance=0.65, usdt_mcap=100e9, usdc_mcap=50e9)
+        adj = _stablecoin_adjustment(make_signal(side="long"), flows)
+        assert adj == 3
+
+    def test_capital_outflow_penalizes_long(self):
+        flows = StablecoinFlows(total_stablecoin_mcap=150e9,
+                                mcap_change_24h_pct=-0.5, mcap_change_7d_pct=-1.0,
+                                usdt_dominance=0.65, usdt_mcap=100e9, usdc_mcap=50e9)
+        adj = _stablecoin_adjustment(make_signal(side="long"), flows)
+        assert adj == -3
+
+
+# ── _unlock_risk_adjustment ──────────────────────────────────────────────
+
+class TestUnlockRiskAdjustment:
+    def test_no_risk(self):
+        assert _unlock_risk_adjustment(make_signal(), False) == 0
+
+    def test_risk_penalizes_long(self):
+        assert _unlock_risk_adjustment(make_signal(side="long"), True) == -8
+
+    def test_risk_boosts_short(self):
+        assert _unlock_risk_adjustment(make_signal(side="short"), True) == 3

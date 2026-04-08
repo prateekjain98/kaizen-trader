@@ -214,7 +214,7 @@ class TestProtectionChain:
 
     def test_from_config(self):
         chain = ProtectionChain.from_config(DEFAULT_PROTECTIONS)
-        assert len(chain.rules) == 5
+        assert len(chain.rules) == 6
 
     def test_disabled_rule_skipped(self):
         config = [
