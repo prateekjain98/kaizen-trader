@@ -34,13 +34,15 @@ class _Env:
     binance_api_key = _optional("BINANCE_API_KEY")
     binance_api_secret = _optional("BINANCE_API_SECRET")
 
+    convex_url = _optional("CONVEX_URL")  # required for prod — primary database
     anthropic_api_key = _optional("ANTHROPIC_API_KEY")
-    lunarcrush_api_key = _optional("LUNARCRUSH_API_KEY")
+    lunarcrush_api_key = _optional("LUNARCRUSH_API_KEY")  # required — core social signal source
     cryptopanic_token = _optional("CRYPTOPANIC_TOKEN")
     whale_alert_api_key = _optional("WHALE_ALERT_API_KEY")
 
-    max_position_usd = _num("MAX_POSITION_USD", 100)
-    max_daily_loss_usd = _num("MAX_DAILY_LOSS_USD", 300)
+    portfolio_usd = _num("PORTFOLIO_USD", 6000)
+    max_position_usd = _num("MAX_POSITION_USD", 1200)  # ~20% of 6k portfolio
+    max_daily_loss_usd = _num("MAX_DAILY_LOSS_USD", 300)  # 5% of portfolio
     max_open_positions = int(_num("MAX_OPEN_POSITIONS", 5))
 
     log_analysis_interval_mins = int(_num("LOG_ANALYSIS_INTERVAL_MINS", 60))
