@@ -17,6 +17,7 @@ from src.storage.database import log
 
 _CACHE_TTL_MS = 120_000  # 2 minutes
 _FAPI_BASE = "https://fapi.binance.com/fapi/v1"
+_FUTURES_DATA_BASE = "https://fapi.binance.com/futures/data"
 _SPOT_BASE = "https://api.binance.com/api/v3"
 
 _lock = threading.Lock()
@@ -170,7 +171,7 @@ def _fetch_leverage_profile(symbol: str) -> Optional[LeverageProfile]:
     try:
         # Top trader long/short ratio (most informative — "smart money")
         top_resp = requests.get(
-            f"{_FAPI_BASE}/topLongShortAccountRatio",
+            f"{_FUTURES_DATA_BASE}/topLongShortAccountRatio",
             params={"symbol": perp_ticker, "period": "1h", "limit": 1},
             timeout=10,
         )
@@ -179,7 +180,7 @@ def _fetch_leverage_profile(symbol: str) -> Optional[LeverageProfile]:
 
         # Global long/short ratio
         global_resp = requests.get(
-            f"{_FAPI_BASE}/globalLongShortAccountRatio",
+            f"{_FUTURES_DATA_BASE}/globalLongShortAccountRatio",
             params={"symbol": perp_ticker, "period": "1h", "limit": 1},
             timeout=10,
         )

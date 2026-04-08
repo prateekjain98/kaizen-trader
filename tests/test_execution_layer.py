@@ -70,7 +70,7 @@ class TestBinanceProvider:
     def test_buy_fails_without_credentials(self):
         from src.execution.providers import BinanceProvider
         provider = BinanceProvider()
-        with patch("src.config.env") as mock_env:
+        with patch("src.execution.providers.env") as mock_env:
             mock_env.binance_api_key = None
             mock_env.binance_api_secret = None
             trade = provider.buy("BTC", "BTCUSDT", 100.0, "pos-1", 95000.0)
@@ -80,7 +80,7 @@ class TestBinanceProvider:
     def test_sell_fails_without_credentials(self):
         from src.execution.providers import BinanceProvider
         provider = BinanceProvider()
-        with patch("src.config.env") as mock_env:
+        with patch("src.execution.providers.env") as mock_env:
             mock_env.binance_api_key = None
             mock_env.binance_api_secret = None
             trade = provider.sell("BTC", "BTCUSDT", 0.001, "pos-1", 95000.0)
@@ -89,7 +89,7 @@ class TestBinanceProvider:
     def test_buy_invalid_size(self):
         from src.execution.providers import BinanceProvider
         provider = BinanceProvider()
-        with patch("src.config.env") as mock_env:
+        with patch("src.execution.providers.env") as mock_env:
             mock_env.binance_api_key = "test"
             mock_env.binance_api_secret = "test"
             trade = provider.buy("BTC", "BTCUSDT", -100.0, "pos-1", 95000.0)
@@ -98,7 +98,7 @@ class TestBinanceProvider:
     def test_sell_invalid_quantity(self):
         from src.execution.providers import BinanceProvider
         provider = BinanceProvider()
-        with patch("src.config.env") as mock_env:
+        with patch("src.execution.providers.env") as mock_env:
             mock_env.binance_api_key = "test"
             mock_env.binance_api_secret = "test"
             trade = provider.sell("BTC", "BTCUSDT", 0, "pos-1", 95000.0)
@@ -114,7 +114,7 @@ class TestBinanceProvider:
     def test_get_balances_without_creds_returns_empty(self):
         from src.execution.providers import BinanceProvider
         provider = BinanceProvider()
-        with patch("src.config.env") as mock_env:
+        with patch("src.execution.providers.env") as mock_env:
             mock_env.binance_api_key = None
             mock_env.binance_api_secret = None
             balances = provider.get_balances()
