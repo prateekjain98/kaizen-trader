@@ -56,6 +56,13 @@ def insert_position(p: Position) -> None:
     _get().insert_position(p)
 
 
+def update_position_price(position_id: str, current_price: float,
+                          high_watermark: float, low_watermark: float,
+                          stop_price: float, quantity: float | None = None) -> None:
+    _get().update_position_price(position_id, current_price, high_watermark,
+                                  low_watermark, stop_price, quantity)
+
+
 def update_position_close(id: str, exit_price: float, pnl_usd: float,
                           pnl_pct: float, exit_reason: str) -> None:
     _get().update_position_close(id, exit_price, pnl_usd, pnl_pct, exit_reason)
@@ -80,6 +87,10 @@ def snapshot_config(config: object, reason: str) -> None:
 
 def insert_trade_journal(entry: dict) -> None:
     _get().insert_trade_journal(entry)
+
+
+def close_orphaned_positions(exit_reason: str = "orphaned_restart") -> dict:
+    return _get().close_orphaned_positions(exit_reason)
 
 
 # ─── Read operations ──────────────────────────────────────────────────────

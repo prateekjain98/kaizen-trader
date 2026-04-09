@@ -28,9 +28,51 @@ export const insertPosition = mutation({
     pnlPct: v.optional(v.float64()),
     exitReason: v.optional(v.string()),
     paperTrading: v.boolean(),
+    maePct: v.optional(v.float64()),
+    mfePct: v.optional(v.float64()),
+    partialExitPct: v.optional(v.float64()),
+    trancheCount: v.optional(v.float64()),
+    avgEntryPrice: v.optional(v.float64()),
+    originalQuantity: v.optional(v.float64()),
+    entrySizeUsd: v.optional(v.float64()),
+    totalCommission: v.optional(v.float64()),
+    initialStopPrice: v.optional(v.float64()),
   },
   handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("positions")
+      .withIndex("by_positionId", (q) => q.eq("positionId", args.positionId))
+      .first();
+    if (existing) return;
     await ctx.db.insert("positions", args);
+  },
+});
+
+export const updatePositionPrice = mutation({
+  args: {
+    positionId: v.string(),
+    currentPrice: v.float64(),
+    highWatermark: v.float64(),
+    lowWatermark: v.float64(),
+    stopPrice: v.float64(),
+    quantity: v.optional(v.float64()),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("positions")
+      .withIndex("by_positionId", (q) => q.eq("positionId", args.positionId))
+      .first();
+    if (!existing) return;
+    const updates: Record<string, number> = {
+      currentPrice: args.currentPrice,
+      highWatermark: args.highWatermark,
+      lowWatermark: args.lowWatermark,
+      stopPrice: args.stopPrice,
+    };
+    if (args.quantity !== undefined) {
+      updates.quantity = args.quantity;
+    }
+    await ctx.db.patch(existing._id, updates);
   },
 });
 
@@ -59,6 +101,42 @@ export const updatePositionClose = mutation({
       pnlPct: args.pnlPct,
       exitReason: args.exitReason,
     });
+  },
+});
+
+export const deletePositionById = mutation({
+  args: { positionId: v.string() },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("positions")
+      .withIndex("by_positionId", (q) => q.eq("positionId", args.positionId))
+      .first();
+    if (existing) {
+      await ctx.db.delete(existing._id);
+      return true;
+    }
+    return false;
+  },
+});
+
+export const deduplicateOpenPositions = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const open = await ctx.db
+      .query("positions")
+      .withIndex("by_status", (q) => q.eq("status", "open"))
+      .collect();
+    const seen = new Set<string>();
+    let removed = 0;
+    for (const pos of open) {
+      if (seen.has(pos.positionId)) {
+        await ctx.db.delete(pos._id);
+        removed++;
+      } else {
+        seen.add(pos.positionId);
+      }
+    }
+    return { removed, remaining: open.length - removed };
   },
 });
 
@@ -204,6 +282,57 @@ export const insertTradeJournal = mutation({
   },
 });
 
+export const clearAllData = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const tables = [
+      "positions",
+      "trades",
+      "logs",
+      "diagnoses",
+      "scannerConfigHistory",
+      "parameterDeltas",
+      "githubIssues",
+      "tradeJournal",
+      "metrics",
+    ] as const;
+    const counts: Record<string, number> = {};
+    for (const table of tables) {
+      const rows = await ctx.db.query(table).collect();
+      for (const row of rows) {
+        await ctx.db.delete(row._id);
+      }
+      counts[table] = rows.length;
+    }
+    return counts;
+  },
+});
+
+export const closeOrphanedPositions = mutation({
+  args: {
+    exitReason: v.string(),
+    closedAt: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    const open = await ctx.db
+      .query("positions")
+      .withIndex("by_status", (q) => q.eq("status", "open"))
+      .collect();
+    let closed = 0;
+    for (const pos of open) {
+      await ctx.db.patch(pos._id, {
+        status: "closed",
+        exitReason: args.exitReason,
+        closedAt: args.closedAt,
+        pnlUsd: 0,
+        pnlPct: 0,
+      });
+      closed++;
+    }
+    return { closed, positionIds: open.map((p) => p.positionId) };
+  },
+});
+
 export const insertMetrics = mutation({
   args: {
     windowStartMs: v.float64(),
@@ -218,5 +347,36 @@ export const insertMetrics = mutation({
   },
   handler: async (ctx, args) => {
     await ctx.db.insert("metrics", args);
+  },
+});
+
+export const deleteByExitReason = mutation({
+  args: { exitReason: v.string() },
+  handler: async (ctx, args) => {
+    const positions = await ctx.db.query("positions").collect();
+    let deleted = 0;
+    for (const pos of positions) {
+      if (pos.exitReason === args.exitReason) {
+        await ctx.db.delete(pos._id);
+        deleted++;
+      }
+    }
+    return { deleted };
+  },
+});
+
+export const deleteClosedPositions = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const closed = await ctx.db
+      .query("positions")
+      .withIndex("by_status", (q) => q.eq("status", "closed"))
+      .collect();
+    let deleted = 0;
+    for (const pos of closed) {
+      await ctx.db.delete(pos._id);
+      deleted++;
+    }
+    return { deleted };
   },
 });

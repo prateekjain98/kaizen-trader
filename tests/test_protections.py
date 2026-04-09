@@ -105,34 +105,45 @@ class TestMaxDrawdownGuard:
         assert v.allowed is True
 
     def test_blocks_on_drawdown(self):
-        rule = MaxDrawdownGuard(max_drawdown_pct=0.15)
-        # Build equity to 1000, then draw down
+        # starting_equity=1000 so drawdown math is clearer
+        rule = MaxDrawdownGuard(max_drawdown_pct=0.15, starting_equity=1000)
+        # Build equity to 2000, then draw down
         p = make_position(pnl_usd=1000)
         rule.on_trade_closed(p, 1000)
-        p2 = make_position(pnl_usd=-200)
-        rule.on_trade_closed(p2, -200)
-        # dd = (1000 - 800) / 1000 = 0.20 > 0.15
+        p2 = make_position(pnl_usd=-500)
+        rule.on_trade_closed(p2, -500)
+        # peak=2000, current=1500, dd = 500/2000 = 0.25 > 0.15
         v = rule.check(_ctx())
         assert v.allowed is False
-        assert "20.0%" in v.reason
+        assert "25.0%" in v.reason
+
+    def test_blocks_on_early_losses(self):
+        """Early losses from starting equity should trigger drawdown."""
+        rule = MaxDrawdownGuard(max_drawdown_pct=0.15, starting_equity=1000)
+        # Lose 200 right away — no profit first
+        p = make_position(pnl_usd=-200)
+        rule.on_trade_closed(p, -200)
+        # peak=1000, current=800, dd = 200/1000 = 0.20 > 0.15
+        v = rule.check(_ctx())
+        assert v.allowed is False
 
     def test_allows_small_drawdown(self):
-        rule = MaxDrawdownGuard(max_drawdown_pct=0.15)
+        rule = MaxDrawdownGuard(max_drawdown_pct=0.15, starting_equity=1000)
         p = make_position(pnl_usd=1000)
         rule.on_trade_closed(p, 1000)
         p2 = make_position(pnl_usd=-100)
         rule.on_trade_closed(p2, -100)
-        # dd = 100/1000 = 0.10 < 0.15
+        # peak=2000, current=1900, dd = 100/2000 = 0.05 < 0.15
         v = rule.check(_ctx())
         assert v.allowed is True
 
-    def test_day_reset_clears_equity(self):
-        rule = MaxDrawdownGuard(max_drawdown_pct=0.15)
+    def test_day_reset_preserves_current_equity(self):
+        rule = MaxDrawdownGuard(max_drawdown_pct=0.15, starting_equity=1000)
         p = make_position(pnl_usd=1000)
         rule.on_trade_closed(p, 1000)
-        p2 = make_position(pnl_usd=-200)
-        rule.on_trade_closed(p2, -200)
-        rule.on_day_reset()
+        p2 = make_position(pnl_usd=-500)
+        rule.on_trade_closed(p2, -500)
+        rule.on_day_reset()  # peak resets to current equity
         v = rule.check(_ctx())
         assert v.allowed is True
 

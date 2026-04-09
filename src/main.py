@@ -41,6 +41,7 @@ from src.signals.derivatives import fetch_derivatives_data, fetch_leverage_profi
 import src.storage.database as _db_mod
 from src.storage.database import (
     log, insert_position, insert_trade, update_position_close,
+    update_position_price as db_update_position_price,
     get_closed_trades, batch_writes, close as close_db,
 )
 from src.strategies.registry import get_registry
@@ -52,7 +53,11 @@ from src.strategies.orderbook_imbalance import (
 from src.strategies.funding_extreme import scan_funding_extreme, update_funding_data, FundingRateData
 from src.strategies.whale_tracker import scan_whale_accumulation
 from src.strategies.liquidation_cascade import scan_liquidation_cascade
-from src.strategies.fear_greed_contrarian import scan_fear_greed_contrarian
+from src.strategies.fear_greed_contrarian import (
+    scan_fear_greed_contrarian,
+    on_position_opened as fgi_on_position_opened,
+    on_position_closed as fgi_on_position_closed,
+)
 from src.strategies.correlation_break import scan_correlation_break
 from src.strategies.cross_exchange_divergence import scan_cross_exchange_divergence
 from src.strategies.narrative_momentum import scan_narrative_momentum
@@ -91,7 +96,7 @@ _SCALP_EXIT_CHECK_INTERVAL_S = 1  # check scalp exits every 1 second
 _MARKET_CONTEXT_INTERVAL_S = 120  # refresh market context every 2 minutes
 _SIGNAL_REFRESH_INTERVAL_S = 150  # refresh external signals every 2.5 minutes
 _BOOK_PURGE_INTERVAL_S = 120      # purge stale order books every 2 minutes
-_WARMUP_PERIOD_S = 300  # 5 minutes — collect data before trading
+_WARMUP_PERIOD_S = 60  # 1 minute — collect data before trading
 _last_mc_run = [0.0]  # mutable container for last Monte Carlo run timestamp
 
 # Graceful shutdown event — background threads check this to exit promptly
@@ -107,6 +112,12 @@ _market_ctx: MarketContext = MarketContext(
 _price_lock = threading.Lock()
 _latest_prices: dict[str, float] = {}  # symbol -> latest price
 _prev_prices: dict[str, float] = {}    # symbol -> previous tick price (for CVD side inference)
+_tick_count: dict[str, int] = {}       # symbol -> tick count for diagnostics
+_last_diag_time = 0.0
+_DIAG_INTERVAL_S = 60  # log diagnostics every 60 seconds
+_last_convex_sync_time = 0.0
+_CONVEX_SYNC_INTERVAL_S = 10  # sync position prices to Convex every 10 seconds
+_ws_instance: Optional[CoinbaseWebSocket] = None  # for health check access
 
 _news_lock = threading.Lock()
 _news_cache: dict[str, NewsSentiment] = {}  # symbol -> NewsSentiment
@@ -310,20 +321,35 @@ def _scan_protocol_revenue_signals() -> None:
 
 def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     """Qualify a signal and open a position if it passes all checks."""
+    # Validate required signal fields
+    if not signal.symbol or not signal.product_id or signal.entry_price <= 0:
+        log("error", f"Invalid signal — missing fields: symbol={signal.symbol} "
+            f"product_id={signal.product_id} entry_price={signal.entry_price}")
+        return
+
     # Check if strategy is enabled
     if not strategy_selector.is_strategy_enabled(signal.strategy):
+        log("info", f"Signal blocked (strategy disabled): {signal.strategy} {signal.symbol}",
+            symbol=signal.symbol, strategy=signal.strategy)
         return
 
     # Warm-up period: don't trade until we have enough data
-    if time.time() - _start_time < _WARMUP_PERIOD_S:
+    remaining = _WARMUP_PERIOD_S - (time.time() - _start_time)
+    if remaining > 0:
+        log("info", f"Signal blocked (warm-up {remaining:.0f}s left): {signal.strategy} {signal.symbol}",
+            symbol=signal.symbol, strategy=signal.strategy)
         return
 
     # Consecutive loss cooldown check
     if is_on_cooldown(signal.strategy):
+        log("info", f"Signal blocked (loss cooldown): {signal.strategy} {signal.symbol}",
+            symbol=signal.symbol, strategy=signal.strategy)
         return
 
     # Regime-based hard gating: completely block strategy in wrong regime
     if is_regime_blocked(signal.strategy, signal.symbol):
+        log("info", f"Signal blocked (regime gate): {signal.strategy} {signal.symbol}",
+            symbol=signal.symbol, strategy=signal.strategy)
         return
 
     # Signal staleness check: reject signals older than 30s (price may have moved)
@@ -383,12 +409,22 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         stablecoin=stablecoin, has_unlock_risk=has_unlock_risk,
     )
     if not qual.passed:
+        try:
+            log("info", f"Signal blocked (qual {qual.score:.0f} < min): {signal.strategy} {signal.symbol} — {qual.reasoning}",
+                symbol=signal.symbol, strategy=signal.strategy)
+        except (TypeError, AttributeError):
+            pass
         return
 
     log("signal",
         f"{signal.strategy} signal: {signal.symbol} {signal.side} (qual={qual.score:.0f}) — {signal.reasoning}",
         symbol=signal.symbol, strategy=signal.strategy,
         data={"qual_score": qual.score, "breakdown": qual.breakdown})
+
+    # Block duplicate: don't open same symbol+strategy if already open
+    for pos in get_open_positions():
+        if pos.symbol == signal.symbol and pos.strategy == signal.strategy:
+            return
 
     # Risk check
     if not can_open_position():
@@ -448,21 +484,34 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     entry_price = trade.price if trade.price > 0 else signal.entry_price
     quantity = trade.quantity
 
+    # Guard against zero/negative quantity positions (e.g., size below minimum)
+    if quantity <= 0:
+        log("error", f"Trade returned zero quantity for {signal.symbol}, skipping position",
+            symbol=signal.symbol, strategy=signal.strategy)
+        return
+
     # Compute ATR-based stop price (falls back to fixed % if ATR unavailable)
     stop_price, trail_pct = compute_atr_stop(
         signal.symbol, entry_price, signal.side, signal.strategy,
         fallback_trail_pct=trail_pct,
     )
 
-    # Adaptive stop: use historical MAE if available (may tighten or widen the ATR stop)
+    # Adaptive stop: use historical MAE if available (may widen the ATR stop)
     adaptive_trail = compute_adaptive_stop(signal.strategy, trail_pct)
     if adaptive_trail != trail_pct:
-        # Use the tighter of ATR stop and adaptive stop
-        trail_pct = min(trail_pct, adaptive_trail)
+        # Use the wider of ATR stop and adaptive stop to give trades breathing room
+        trail_pct = max(trail_pct, adaptive_trail)
         if signal.side == "long":
             stop_price = entry_price * (1 - trail_pct)
         else:
             stop_price = entry_price * (1 + trail_pct)
+
+    # Capture momentum at entry for self-healing diagnosis
+    from src.strategies.momentum import _swing_buffers
+    _momentum_at_entry = 0.0
+    buf = _swing_buffers.get(signal.symbol, [])
+    if len(buf) >= 2 and buf[0].price > 0:
+        _momentum_at_entry = (buf[-1].price - buf[0].price) / buf[0].price
 
     # Create position
     position = Position(
@@ -490,6 +539,10 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         tranche_count=1,
         max_tranches=get_max_tranches(signal.tier),
         avg_entry_price=entry_price,
+        entry_size_usd=trade.size_usd,
+        total_commission=trade.commission,
+        initial_stop_price=stop_price,
+        momentum_at_entry=_momentum_at_entry,
     )
 
     # Persist and register
@@ -497,6 +550,8 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         insert_position(position)
         insert_trade(trade)
     register_open(position)
+    if signal.strategy == "fear_greed_contrarian":
+        fgi_on_position_opened(signal.symbol)
 
     log("trade",
         f"OPENED {signal.side.upper()} {signal.symbol} ${trade.size_usd:.0f} "
@@ -510,18 +565,107 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         })
 
 
+# ─── Diagnostics ──────────────────────────────────────────────────────────────
+
+def _log_diagnostics() -> None:
+    """Log system diagnostics every 60s to help debug trading pipeline."""
+    from src.strategies.momentum import _swing_buffers, _scalp_buffers
+    from src.indicators.core import get_snapshot, get_atr
+
+    uptime = time.time() - _start_time
+    warmup_remaining = max(0, _WARMUP_PERIOD_S - uptime)
+
+    with _price_lock:
+        n_prices = len(_latest_prices)
+        symbols_with_prices = list(_latest_prices.keys())[:5]
+
+    total_ticks = sum(_tick_count.values())
+    n_tick_symbols = len(_tick_count)
+
+    # Buffer status for momentum
+    swing_ready = {s for s, buf in _swing_buffers.items() if len(buf) >= 5}
+    scalp_ready = {s for s, buf in _scalp_buffers.items() if len(buf) >= 5}
+
+    # Indicator readiness (sample BTC)
+    btc_snap = get_snapshot("BTC")
+    btc_atr = get_atr("BTC")
+    btc_indicators = "none"
+    if btc_snap:
+        parts = []
+        if btc_snap.rsi_14 is not None:
+            parts.append(f"RSI={btc_snap.rsi_14:.0f}")
+        if btc_snap.adx is not None:
+            parts.append(f"ADX={btc_snap.adx:.0f}")
+        if btc_snap.ema_20 is not None:
+            parts.append("EMA20")
+        if btc_snap.bb_width is not None:
+            parts.append(f"BBW={btc_snap.bb_width:.3f}")
+        btc_indicators = ", ".join(parts) if parts else "computing..."
+
+    # Regime
+    regime = classify_regime("BTC")
+
+    # Market context
+    with _market_ctx_lock:
+        ctx = _market_ctx
+
+    open_pos = get_open_positions()
+
+    log("info",
+        f"DIAGNOSTICS: uptime={uptime:.0f}s | warmup_left={warmup_remaining:.0f}s | "
+        f"ticks={total_ticks} ({n_tick_symbols} symbols) | "
+        f"prices={n_prices} [{', '.join(symbols_with_prices)}...] | "
+        f"swing_ready={len(swing_ready)} scalp_ready={len(scalp_ready)} | "
+        f"BTC: ATR={'%.2f' % btc_atr if btc_atr else 'None'} indicators=[{btc_indicators}] | "
+        f"regime: trend={regime.trend} vol={regime.volatility} phase={regime.phase} score={regime.regime_score:.0f} | "
+        f"market: phase={ctx.phase} FGI={ctx.fear_greed_index:.0f} | "
+        f"positions: {len(open_pos)} open")
+
+
 # ─── Tick-driven strategy scanning ───────────────────────────────────────────
 
 def _on_tick(symbol: str, price: float, volume: float) -> None:
     """Called on each WebSocket tick. Feed data to strategies and scan."""
+    # Price feed validation: reject unreasonable prices
+    if price <= 0.001:
+        return  # absolute floor — no sub-penny assets
+    with _price_lock:
+        prev = _latest_prices.get(symbol)
+    if prev and prev > 0:
+        change = abs(price - prev) / prev
+        if change > 0.20:
+            log("warn", f"Price spike rejected: {symbol} {prev:.4f} -> {price:.4f} ({change:.1%})",
+                symbol=symbol)
+            return  # reject >20% single-tick moves as feed glitches
+
     # Update latest price
     with _price_lock:
         _latest_prices[symbol] = price
+    _tick_count[symbol] = _tick_count.get(symbol, 0) + 1
+
+    # Periodic diagnostics
+    global _last_diag_time
+    now_diag = time.time()
+    if now_diag - _last_diag_time >= _DIAG_INTERVAL_S:
+        _last_diag_time = now_diag
+        _log_diagnostics()
 
     # Update open position prices
     for pos in get_open_positions():
         if pos.symbol == symbol:
             update_position_price(pos.id, price)
+
+    # Periodically sync position prices to Convex for dashboard
+    global _last_convex_sync_time
+    now_sync = time.time()
+    if now_sync - _last_convex_sync_time >= _CONVEX_SYNC_INTERVAL_S:
+        _last_convex_sync_time = now_sync
+        for pos in get_open_positions():
+            db_update_position_price(
+                pos.id, pos.current_price,
+                pos.high_watermark, pos.low_watermark,
+                pos.stop_price, pos.quantity,
+            )
 
     # Feed price samples to tick-driven strategies and indicator engine
     push_price_sample(symbol, price, volume)
@@ -596,18 +740,26 @@ def _try_scan(scan_fn, ctx: MarketContext) -> None:
 
 def _try_scan_correlation(symbol: str, product_id: str, price: float, ctx: MarketContext) -> None:
     """Scan correlation break strategy using BTC as reference."""
+    from src.strategies.momentum import _swing_buffers
     if symbol == "BTC":
-        return  # BTC is the reference, not a tradeable pair for this strategy
+        return
     with _price_lock:
         btc_price = _latest_prices.get("BTC")
     if not btc_price:
         return
-    # Use a simple approximation: 0% change for both when we lack history
-    # The strategy's internal correlation history will handle accumulation
+    # Compute actual 1h % change from swing buffers
+    btc_buf = _swing_buffers.get("BTC", [])
+    alt_buf = _swing_buffers.get(symbol, [])
+    btc_1h_pct = 0.0
+    alt_1h_pct = 0.0
+    if len(btc_buf) >= 2 and btc_buf[0].price > 0:
+        btc_1h_pct = (btc_buf[-1].price - btc_buf[0].price) / btc_buf[0].price
+    if len(alt_buf) >= 2 and alt_buf[0].price > 0:
+        alt_1h_pct = (alt_buf[-1].price - alt_buf[0].price) / alt_buf[0].price
     try:
         sig = scan_correlation_break(
             symbol, product_id, price,
-            btc_1h_pct=0, alt_1h_pct=0,
+            btc_1h_pct=btc_1h_pct, alt_1h_pct=alt_1h_pct,
             config=config, ctx=ctx,
         )
         if sig:
@@ -624,7 +776,7 @@ def _scan_narrative_momentum(ctx: MarketContext) -> None:
         current_prices = dict(_latest_prices)
     product_id_map = {sym: f"{sym}-USD" for sym in current_prices}
     try:
-        sig = scan_narrative_momentum(product_id_map, config, current_prices)
+        sig = scan_narrative_momentum(product_id_map, config, current_prices, ctx=ctx)
         if sig:
             _process_signal(sig, ctx)
     except Exception as err:
@@ -636,8 +788,18 @@ def _scan_narrative_momentum(ctx: MarketContext) -> None:
 def _on_book(symbol: str, bids: list, asks: list) -> None:
     """Called on each WebSocket L2 update."""
     try:
-        bid_levels = [OrderBookLevel(price=b["price"], size=b["size"]) for b in bids]
-        ask_levels = [OrderBookLevel(price=a["price"], size=a["size"]) for a in asks]
+        # Validate book data: reject negative sizes and inverted books
+        bid_levels = [
+            OrderBookLevel(price=b["price"], size=b["size"])
+            for b in bids if b.get("size", 0) >= 0 and b.get("price", 0) > 0
+        ]
+        ask_levels = [
+            OrderBookLevel(price=a["price"], size=a["size"])
+            for a in asks if a.get("size", 0) >= 0 and a.get("price", 0) > 0
+        ]
+        # Sanity check: best bid should be below best ask
+        if bid_levels and ask_levels and bid_levels[0].price >= ask_levels[0].price:
+            return  # inverted book, likely stale data
         update_order_book(symbol, bid_levels, ask_levels)
     except Exception as err:
         log("error", f"Order book update error for {symbol}: {err}")
@@ -649,11 +811,13 @@ def _on_book(symbol: str, bids: list, asks: list) -> None:
 def _compute_r_multiple(pos: Position, current_price: float) -> float:
     """Compute R-multiple: how many R (risk units) the trade has moved in our favor.
 
-    R = distance from entry to initial stop. R-multiple = profit / R.
+    R = distance from entry to initial stop (frozen at open). R-multiple = profit / R.
     """
     if pos.entry_price <= 0:
         return 0.0
-    initial_risk = abs(pos.entry_price - pos.stop_price) if pos.stop_price > 0 else pos.entry_price * pos.trail_pct
+    # Use initial_stop_price (frozen at open) for consistent R calculation
+    stop_ref = pos.initial_stop_price if pos.initial_stop_price > 0 else pos.stop_price
+    initial_risk = abs(pos.entry_price - stop_ref) if stop_ref > 0 else pos.entry_price * pos.trail_pct
     if initial_risk <= 0:
         return 0.0
     if pos.side == "long":
@@ -682,16 +846,38 @@ def _execute_partial_exit(pos: Position, current_price: float, now: float, fract
     # Track the partial exit
     if pos.original_quantity is None:
         pos.original_quantity = pos.quantity
+
+    # Compute partial P&L before updating quantity
+    if pos.entry_price > 0:
+        if pos.side == "long":
+            partial_pnl_pct = (trade.price - pos.avg_entry_price) / pos.avg_entry_price
+        else:
+            partial_pnl_pct = (pos.avg_entry_price - trade.price) / pos.avg_entry_price
+        # Use entry-basis size for this partial chunk
+        partial_chunk_entry_usd = (partial_qty / pos.original_quantity) * pos.entry_size_usd
+        partial_pnl_usd = partial_pnl_pct * partial_chunk_entry_usd - trade.commission
+        pos.partial_realized_pnl += partial_pnl_usd
+    else:
+        partial_pnl_usd = 0.0
+
     pos.quantity -= partial_qty
-    pos.partial_exit_pct += fraction
-    pos.size_usd = pos.quantity * current_price
+    pos.total_commission += trade.commission
+    # Fix P0.3: Track fraction of original quantity sold, not raw accumulation
+    if pos.original_quantity and pos.original_quantity > 0:
+        pos.partial_exit_pct = 1.0 - (pos.quantity / pos.original_quantity)
+    # Keep size_usd on entry basis for remaining quantity
+    if pos.original_quantity and pos.original_quantity > 0:
+        pos.size_usd = (pos.quantity / pos.original_quantity) * pos.entry_size_usd
 
     insert_trade(trade)
+
+    # Register partial P&L with risk manager for daily loss tracking (P1.4)
+    register_close(pos, partial_pnl_usd, is_partial=True)
 
     r_mult = _compute_r_multiple(pos, current_price)
     log("trade",
         f"PARTIAL EXIT {pos.side.upper()} {pos.symbol} — sold {fraction*100:.0f}% "
-        f"@ {current_price:.4f} (R={r_mult:.1f}), trailing remainder",
+        f"@ {current_price:.4f} (R={r_mult:.1f} partial_pnl=${partial_pnl_usd:.2f}), trailing remainder",
         symbol=pos.symbol, strategy=pos.strategy)
 
 
@@ -735,24 +921,27 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
     try:
         regime = classify_regime(pos.symbol)
         if regime.volatility == "high_vol":
-            # High vol: don't tighten stops as aggressively (give room for noise)
-            # Widen stop by 20% from current trail
+            # High vol: widen stops (use larger trail %) to avoid noise whipsaws
+            wider_trail = pos.trail_pct * 1.2
             if pos.side == "long":
-                widened = pos.high_watermark * (1 - pos.trail_pct * 1.2)
+                widened = pos.high_watermark * (1 - wider_trail)
+                # Only update if this widens (lowers) the stop
                 if widened < pos.stop_price:
                     pos.stop_price = widened
             else:
-                widened = pos.low_watermark * (1 + pos.trail_pct * 1.2)
+                widened = pos.low_watermark * (1 + wider_trail)
                 if widened > pos.stop_price:
                     pos.stop_price = widened
         elif regime.volatility == "low_vol":
-            # Low vol: tighten stops — less room for noise needed
+            # Low vol: tighten stops (use smaller trail %) — less room for noise needed
+            tighter_trail = pos.trail_pct * 0.8
             if pos.side == "long":
-                tightened = pos.high_watermark * (1 - pos.trail_pct * 0.8)
+                tightened = pos.high_watermark * (1 - tighter_trail)
+                # Only update if this tightens (raises) the stop
                 if tightened > pos.stop_price:
                     pos.stop_price = tightened
             else:
-                tightened = pos.low_watermark * (1 + pos.trail_pct * 0.8)
+                tightened = pos.low_watermark * (1 + tighter_trail)
                 if tightened < pos.stop_price:
                     pos.stop_price = tightened
     except Exception:
@@ -772,12 +961,16 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
                     old_qty = pos.quantity
                     pos.quantity += trade.quantity
                     pos.size_usd += trade.size_usd
+                    pos.entry_size_usd += trade.size_usd  # track total entry cost
+                    pos.total_commission += trade.commission
                     pos.tranche_count += 1
-                    # Update average entry price
+                    # Update average entry price using actual fill price, not current_price
                     pos.avg_entry_price = (
-                        (pos.avg_entry_price * old_qty + current_price * trade.quantity)
+                        (pos.avg_entry_price * old_qty + trade.price * trade.quantity)
                         / pos.quantity
                     )
+                    # Update original_quantity to reflect total DCA'd quantity
+                    pos.original_quantity = pos.quantity
                     insert_trade(trade)
                     log("trade",
                         f"DCA TRANCHE {pos.tranche_count}/{pos.max_tranches} {pos.symbol} "
@@ -796,10 +989,12 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
             elif pos.side == "short" and pos.stop_price > pos.entry_price:
                 pos.stop_price = pos.entry_price
 
-    # Partial take-profit: sell 50% at 1.5R, trail the rest
-    if pos.partial_exit_pct == 0.0 and pos.entry_price > 0:
+    # Partial take-profit: sell 50% at 1.5R, trail the rest (only if no prior partial)
+    if pos.partial_exit_pct < 0.01 and pos.entry_price > 0:
+        pnl_pct = (current_price - pos.entry_price) / pos.entry_price if pos.side == "long" \
+            else (pos.entry_price - current_price) / pos.entry_price
         r_multiple = _compute_r_multiple(pos, current_price)
-        if r_multiple >= 1.5:
+        if r_multiple >= 1.5 and pnl_pct > 0.015:
             _execute_partial_exit(pos, current_price, now, fraction=0.5)
 
     # Stale position tightening: if >50% of max hold and MFE < 1%,
@@ -828,7 +1023,7 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
 
     # 2. Max hold time exceeded
     hold_ms = now - pos.opened_at
-    if hold_ms >= pos.max_hold_ms:
+    if pos.max_hold_ms > 0 and hold_ms >= pos.max_hold_ms:
         exit_reason = "time_limit"
 
     if not exit_reason:
@@ -852,12 +1047,22 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
 
     exit_price = trade.price if trade.price > 0 else current_price
 
-    # Compute PnL
+    # Track exit commission
+    pos.total_commission += trade.commission
+
+    # Compute PnL for remaining position (entry-basis)
     if pos.side == "long":
-        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
+        remaining_pnl_pct = (exit_price - pos.avg_entry_price) / pos.avg_entry_price if pos.avg_entry_price > 0 else 0
     else:
-        pnl_pct = (pos.entry_price - exit_price) / pos.entry_price if pos.entry_price > 0 else 0
-    pnl_usd = pnl_pct * pos.size_usd
+        remaining_pnl_pct = (pos.avg_entry_price - exit_price) / pos.avg_entry_price if pos.avg_entry_price > 0 else 0
+    # remaining_size_usd is already on entry basis after partial exit fixes
+    remaining_pnl_usd = remaining_pnl_pct * pos.size_usd - trade.commission
+
+    # Total P&L = partial exits + remaining - commissions on entry
+    pnl_usd = pos.partial_realized_pnl + remaining_pnl_usd
+    # Overall pnl_pct relative to original entry size
+    entry_basis = pos.entry_size_usd if pos.entry_size_usd > 0 else pos.size_usd
+    pnl_pct = pnl_usd / entry_basis if entry_basis > 0 else 0
 
     # Update position fields for self-healing
     pos.exit_price = exit_price
@@ -874,6 +1079,8 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
 
     # Register close with risk manager
     register_close(pos, pnl_usd)
+    if pos.strategy == "fear_greed_contrarian":
+        fgi_on_position_closed(pos.symbol)
 
     # Update peak portfolio for drawdown-based sizing
     portfolio_usd = get_paper_balance() if env.paper_trading else env.max_position_usd * env.max_open_positions
@@ -1008,10 +1215,17 @@ def _exit_check_loop() -> None:
     Scalp strategies are checked every 1s; swing/normal every 5s.
     """
     tick = 0
+    ws_check_counter = 0
     while not _shutdown_event.is_set():
         if _shutdown_event.wait(timeout=_SCALP_EXIT_CHECK_INTERVAL_S):
             break
         try:
+            # Check WS health every ~10 seconds
+            ws_check_counter += 1
+            if ws_check_counter >= 10 and _ws_instance:
+                ws_check_counter = 0
+                _ws_instance.check_health(max_silence_s=30.0)
+
             now = time.time() * 1000
             positions = get_open_positions()
             ctx = _get_market_context()
@@ -1219,6 +1433,23 @@ def main() -> None:
     portfolio_usd = get_paper_balance() if env.paper_trading else env.portfolio_usd
     update_peak(portfolio_usd)
 
+    # ── Restore open positions from Convex into in-memory tracking ──────────
+    # On restart, load existing open positions so the bot continues managing them
+    # (trailing stops, exit checks, dedup) instead of losing track of them.
+    try:
+        existing_open = _db_mod.get_open_positions()
+        for pos in existing_open:
+            register_open(pos)
+            if pos.strategy == "fear_greed_contrarian":
+                fgi_on_position_opened(pos.symbol)
+        if existing_open:
+            log("info", f"Restored {len(existing_open)} open positions into in-memory tracking",
+                data={"symbols": [p.symbol for p in existing_open]})
+        else:
+            log("info", "No open positions to restore")
+    except Exception as e:
+        log("warn", f"Failed to restore open positions: {e}")
+
     # ── Start health check server (for Railway) ────────────────────────────
     _start_health_server()
 
@@ -1254,11 +1485,13 @@ def main() -> None:
     _thread_registry["market_context"] = ctx_thread
 
     # ── Connect WebSocket ─────────────────────────────────────────────────
+    global _ws_instance
     ws = CoinbaseWebSocket(
         product_ids=DEFAULT_WATCHLIST,
         on_tick=_on_tick,
         on_book=_on_book,
     )
+    _ws_instance = ws
     ws.connect()
     log("info", f"Coinbase WebSocket connecting to {len(DEFAULT_WATCHLIST)} products")
 

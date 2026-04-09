@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from src.types import TradeSignal, MarketContext, ScannerConfig
+from src.config import env
 from src.signals.news import NewsSentiment
 from src.signals.social import SocialSentiment
 from src.signals.options import OptionsSentiment
@@ -386,6 +387,18 @@ def qualify(
     stablecoin: Optional[StablecoinFlows] = None,
     has_unlock_risk: bool = False,
 ) -> QualificationResult:
+    # Fee-aware filter: reject signals where stop distance is too close to round-trip fees
+    round_trip_fee_pct = env.commission_per_side * 2
+    if signal.entry_price > 0 and signal.stop_price and signal.stop_price > 0:
+        stop_distance_pct = abs(signal.entry_price - signal.stop_price) / signal.entry_price
+        # If stop is less than 3x the round-trip fee, the risk/reward is structurally poor
+        if stop_distance_pct < round_trip_fee_pct * 3:
+            return QualificationResult(
+                score=0, passed=False,
+                breakdown={"fee_filter": f"stop {stop_distance_pct:.2%} < 3x fees {round_trip_fee_pct*3:.2%}"},
+                reasoning=f"REJECTED: stop distance {stop_distance_pct:.2%} too close to fees {round_trip_fee_pct:.2%}",
+            )
+
     news_adj = _news_adjustment(signal, news)
     social_adj = _social_adjustment(signal, social)
     ctx_adj = _context_adjustment(signal, ctx)
@@ -395,6 +408,14 @@ def qualify(
     options_adj = _options_adjustment(signal, options)
     deriv_adj = _derivatives_adjustment(signal, derivatives)
     oi_funding_adj = _oi_funding_composite(signal, derivatives)
+
+    # Cap combined regime + derivatives/OI penalty to avoid double-penalizing the same condition
+    _regime_deriv_combined = regime_adj + deriv_adj + oi_funding_adj
+    if _regime_deriv_combined < -12:
+        _scale = -12 / _regime_deriv_combined  # proportionally scale back
+        regime_adj *= _scale
+        deriv_adj *= _scale
+        oi_funding_adj *= _scale
     leverage_adj = _leverage_profile_adjustment(signal, derivatives)
     flow_adj = _exchange_flow_adjustment(signal)
     stable_adj = _stablecoin_adjustment(signal, stablecoin)

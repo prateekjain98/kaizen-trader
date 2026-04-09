@@ -51,6 +51,7 @@ class CoinbaseWebSocket:
         self._status = "disconnected"
         self._thread: Optional[threading.Thread] = None
         self._tick_count = 0
+        self._last_tick_time = time.time()
 
     def connect(self) -> None:
         if self._status in ("connected", "connecting"):
@@ -138,9 +139,12 @@ class CoinbaseWebSocket:
                         if price > 0:
                             self.on_tick(symbol, price, volume)
                             self._tick_count += 1
+                            self._last_tick_time = time.time()
                             if self._tick_count == 1:
                                 log("info", f"First tick received: {symbol} @ ${price:,.2f}")
-                    except (KeyError, ValueError, TypeError):
+                    except Exception as e:
+                        if self._tick_count < 5:
+                            log("error", f"Tick handler error for {symbol}: {type(e).__name__}: {e}")
                         pass
 
             elif channel == "l2_data":
@@ -190,6 +194,31 @@ class CoinbaseWebSocket:
                 self.connect()
         t = threading.Thread(target=_reconnect, daemon=True)
         t.start()
+
+    def check_health(self, max_silence_s: float = 30.0) -> bool:
+        """Check if WS is receiving ticks. Force-reconnect if stale."""
+        if self._status != "connected":
+            return False
+        silence = time.time() - self._last_tick_time
+        if silence > max_silence_s:
+            log("warn", f"WS tick silence for {silence:.0f}s — force reconnecting")
+            self.force_reconnect()
+            return False
+        return True
+
+    def force_reconnect(self) -> None:
+        """Kill the current connection and reconnect."""
+        self._status = "disconnected"
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+        self._client = None
+        self._tick_count = 0
+        self._last_tick_time = time.time()
+        time.sleep(1)
+        self.connect()
 
     def disconnect(self) -> None:
         if self._client:

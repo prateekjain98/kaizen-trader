@@ -48,6 +48,10 @@ class _Env:
     log_analysis_interval_mins = int(_num("LOG_ANALYSIS_INTERVAL_MINS", 60))
     min_trades_for_analysis = int(_num("MIN_TRADES_FOR_ANALYSIS", 10))
 
+    # Trading fee per side (taker). Defaults to Binance Spot VIP 0 (0.1%).
+    # Coinbase Advanced 1 ($10K+ vol): 0.004, Binance Futures: 0.0004
+    commission_per_side = _num("COMMISSION_PER_SIDE", 0.001)
+
 
 env = _Env()
 

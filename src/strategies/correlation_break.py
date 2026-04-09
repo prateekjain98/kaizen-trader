@@ -1,5 +1,6 @@
 """Correlation Break Strategy — BTC/altcoin divergence."""
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,17 +17,38 @@ class PricePoint:
 
 
 _correlation_history: dict[str, list[PricePoint]] = {}
+_lock = threading.Lock()
+_MAX_SYMBOLS = 300
+
+STRATEGY_META = {
+    "strategies": [
+        {"id": "correlation_break", "function": "scan_correlation_break",
+         "description": "Detects correlation breakdowns for mean-reversion trades",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["price_action", "correlation"],
+}
 
 
 def update_correlation_point(symbol: str, btc_pct: float, alt_pct: float) -> None:
-    hist = _correlation_history.setdefault(symbol, [])
-    hist.append(PricePoint(btc_pct=btc_pct, alt_pct=alt_pct, ts=time.time() * 1000))
-    cutoff = time.time() * 1000 - 172_800_000
-    _correlation_history[symbol] = [p for p in hist if p.ts >= cutoff]
+    with _lock:
+        # Evict oldest symbols if we exceed the max
+        if symbol not in _correlation_history and len(_correlation_history) >= _MAX_SYMBOLS:
+            oldest_key = min(
+                _correlation_history,
+                key=lambda k: _correlation_history[k][-1].ts if _correlation_history[k] else 0,
+            )
+            del _correlation_history[oldest_key]
+
+        hist = _correlation_history.setdefault(symbol, [])
+        hist.append(PricePoint(btc_pct=btc_pct, alt_pct=alt_pct, ts=time.time() * 1000))
+        cutoff = time.time() * 1000 - 172_800_000
+        _correlation_history[symbol] = [p for p in hist if p.ts >= cutoff]
 
 
 def _compute_expected_alt_move(symbol: str, btc_pct: float) -> Optional[float]:
-    hist = _correlation_history.get(symbol)
+    with _lock:
+        hist = list(_correlation_history.get(symbol, []))
     if not hist or len(hist) < 24:
         return None
     n = len(hist)

@@ -285,7 +285,7 @@ class TestRegimeAwareExits:
 class TestWarmupPeriod:
     def test_warmup_constant_exists(self):
         from src.main import _WARMUP_PERIOD_S
-        assert _WARMUP_PERIOD_S == 300  # 5 minutes
+        assert _WARMUP_PERIOD_S == 60  # 1 minute
 
     def test_warmup_blocks_during_startup(self):
         """During warm-up, _process_signal should return without processing."""

@@ -88,6 +88,14 @@ class Position:
     tranche_count: int = 1  # how many entries so far (1 = initial, max 3)
     max_tranches: int = 1  # max tranches for this position (1 for scalp, 3 for swing)
     avg_entry_price: float = 0.0  # volume-weighted average entry
+    # P&L tracking for partial exits
+    entry_size_usd: float = 0.0        # original size at open (frozen, not recalculated)
+    partial_realized_pnl: float = 0.0  # cumulative P&L from partial exits
+    total_commission: float = 0.0      # cumulative commissions (entry + all exits)
+    # Risk tracking
+    initial_stop_price: float = 0.0    # stop price at open time (never updated)
+    # Self-healing context
+    momentum_at_entry: float = 0.0     # price momentum % at entry time for loss diagnosis
 
 
 @dataclass
@@ -102,6 +110,7 @@ class Trade:
     status: str
     paper_trading: bool
     placed_at: float
+    commission: float = 0.0
     order_id: Optional[str] = None
     error: Optional[str] = None
 

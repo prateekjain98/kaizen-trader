@@ -1,5 +1,6 @@
 """LunarCrush social signal fetcher."""
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -31,10 +32,11 @@ class SocialSentiment:
 _volume_history: dict[str, list[float]] = {}
 _last_fetch_at: float = 0
 _cached: list[SocialSentiment] = []
-_CACHE_TTL_MS = 180_000
+_CACHE_TTL_MS = 600_000  # 10 min — LunarCrush free tier rate-limits aggressively
 _breaker = CircuitBreaker("social")
 
 # Rate limit tracking for /topic/ endpoint
+_rate_lock = threading.Lock()
 _topic_requests_this_minute: int = 0
 _topic_minute_start: float = 0
 _MAX_TOPIC_PER_MINUTE = 3
@@ -48,21 +50,23 @@ _TOPIC_CACHE_TTL_MS = 180_000
 def _can_call_topic() -> bool:
     """Check if we're within the topic endpoint rate limit budget."""
     global _topic_requests_this_minute, _topic_minute_start
-    now = time.time()
-    if now - _topic_minute_start >= 60:
-        _topic_requests_this_minute = 0
-        _topic_minute_start = now
-    return _topic_requests_this_minute < _MAX_TOPIC_PER_MINUTE
+    with _rate_lock:
+        now = time.time()
+        if now - _topic_minute_start >= 60:
+            _topic_requests_this_minute = 0
+            _topic_minute_start = now
+        return _topic_requests_this_minute < _MAX_TOPIC_PER_MINUTE
 
 
 def _record_topic_call() -> None:
     """Record a topic endpoint call for rate limiting."""
     global _topic_requests_this_minute, _topic_minute_start
-    now = time.time()
-    if now - _topic_minute_start >= 60:
-        _topic_requests_this_minute = 0
-        _topic_minute_start = now
-    _topic_requests_this_minute += 1
+    with _rate_lock:
+        now = time.time()
+        if now - _topic_minute_start >= 60:
+            _topic_requests_this_minute = 0
+            _topic_minute_start = now
+        _topic_requests_this_minute += 1
 
 
 def _compute_velocity(symbol: str, current_volume: float) -> float:

@@ -15,9 +15,11 @@ from src.signals._circuit_breaker import CircuitBreaker
 from src.storage.database import log
 
 _CACHE_TTL_MS = 3_600_000  # 1 hour
-_API_BASE = "https://token.unlocks.app/api/v2"
+_API_BASE = "https://tokenomist.ai/api/v2"
 _UNLOCK_RISK_DAYS = 7
 _UNLOCK_RISK_PCT = 2.0  # >2% of supply = risk
+# Base-layer tokens never have VC unlock events — skip to avoid 404 spam
+_SKIP_SYMBOLS = {"BTC", "ETH", "DOGE", "LTC"}
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[list["TokenUnlock"], float]] = {}
@@ -35,6 +37,8 @@ class TokenUnlock:
 
 def fetch_token_unlocks(symbol: str) -> list[TokenUnlock]:
     """Fetch upcoming token unlock events for a symbol."""
+    if symbol.upper() in _SKIP_SYMBOLS:
+        return []
     now = time.time() * 1000
 
     with _lock:

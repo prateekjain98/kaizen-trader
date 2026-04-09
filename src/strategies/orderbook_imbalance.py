@@ -1,11 +1,21 @@
 """Order Book Imbalance Strategy."""
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
 from src.types import TradeSignal, ScannerConfig
+
+STRATEGY_META = {
+    "strategies": [
+        {"id": "orderbook_imbalance", "function": "scan_orderbook_imbalance",
+         "description": "Detects significant bid/ask imbalance in the order book",
+         "tier": "scalp"},
+    ],
+    "signal_sources": ["price_action"],
+}
 
 
 @dataclass
@@ -22,18 +32,30 @@ class OrderBookSnapshot:
 
 
 _order_books: dict[str, OrderBookSnapshot] = {}
+_lock = threading.Lock()
 _MAX_ORDER_BOOKS = 500
+_STALE_THRESHOLD_MS = 3_600_000  # 1 hour
+
+
+def _cleanup_stale_entries(now: float) -> None:
+    """Remove order book entries older than 1 hour. Must be called with _lock held."""
+    stale_keys = [k for k, v in _order_books.items() if now - v.last_updated > _STALE_THRESHOLD_MS]
+    for k in stale_keys:
+        del _order_books[k]
 
 
 def update_order_book(symbol: str, bids: list[OrderBookLevel], asks: list[OrderBookLevel]) -> None:
-    if symbol not in _order_books and len(_order_books) >= _MAX_ORDER_BOOKS:
-        oldest_key = min(_order_books, key=lambda k: _order_books[k].last_updated)
-        del _order_books[oldest_key]
-    _order_books[symbol] = OrderBookSnapshot(
-        bids=sorted(bids, key=lambda l: l.price, reverse=True),
-        asks=sorted(asks, key=lambda l: l.price),
-        last_updated=time.time() * 1000,
-    )
+    now = time.time() * 1000
+    with _lock:
+        _cleanup_stale_entries(now)
+        if symbol not in _order_books and len(_order_books) >= _MAX_ORDER_BOOKS:
+            oldest_key = min(_order_books, key=lambda k: _order_books[k].last_updated)
+            del _order_books[oldest_key]
+        _order_books[symbol] = OrderBookSnapshot(
+            bids=sorted(bids, key=lambda l: l.price, reverse=True),
+            asks=sorted(asks, key=lambda l: l.price),
+            last_updated=now,
+        )
 
 
 def _sum_book_depth(levels: list[OrderBookLevel], from_price: float, price_pct: float) -> float:
@@ -50,31 +72,34 @@ def get_bid_ask_spread(symbol: str) -> Optional[float]:
 
     E.g., 0.005 means 0.5% spread.
     """
-    book = _order_books.get(symbol)
-    if not book or not book.bids or not book.asks:
-        return None
-    now = time.time() * 1000
-    if now - book.last_updated > 30_000:
-        return None  # stale book data
-    best_bid = book.bids[0].price
-    best_ask = book.asks[0].price
-    if best_bid <= 0 or best_ask <= 0:
-        return None
-    mid = (best_bid + best_ask) / 2
-    return (best_ask - best_bid) / mid
+    with _lock:
+        book = _order_books.get(symbol)
+        if not book or not book.bids or not book.asks:
+            return None
+        now = time.time() * 1000
+        if now - book.last_updated > 30_000:
+            return None  # stale book data
+        best_bid = book.bids[0].price
+        best_ask = book.asks[0].price
+        if best_bid <= 0 or best_ask <= 0:
+            return None
+        mid = (best_bid + best_ask) / 2
+        return (best_ask - best_bid) / mid
 
 
 def scan_orderbook_imbalance(
     symbol: str, product_id: str, current_price: float,
     config: ScannerConfig,
 ) -> Optional[TradeSignal]:
-    book = _order_books.get(symbol)
-    now = time.time() * 1000
-    if not book or now - book.last_updated > 30_000:
-        return None
+    with _lock:
+        book = _order_books.get(symbol)
+        now = time.time() * 1000
+        if not book or now - book.last_updated > 30_000:
+            return None
 
-    bid_depth = _sum_book_depth(book.bids, current_price, 0.01)
-    ask_depth = _sum_book_depth(book.asks, current_price, 0.01)
+        bid_depth = _sum_book_depth(book.bids, current_price, 0.01)
+        ask_depth = _sum_book_depth(book.asks, current_price, 0.01)
+
     total_depth = bid_depth + ask_depth
     if total_depth < 500_000:
         return None
@@ -92,7 +117,7 @@ def scan_orderbook_imbalance(
                 strategy="orderbook_imbalance", side="long", tier="scalp", score=score,
                 confidence="low", sources=["orderbook"],
                 reasoning=f"{symbol} bid/ask ratio {imbalance_ratio:.1f}x within 1%, ${bid_depth/1e6:.1f}M bid wall",
-                entry_price=current_price, stop_price=current_price * 0.99,
+                entry_price=current_price, stop_price=current_price * 0.98,
                 suggested_size_usd=40,
                 expires_at=now + 300_000, created_at=now,
             )
@@ -108,7 +133,7 @@ def scan_orderbook_imbalance(
                 strategy="orderbook_imbalance", side="short", tier="scalp", score=score,
                 confidence="low", sources=["orderbook"],
                 reasoning=f"{symbol} ask/bid ratio {1/max(imbalance_ratio, 0.001):.1f}x within 1%, ${ask_depth/1e6:.1f}M ask wall",
-                entry_price=current_price, stop_price=current_price * 1.01,
+                entry_price=current_price, stop_price=current_price * 1.02,
                 suggested_size_usd=35,
                 expires_at=now + 300_000, created_at=now,
             )

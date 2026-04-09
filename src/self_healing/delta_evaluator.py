@@ -39,8 +39,8 @@ class ParameterDelta:
 class DeltaEvaluator:
     """Tracks parameter changes and evaluates their impact on trading performance."""
 
-    MIN_TRADES_FOR_EVAL = 10  # Need at least 10 trades after change to evaluate
-    WORSENED_WIN_RATE_DROP = 0.05  # 5% win rate drop = worsened
+    MIN_TRADES_FOR_EVAL = 25  # Need at least 25 trades for statistical significance
+    WORSENED_WIN_RATE_DROP = 0.08  # 8% win rate drop = worsened (was 5%, too sensitive to noise)
     WORSENED_PNL_DROP = 0.10  # 10% avg PnL drop = worsened
     MAX_REVERTS_PER_CYCLE = 1  # Only revert 1 parameter per evaluation
 
@@ -117,7 +117,7 @@ class DeltaEvaluator:
                         f"(win_rate {before.win_rate:.1%} -> {after.win_rate:.1%})",
                         data={"delta_id": delta.id, "parameter": delta.parameter})
             elif (win_rate_change > self.WORSENED_WIN_RATE_DROP
-                  or pnl_change > self.WORSENED_PNL_DROP):
+                  and pnl_change > -self.WORSENED_PNL_DROP):
                 delta.verdict = "improved"
                 delta.evaluation_status = "evaluated"
                 log("info",

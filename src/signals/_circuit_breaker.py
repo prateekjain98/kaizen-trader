@@ -22,7 +22,8 @@ class CircuitBreaker:
 
         self._lock = threading.Lock()
         self._failure_count = 0
-        self._last_failure_at: float = 0
+        self._last_failure_at: float = 0  # monotonic time
+        self._half_open_trial: bool = False
         self._state = "closed"  # closed | open | half_open
 
     def can_call(self) -> bool:
@@ -30,14 +31,18 @@ class CircuitBreaker:
             if self._state == "closed":
                 return True
             if self._state == "open":
-                elapsed = time.time() - self._last_failure_at
+                elapsed = time.monotonic() - self._last_failure_at
                 if elapsed >= self.reset_timeout_s:
                     self._state = "half_open"
+                    self._half_open_trial = False
                     log("info", f"Circuit breaker '{self.name}' entering half-open state (testing)")
                     return True
                 return False
-            # half_open — allow the trial call
-            return True
+            # half_open — only allow ONE trial call
+            if not self._half_open_trial:
+                self._half_open_trial = True
+                return True
+            return False
 
     def record_success(self) -> None:
         with self._lock:
@@ -49,7 +54,7 @@ class CircuitBreaker:
     def record_failure(self) -> None:
         with self._lock:
             self._failure_count += 1
-            self._last_failure_at = time.time()
+            self._last_failure_at = time.monotonic()
             if self._failure_count >= self.failure_threshold and self._state != "open":
                 self._state = "open"
                 log("warn", f"Circuit breaker '{self.name}' OPEN after {self._failure_count} failures "

@@ -122,7 +122,7 @@ class StrategySelector:
                 # Re-enable check: if disabled and now above thresholds
                 elif h.disabled_at:
                     days_disabled = (now - h.disabled_at) / (86_400_000)
-                    sharpe_ok = h.rolling_sharpe is None or h.rolling_sharpe >= 0
+                    sharpe_ok = h.rolling_sharpe is None or h.rolling_sharpe >= 0.3
                     winrate_ok = h.rolling_win_rate >= self.config.min_win_rate * 1.5
 
                     if sharpe_ok and winrate_ok and days_disabled >= self.config.probation_days:

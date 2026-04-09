@@ -48,8 +48,9 @@ You can add new loss reason patterns to `src/self_healing/healer.py`:
 To add a new strategy:
 1. Create `src/strategies/your_strategy.py` following the existing pattern
 2. Export a `scan_your_strategy()` function returning `Optional[TradeSignal]`
-3. Register it in `src/strategies/__init__.py`
-4. Add the `StrategyId` to `src/types.py`
+3. The strategy registry auto-discovers `scan_*` / `on_*` functions — no manual registration needed
+4. Optionally add a `STRATEGY_META` dict for richer metadata
+5. Add the `StrategyId` to `src/types.py`
 
 ## Running analysis
 

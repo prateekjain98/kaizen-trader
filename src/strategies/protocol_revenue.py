@@ -7,6 +7,15 @@ from typing import Optional
 
 from src.types import TradeSignal
 
+STRATEGY_META = {
+    "strategies": [
+        {"id": "protocol_revenue", "function": "scan_protocol_revenue",
+         "description": "Trades based on protocol revenue anomalies",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["protocol"],
+}
+
 
 @dataclass
 class ProtocolMetrics:

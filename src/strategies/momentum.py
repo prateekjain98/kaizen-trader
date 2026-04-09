@@ -1,5 +1,6 @@
 """Momentum Breakout Strategy (swing + scalp tiers)."""
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,33 +20,47 @@ class PriceSample:
 _swing_buffers: dict[str, list[PriceSample]] = {}
 _scalp_buffers: dict[str, list[PriceSample]] = {}
 _cooldowns: dict[str, float] = {}
+_lock = threading.Lock()
 
 _MAX_SYMBOLS = 500  # prevent unbounded growth of per-symbol buffers
+
+STRATEGY_META = {
+    "strategies": [
+        {"id": "momentum_swing", "function": "scan_momentum",
+         "description": "Detects momentum breakouts on 1h timeframe",
+         "tier": "swing"},
+        {"id": "momentum_scalp", "function": "scan_momentum",
+         "description": "Detects momentum breakouts on 5m timeframe",
+         "tier": "scalp"},
+    ],
+    "signal_sources": ["price_action"],
+}
 
 
 def push_price_sample(symbol: str, price: float, volume_24h: float) -> None:
     now = time.time() * 1000
     sample = PriceSample(price=price, volume_24h=volume_24h, ts=now)
 
-    # Evict oldest symbols if we exceed the max to prevent unbounded growth
-    if symbol not in _swing_buffers and len(_swing_buffers) >= _MAX_SYMBOLS:
-        oldest_key = min(_swing_buffers, key=lambda k: _swing_buffers[k][-1].ts if _swing_buffers[k] else 0)
-        del _swing_buffers[oldest_key]
-    if symbol not in _scalp_buffers and len(_scalp_buffers) >= _MAX_SYMBOLS:
-        oldest_key = min(_scalp_buffers, key=lambda k: _scalp_buffers[k][-1].ts if _scalp_buffers[k] else 0)
-        del _scalp_buffers[oldest_key]
+    with _lock:
+        # Evict oldest symbols if we exceed the max to prevent unbounded growth
+        if symbol not in _swing_buffers and len(_swing_buffers) >= _MAX_SYMBOLS:
+            oldest_key = min(_swing_buffers, key=lambda k: _swing_buffers[k][-1].ts if _swing_buffers[k] else 0)
+            del _swing_buffers[oldest_key]
+        if symbol not in _scalp_buffers and len(_scalp_buffers) >= _MAX_SYMBOLS:
+            oldest_key = min(_scalp_buffers, key=lambda k: _scalp_buffers[k][-1].ts if _scalp_buffers[k] else 0)
+            del _scalp_buffers[oldest_key]
 
-    sw = _swing_buffers.setdefault(symbol, [])
-    sw.append(sample)
-    cutoff = now - 3_600_000
-    while sw and sw[0].ts < cutoff:
-        sw.pop(0)
+        sw = _swing_buffers.setdefault(symbol, [])
+        sw.append(sample)
+        cutoff = now - 3_600_000
+        while sw and sw[0].ts < cutoff:
+            sw.pop(0)
 
-    sc = _scalp_buffers.setdefault(symbol, [])
-    sc.append(sample)
-    cutoff = now - 300_000
-    while sc and sc[0].ts < cutoff:
-        sc.pop(0)
+        sc = _scalp_buffers.setdefault(symbol, [])
+        sc.append(sample)
+        cutoff = now - 300_000
+        while sc and sc[0].ts < cutoff:
+            sc.pop(0)
 
 
 def _compute_momentum(samples: list[PriceSample]) -> Optional[dict]:
@@ -63,18 +78,20 @@ def _compute_momentum(samples: list[PriceSample]) -> Optional[dict]:
 
 
 def _has_cooldown(symbol: str) -> bool:
-    expiry = _cooldowns.get(symbol)
-    return bool(expiry and expiry > time.time() * 1000)
+    with _lock:
+        expiry = _cooldowns.get(symbol)
+        return bool(expiry and expiry > time.time() * 1000)
 
 
 def _set_cooldown(symbol: str, ms: float) -> None:
-    # Purge expired cooldowns to prevent unbounded growth
-    if len(_cooldowns) > _MAX_SYMBOLS:
-        now = time.time() * 1000
-        expired = [k for k, v in _cooldowns.items() if v <= now]
-        for k in expired:
-            del _cooldowns[k]
-    _cooldowns[symbol] = time.time() * 1000 + ms
+    with _lock:
+        # Purge expired cooldowns to prevent unbounded growth
+        if len(_cooldowns) > _MAX_SYMBOLS:
+            now = time.time() * 1000
+            expired = [k for k, v in _cooldowns.items() if v <= now]
+            for k in expired:
+                del _cooldowns[k]
+        _cooldowns[symbol] = time.time() * 1000 + ms
 
 
 def _vol_adjusted_threshold(symbol: str, base_threshold: float, current_price: float) -> float:
@@ -105,13 +122,18 @@ def scan_momentum(
         return None
     now = time.time() * 1000
 
+    with _lock:
+        swing_samples = list(_swing_buffers.get(symbol, []))
+        scalp_samples = list(_scalp_buffers.get(symbol, []))
+
     # Swing tier — use volatility-adjusted threshold
-    swing = _compute_momentum(_swing_buffers.get(symbol, []))
+    swing = _compute_momentum(swing_samples)
     adj_threshold_swing = _vol_adjusted_threshold(symbol, config.momentum_pct_swing, current_price)
+    adj_threshold_swing = max(0.015, adj_threshold_swing)
     if swing and swing["pct"] >= adj_threshold_swing:
         volume_ok = swing["current_volume"] >= swing["avg_volume"] * config.volume_multiplier_swing
         if volume_ok:
-            market_bonus = 10 if ctx.phase == "bull" else (-15 if ctx.phase == "bear" else 0)
+            market_bonus = 5 if ctx.phase == "bull" else (-15 if ctx.phase == "bear" else 0)
             score = min(95, 55 + swing["pct"] * 200 + market_bonus)
             if score >= config.min_qual_score_swing:
                 _set_cooldown(symbol, config.cooldown_ms_swing)
@@ -129,12 +151,12 @@ def scan_momentum(
                 )
 
     # Scalp tier — use volatility-adjusted threshold
-    scalp = _compute_momentum(_scalp_buffers.get(symbol, []))
+    scalp = _compute_momentum(scalp_samples)
     adj_threshold_scalp = _vol_adjusted_threshold(symbol, config.momentum_pct_scalp, current_price)
+    adj_threshold_scalp = max(0.008, adj_threshold_scalp)
     if scalp and scalp["pct"] >= adj_threshold_scalp:
         volume_ok = scalp["current_volume"] >= scalp["avg_volume"] * config.volume_multiplier_scalp
-        buf = _scalp_buffers.get(symbol, [])
-        recent_2m = [s for s in buf if s.ts >= now - 120_000]
+        recent_2m = [s for s in scalp_samples if s.ts >= now - 120_000]
         freshness_pct = (
             (recent_2m[-1].price - recent_2m[0].price) / recent_2m[0].price
             if len(recent_2m) > 0 and recent_2m[0].price > 0

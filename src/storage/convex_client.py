@@ -101,6 +101,27 @@ class ConvexStorage:
                     else:
                         print(f"[CONVEX ERROR] Failed to call {mutation_name} "
                               f"after {retries} attempt(s): {exc}")
+                        # Dead-letter queue: persist failed critical mutations to disk
+                        if mutation_name in self._CRITICAL_MUTATIONS:
+                            self._write_dead_letter(mutation_name, args, str(exc))
+
+    def _write_dead_letter(self, mutation_name: str, args: dict, error: str) -> None:
+        """Persist failed critical mutations to a local file for recovery."""
+        try:
+            dead_letter_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                ".dead_letters.jsonl",
+            )
+            entry = {
+                "mutation": mutation_name,
+                "args": args,
+                "error": error,
+                "timestamp": time.time(),
+            }
+            with open(dead_letter_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as write_err:
+            print(f"[CONVEX ERROR] Dead letter write also failed: {write_err}")
 
     @staticmethod
     def _strip_none(d: dict) -> dict:
@@ -143,7 +164,31 @@ class ConvexStorage:
             "pnlPct": p.pnl_pct,
             "exitReason": p.exit_reason,
             "paperTrading": p.paper_trading,
+            # New fields for P&L and risk tracking
+            "maePct": p.mae_pct,
+            "mfePct": p.mfe_pct,
+            "partialExitPct": p.partial_exit_pct,
+            "trancheCount": p.tranche_count,
+            "avgEntryPrice": p.avg_entry_price,
+            "originalQuantity": p.original_quantity,
+            "entrySizeUsd": p.entry_size_usd,
+            "totalCommission": p.total_commission,
+            "initialStopPrice": p.initial_stop_price,
         })
+
+    def update_position_price(self, position_id: str, current_price: float,
+                              high_watermark: float, low_watermark: float,
+                              stop_price: float, quantity: float | None = None) -> None:
+        args: dict[str, Any] = {
+            "positionId": position_id,
+            "currentPrice": current_price,
+            "highWatermark": high_watermark,
+            "lowWatermark": low_watermark,
+            "stopPrice": stop_price,
+        }
+        if quantity is not None:
+            args["quantity"] = quantity
+        self._enqueue("mutations:updatePositionPrice", args)
 
     def update_position_close(self, id: str, exit_price: float, pnl_usd: float,
                               pnl_pct: float, exit_reason: str) -> None:
@@ -236,6 +281,15 @@ class ConvexStorage:
             "timestamp": entry["timestamp"],
         })
 
+    def close_orphaned_positions(self, exit_reason: str = "orphaned_restart") -> dict:
+        """Close all open positions in Convex (from a previous bot run)."""
+        client = self._get_client()
+        result = client.mutation("mutations:closeOrphanedPositions", {
+            "exitReason": exit_reason,
+            "closedAt": time.time() * 1000,
+        })
+        return result or {"closed": 0, "positionIds": []}
+
     # ─── Read operations (sync) ────────────────────────────────────────────
 
     def get_open_positions(self) -> list[Position]:
@@ -275,19 +329,36 @@ class ConvexStorage:
 
     @staticmethod
     def _row_to_position(r: dict) -> Position:
+        entry_price = r.get("entryPrice", 0)
+        size_usd = r.get("sizeUsd", 0)
+        quantity = r.get("quantity", 0)
         return Position(
-            id=r["positionId"], symbol=r["symbol"], product_id=r["productId"],
-            strategy=r["strategy"], side=r["side"], tier=r["tier"],
-            entry_price=r["entryPrice"], quantity=r["quantity"],
-            size_usd=r["sizeUsd"], opened_at=r["openedAt"],
-            high_watermark=r["highWatermark"], low_watermark=r["lowWatermark"],
-            current_price=r["currentPrice"], trail_pct=r["trailPct"],
-            stop_price=r["stopPrice"], max_hold_ms=r["maxHoldMs"],
-            qual_score=r["qualScore"], signal_id=r["signalId"],
-            status=r["status"], exit_price=r.get("exitPrice"),
+            id=r.get("positionId", ""), symbol=r.get("symbol", ""),
+            product_id=r.get("productId", ""),
+            strategy=r.get("strategy", "momentum_swing"),
+            side=r.get("side", "long"), tier=r.get("tier", "swing"),
+            entry_price=entry_price, quantity=quantity,
+            size_usd=size_usd, opened_at=r.get("openedAt", 0),
+            high_watermark=r.get("highWatermark", entry_price),
+            low_watermark=r.get("lowWatermark", entry_price),
+            current_price=r.get("currentPrice", entry_price),
+            trail_pct=r.get("trailPct", 0.07),
+            stop_price=r.get("stopPrice", 0), max_hold_ms=r.get("maxHoldMs", 0),
+            qual_score=r.get("qualScore", 0), signal_id=r.get("signalId", ""),
+            status=r.get("status", "open"), exit_price=r.get("exitPrice"),
             closed_at=r.get("closedAt"), pnl_usd=r.get("pnlUsd"),
             pnl_pct=r.get("pnlPct"), exit_reason=r.get("exitReason"),
             paper_trading=r.get("paperTrading", True),
+            # New tracked fields
+            mae_pct=r.get("maePct", 0.0),
+            mfe_pct=r.get("mfePct", 0.0),
+            partial_exit_pct=r.get("partialExitPct", 0.0),
+            tranche_count=r.get("trancheCount", 1),
+            avg_entry_price=r.get("avgEntryPrice", entry_price),
+            original_quantity=r.get("originalQuantity", quantity),
+            entry_size_usd=r.get("entrySizeUsd", size_usd),
+            total_commission=r.get("totalCommission", 0.0),
+            initial_stop_price=r.get("initialStopPrice", 0.0),
         )
 
     @staticmethod

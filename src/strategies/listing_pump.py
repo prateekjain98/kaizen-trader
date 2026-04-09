@@ -1,5 +1,6 @@
 """Listing Pump Strategy."""
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,22 +20,54 @@ class ListingAnnouncement:
 
 
 _seen_listings: set[str] = set()
+_listing_timestamps: dict[str, float] = {}
+_lock = threading.Lock()
 _LISTING_EXPIRY_MS = 48 * 3_600_000
+_last_cleanup: float = 0
+
+STRATEGY_META = {
+    "strategies": [
+        {"id": "listing_announcement", "function": "on_listing_announcement",
+         "description": "Detects new exchange listings and rides the initial pump",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["price_action"],
+}
+
+
+def _cleanup_expired_listings(now: float) -> None:
+    global _last_cleanup
+    if now - _last_cleanup < 3_600_000:
+        return
+    _last_cleanup = now
+    expired = [k for k, ts in _listing_timestamps.items() if now - ts > _LISTING_EXPIRY_MS]
+    for k in expired:
+        _seen_listings.discard(k)
+        _listing_timestamps.pop(k, None)
 
 
 def on_listing_announcement(listing: ListingAnnouncement, current_price: float) -> Optional[TradeSignal]:
-    key = f"{listing.exchange}:{listing.symbol}"
-    if key in _seen_listings:
-        return None
-    _seen_listings.add(key)
     now = time.time() * 1000
+    key = f"{listing.exchange}:{listing.symbol}"
+
+    with _lock:
+        _cleanup_expired_listings(now)
+        if key in _seen_listings:
+            return None
+        _seen_listings.add(key)
+        _listing_timestamps[key] = now
 
     age_ms = now - listing.announced_at
     if age_ms > _LISTING_EXPIRY_MS:
         return None
 
     base_score = {"coinbase": 75, "binance": 72, "kraken": 60, "bybit": 58}.get(listing.exchange, 55)
-    freshness_bonus = max(0, 15 - int(age_ms / 120_000))
+    # Decay faster: penalize signals older than 15 minutes instead of rewarding late entries
+    age_minutes = age_ms / 60_000
+    if age_minutes <= 15:
+        freshness_bonus = max(0, 15 - int(age_minutes))
+    else:
+        freshness_bonus = -min(10, int((age_minutes - 15) / 5))
     already_listed_penalty = 0 if listing.is_new_to_major_exchanges else -15
     score = min(95, base_score + freshness_bonus + already_listed_penalty)
 
@@ -45,7 +78,7 @@ def on_listing_announcement(listing: ListingAnnouncement, current_price: float) 
         sources=["listing_detector"],
         reasoning=f"{listing.symbol} new {listing.exchange} listing {int(age_ms/60_000)}m ago"
                   + (" (first major exchange)" if listing.is_new_to_major_exchanges else ""),
-        entry_price=current_price, stop_price=current_price * 0.88,
+        entry_price=current_price, stop_price=current_price * 0.85,
         suggested_size_usd=120,
         expires_at=now + _LISTING_EXPIRY_MS, created_at=now,
     )

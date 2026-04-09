@@ -286,11 +286,15 @@ def push_tick(symbol: str, price: float, volume: float) -> None:
 
 
 def get_atr(symbol: str, period: int = 14) -> Optional[float]:
-    """Get ATR for a symbol from the candle buffer."""
+    """Get ATR for a symbol from the candle buffer, excluding the incomplete current candle."""
+    now = time.time() * 1000
     with _lock:
         buf = _candle_buffers.get(symbol)
     if not buf:
         return None
+    # Exclude the last candle if it is still forming (within the current candle interval)
+    if len(buf) > 1 and (now - buf[-1].ts) < _CANDLE_INTERVAL_MS:
+        buf = buf[:-1]
     return compute_atr(buf, period)
 
 
@@ -354,7 +358,8 @@ ATR_MULTIPLIERS: dict[str, float] = {
     "correlation_break": 2.0,
     "narrative_momentum": 2.0,
     "protocol_revenue": 2.5,
-    "fear_greed_contrarian": 2.5,
+    "fear_greed_contrarian": 4.0,
+    "cross_exchange_divergence": 3.0,
     "listing_pump": 1.5,
 }
 
@@ -376,8 +381,9 @@ def compute_atr_stop(
     if atr and atr > 0 and entry_price > 0:
         stop_distance = atr * multiplier
         effective_trail_pct = stop_distance / entry_price
-        # Clamp trail to reasonable bounds (1% - 25%)
-        effective_trail_pct = max(0.01, min(0.25, effective_trail_pct))
+        # Clamp trail to reasonable bounds (3% - 25%)
+        # 1% was too tight — BTC fluctuates 1% within minutes, triggering premature exits
+        effective_trail_pct = max(0.03, min(0.25, effective_trail_pct))
     else:
         effective_trail_pct = fallback_trail_pct
 
@@ -399,7 +405,7 @@ def compute_atr_trailing_stop(
 
     if atr and atr > 0 and watermark > 0:
         stop_distance = atr * multiplier
-        effective_trail_pct = max(0.01, min(0.25, stop_distance / watermark))
+        effective_trail_pct = max(0.03, min(0.25, stop_distance / watermark))
     else:
         effective_trail_pct = fallback_trail_pct
 

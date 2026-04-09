@@ -5,7 +5,7 @@
 - Python 3.11+
 - Convex account (free tier — database backend)
 - Coinbase Advanced Trade account (for price feed + execution)
-- Anthropic API key (for self-healing log analysis)
+- Anthropic API key — optional (for self-healing analysis); the bot works without it (L2 healing is just disabled)
 
 ## Installation
 
@@ -34,11 +34,11 @@ Edit `.env` with your keys. Paper trading is enabled by default.
 PAPER_TRADING=true                # always start here
 
 # ── Required ──────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY=                # Claude log analysis
 COINBASE_API_KEY=                 # price feed + execution
 COINBASE_API_SECRET=
 
 # ── Recommended ───────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY=                # Claude log analysis (optional — bot degrades gracefully without it)
 LUNARCRUSH_API_KEY=               # social signals (Twitter/Reddit/YouTube/TikTok)
 CRYPTOPANIC_TOKEN=                # news sentiment
 
@@ -48,7 +48,8 @@ BINANCE_API_SECRET=
 WHALE_ALERT_API_KEY=              # whale_accumulation
 
 # ── Risk limits ───────────────────────────────────────────────────────────────
-MAX_POSITION_USD=100
+PORTFOLIO_USD=6000                # total portfolio capital
+MAX_POSITION_USD=1200
 MAX_DAILY_LOSS_USD=300
 MAX_OPEN_POSITIONS=5
 
@@ -132,12 +133,9 @@ railway up
 
 Set environment variables in the Railway dashboard. Health check at `/health` on port 8080.
 
-### Docker (alternative)
+### Docker
 
-```bash
-docker build -t kaizen-trader .
-docker run --env-file .env kaizen-trader
-```
+No Docker setup currently — the project deploys via Railway with Nixpacks.
 
 ## Adding a strategy
 

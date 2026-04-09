@@ -12,7 +12,6 @@ from src.types import Trade
 _INITIAL_BALANCE = 10_000
 _SLIPPAGE_BUY = 0.0005
 _SLIPPAGE_SELL = 0.0003
-_COMMISSION = 0.006
 _MIN_ORDER_USD = 1.0
 
 _lock = threading.Lock()
@@ -73,7 +72,7 @@ def paper_buy(symbol: str, product_id: str, size_usd: float,
             )
 
         fill_price = market_price * (1 + _SLIPPAGE_BUY)
-        commission = size_usd * _COMMISSION
+        commission = size_usd * env.commission_per_side
         net_size_usd = size_usd - commission
         quantity = net_size_usd / fill_price
 
@@ -90,7 +89,7 @@ def paper_buy(symbol: str, product_id: str, size_usd: float,
         id=str(uuid.uuid4()), position_id=position_id, side="buy",
         symbol=symbol, quantity=quantity, size_usd=size_usd,
         price=fill_price, status="paper", paper_trading=True,
-        placed_at=time.time() * 1000,
+        placed_at=time.time() * 1000, commission=commission,
     )
 
 
@@ -152,7 +151,7 @@ def paper_sell(symbol: str, product_id: str, quantity: float,
             )
 
         gross_proceeds = actual_qty * fill_price
-        commission = gross_proceeds * _COMMISSION
+        commission = gross_proceeds * env.commission_per_side
         net_proceeds = gross_proceeds - commission
 
         _holdings[symbol] = held - actual_qty
@@ -170,7 +169,7 @@ def paper_sell(symbol: str, product_id: str, quantity: float,
         id=str(uuid.uuid4()), position_id=position_id, side="sell",
         symbol=symbol, quantity=actual_qty, size_usd=net_proceeds,
         price=fill_price, status="paper", paper_trading=True,
-        placed_at=time.time() * 1000,
+        placed_at=time.time() * 1000, commission=commission,
     )
 
 

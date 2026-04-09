@@ -1,5 +1,6 @@
 """Whale Accumulation/Distribution Strategy."""
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ class NetFlowState:
 
 
 _flow_windows: dict[str, NetFlowState] = {}
+_flow_lock = threading.Lock()
 _MAX_FLOW_SYMBOLS = 500
 
 
@@ -28,29 +30,41 @@ def on_whale_transfer(tx: dict) -> None:
     now = time.time() * 1000
     symbol = tx["symbol"]
 
-    if symbol not in _flow_windows:
-        # Evict stale entries to prevent unbounded growth
-        if len(_flow_windows) >= _MAX_FLOW_SYMBOLS:
-            oldest_key = min(_flow_windows, key=lambda k: _flow_windows[k].last_ts)
-            del _flow_windows[oldest_key]
-        _flow_windows[symbol] = NetFlowState(last_ts=now)
-    state = _flow_windows[symbol]
+    with _flow_lock:
+        if symbol not in _flow_windows:
+            # Evict stale entries to prevent unbounded growth
+            if len(_flow_windows) >= _MAX_FLOW_SYMBOLS:
+                oldest_key = min(_flow_windows, key=lambda k: _flow_windows[k].last_ts)
+                del _flow_windows[oldest_key]
+            _flow_windows[symbol] = NetFlowState(last_ts=now)
+        state = _flow_windows[symbol]
 
-    if now - state.last_ts > _WINDOW_MS:
-        state.inflow_to_exchange = 0
-        state.outflow_from_exchange = 0
-    state.last_ts = now
+        if now - state.last_ts > _WINDOW_MS:
+            state.inflow_to_exchange = 0
+            state.outflow_from_exchange = 0
+        state.last_ts = now
 
-    if tx["to_type"] == "exchange":
-        state.inflow_to_exchange += tx["amount_usd"]
-    elif tx["from_type"] == "exchange" or tx["to_type"] == "unknown_wallet":
-        state.outflow_from_exchange += tx["amount_usd"]
+        if tx["to_type"] == "exchange":
+            state.inflow_to_exchange += tx["amount_usd"]
+        elif tx["from_type"] == "exchange" or tx["to_type"] == "unknown_wallet":
+            state.outflow_from_exchange += tx["amount_usd"]
+
+
+STRATEGY_META = {
+    "strategies": [
+        {"id": "whale_accumulation", "function": "scan_whale_accumulation",
+         "description": "Follows whale accumulation/distribution patterns",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["whale"],
+}
 
 
 def scan_whale_accumulation(
     symbol: str, product_id: str, current_price: float,
 ) -> Optional[TradeSignal]:
-    state = _flow_windows.get(symbol)
+    with _flow_lock:
+        state = _flow_windows.get(symbol)
     if not state:
         return None
     now = time.time() * 1000
@@ -108,7 +122,7 @@ def get_net_exchange_flow() -> dict:
     total_outflow = 0.0
     active_symbols = 0
 
-    for sym, state in _flow_windows.items():
+    for sym, state in list(_flow_windows.items()):
         if now - state.last_ts > _WINDOW_MS:
             continue  # stale data
         total_inflow += state.inflow_to_exchange
