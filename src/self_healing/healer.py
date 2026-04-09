@@ -26,9 +26,16 @@ def _adjust(config: ScannerConfig, key: str, delta: float) -> None:
 
 
 def _classify_loss_reason(p: Position) -> str:
-    hold_hours = ((p.closed_at or time.time() * 1000) - p.opened_at) / 3_600_000
+    # Skip diagnosis if position was never properly closed
+    if p.closed_at is None:
+        return "unknown"
+
+    hold_hours = (p.closed_at - p.opened_at) / 3_600_000
     pnl_pct = p.pnl_pct or 0
-    momentum_at_entry = (p.entry_price - p.low_watermark) / p.low_watermark if p.low_watermark > 0 else 0
+
+    # Use stored momentum at entry time (frozen at open), not low_watermark
+    # which tracks worst price during hold and gives false "pump top" diagnoses
+    momentum_at_entry = getattr(p, "momentum_at_entry", 0.0) or 0.0
 
     if momentum_at_entry > 0.08 and hold_hours < 4:
         return "entered_pump_top"
@@ -38,6 +45,8 @@ def _classify_loss_reason(p: Position) -> str:
         return "stop_too_wide"
     if p.qual_score < 55:
         return "low_qual_score"
+    if p.strategy == "funding_extreme":
+        return "funding_squeeze"
 
     # Check promoted blind spots before returning unknown
     hold_ms = ((p.closed_at or time.time() * 1000) - p.opened_at)

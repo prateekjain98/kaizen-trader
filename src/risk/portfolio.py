@@ -68,6 +68,16 @@ def _maybe_reset_day() -> None:
 
 def can_open_position() -> bool:
     _maybe_reset_day()
+
+    # Negative equity check: stop trading if paper balance is depleted
+    from src.execution.paper import get_paper_balance
+    from src.config import env as _env
+    if _env.paper_trading:
+        balance = get_paper_balance()
+        if balance < 50:  # $50 minimum to open new positions
+            log("warn", f"Trading halted — paper balance ${balance:.2f} below $50 minimum")
+            return False
+
     with _lock:
         chain = _get_chain()
         ctx = ProtectionContext(
@@ -87,13 +97,15 @@ def register_open(position: Position) -> None:
         _open_positions[position.id] = position
 
 
-def register_close(position: Position, pnl_usd: float) -> None:
+def register_close(position: Position, pnl_usd: float, is_partial: bool = False) -> None:
     _maybe_reset_day()
     with _lock:
-        _open_positions.pop(position.id, None)
         _daily_stats.realized_pnl += pnl_usd
-        _daily_stats.trade_count += 1
-        _get_chain().notify_close(position, pnl_usd)
+        if not is_partial:
+            # Only remove position and count trade on full close
+            _open_positions.pop(position.id, None)
+            _daily_stats.trade_count += 1
+            _get_chain().notify_close(position, pnl_usd)
 
 
 def update_position_price(position_id: str, current_price: float) -> None:

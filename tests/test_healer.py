@@ -37,14 +37,15 @@ class TestHealerClamp:
 
 class TestClassifyLossReason:
     def test_entered_pump_top(self):
-        """Entry price far above low watermark + short hold -> pump top."""
+        """High momentum at entry + short hold -> pump top."""
         now = time.time() * 1000
         p = make_position(
-            entry_price=2000, low_watermark=1800,  # 11% above low
+            entry_price=2000, low_watermark=1800,
             opened_at=now - 2 * 3_600_000,  # 2 hours ago
             closed_at=now, pnl_pct=-0.03,
             exit_reason="trailing_stop", status="closed",
         )
+        p.momentum_at_entry = 0.10  # high momentum triggers entered_pump_top
         assert _classify_loss_reason(p) == "entered_pump_top"
 
     def test_stop_too_tight(self):
@@ -97,11 +98,12 @@ class TestClassifyLossReason:
         """When both pump top and tight stop conditions met, pump top wins (checked first)."""
         now = time.time() * 1000
         p = make_position(
-            entry_price=2000, low_watermark=1800,  # 11% above low
+            entry_price=2000, low_watermark=1800,
             opened_at=now - 1 * 3_600_000,  # 1 hour (< 2h for tight, < 4h for pump)
             closed_at=now, pnl_pct=-0.03,
             exit_reason="trailing_stop", status="closed",
         )
+        p.momentum_at_entry = 0.10  # high momentum triggers pump top
         assert _classify_loss_reason(p) == "entered_pump_top"
 
 

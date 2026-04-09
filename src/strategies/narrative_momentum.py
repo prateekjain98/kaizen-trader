@@ -1,11 +1,12 @@
 """Narrative Momentum Strategy — sector rotation play."""
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from src.types import TradeSignal, ScannerConfig
+from src.types import TradeSignal, ScannerConfig, MarketContext
 
 NarrativeId = str
 
@@ -33,19 +34,43 @@ class NarrativeState:
 
 
 _narrative_states: dict[str, NarrativeState] = {}
+_lock = threading.Lock()
+_MAX_NARRATIVE_STATES = 500
+
+STRATEGY_META = {
+    "strategies": [
+        {"id": "narrative_momentum", "function": "scan_narrative_momentum",
+         "description": "Detects narratives gaining momentum and trades laggard catch-up",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["social", "news"],
+}
+
+
+def _evict_lru_if_needed() -> None:
+    """Evict least-recently-updated entries when _narrative_states exceeds max size."""
+    if len(_narrative_states) <= _MAX_NARRATIVE_STATES:
+        return
+    sorted_keys = sorted(_narrative_states, key=lambda k: _narrative_states[k].last_updated)
+    to_remove = len(_narrative_states) - _MAX_NARRATIVE_STATES
+    for k in sorted_keys[:to_remove]:
+        del _narrative_states[k]
 
 
 def update_narrative_social_data(narrative_id: str, current_mentions: int, baseline_mentions: int) -> None:
-    if narrative_id not in _narrative_states:
-        _narrative_states[narrative_id] = NarrativeState(id=narrative_id)
-    state = _narrative_states[narrative_id]
+    with _lock:
+        if narrative_id not in _narrative_states:
+            _narrative_states[narrative_id] = NarrativeState(id=narrative_id)
+        _evict_lru_if_needed()
+        state = _narrative_states[narrative_id]
     state.social_velocity = current_mentions / baseline_mentions if baseline_mentions > 0 else 1
     state.baseline_velocity = baseline_mentions
     state.last_updated = time.time() * 1000
 
 
 def update_narrative_member_price(narrative_id: str, symbol: str, price_change_pct: float) -> None:
-    state = _narrative_states.get(narrative_id)
+    with _lock:
+        state = _narrative_states.get(narrative_id)
     if state:
         state.member_price_changes[symbol] = price_change_pct
 
@@ -65,13 +90,22 @@ def scan_narrative_momentum(
     product_id_map: dict[str, str],
     config: ScannerConfig,
     current_prices: dict[str, float],
+    ctx: Optional[MarketContext] = None,
 ) -> Optional[TradeSignal]:
     now = time.time() * 1000
     best_signal = None
     best_score = 0
 
-    for narrative_id, state in _narrative_states.items():
-        if state.social_velocity < config.narrative_velocity_threshold:
+    # Regime-adjust velocity threshold: require stronger signal in bear markets
+    velocity_threshold = config.narrative_velocity_threshold
+    if ctx and ctx.phase == "bear":
+        velocity_threshold *= 1.5
+
+    with _lock:
+        snapshot = list(_narrative_states.items())
+
+    for narrative_id, state in snapshot:
+        if state.social_velocity < velocity_threshold:
             continue
         if now - state.last_updated > 1_800_000:
             continue
@@ -83,7 +117,7 @@ def scan_narrative_momentum(
         if not current_price:
             continue
 
-        velocity_score = min(35, (state.social_velocity - config.narrative_velocity_threshold) * 10)
+        velocity_score = min(35, (state.social_velocity - velocity_threshold) * 10)
         laggard_score = min(20, max(0, -laggard["price_change_pct"] * 100))
         score = min(88, 48 + velocity_score + laggard_score)
 

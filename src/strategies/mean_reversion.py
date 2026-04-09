@@ -1,5 +1,6 @@
 """Mean Reversion Strategy — VWAP + RSI."""
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,14 +17,25 @@ class OHLCVSample:
 
 
 _ohlcv_buffers: dict[str, list[OHLCVSample]] = {}
+_lock = threading.Lock()
 _MAX_SAMPLES = 200
+
+STRATEGY_META = {
+    "strategies": [
+        {"id": "mean_reversion", "function": "scan_mean_reversion",
+         "description": "Trades VWAP/RSI mean reversion signals",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["price_action"],
+}
 
 
 def push_ohlcv_sample(symbol: str, close: float, volume: float) -> None:
-    buf = _ohlcv_buffers.setdefault(symbol, [])
-    buf.append(OHLCVSample(close=close, volume=volume, ts=time.time() * 1000))
-    if len(buf) > _MAX_SAMPLES:
-        buf.pop(0)
+    with _lock:
+        buf = _ohlcv_buffers.setdefault(symbol, [])
+        buf.append(OHLCVSample(close=close, volume=volume, ts=time.time() * 1000))
+        if len(buf) > _MAX_SAMPLES:
+            buf.pop(0)
 
 
 def _compute_vwap(samples: list[OHLCVSample]) -> Optional[float]:
@@ -57,7 +69,8 @@ def scan_mean_reversion(
     symbol: str, product_id: str, current_price: float,
     config: ScannerConfig, ctx: MarketContext,
 ) -> Optional[TradeSignal]:
-    buf = _ohlcv_buffers.get(symbol)
+    with _lock:
+        buf = list(_ohlcv_buffers.get(symbol, []))
     if not buf or len(buf) < 30:
         return None
     now = time.time() * 1000

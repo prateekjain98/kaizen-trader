@@ -153,9 +153,9 @@ class TestEvaluatePendingDeltas:
         mock_get_trades.return_value = before_trades
         delta = ev.record_delta("momentum_pct_swing", 0.02, 0.03, "test", "immediate_healer", config)
 
-        # After: 60% win rate (big improvement)
+        # After: 60% win rate (big improvement) — need >= MIN_TRADES_FOR_EVAL (25)
         now = time.time() * 1000
-        after_trades = _make_trades(15, win_rate=0.7, avg_pnl=0.02, base_time=delta.timestamp + 1)
+        after_trades = _make_trades(30, win_rate=0.7, avg_pnl=0.02, base_time=delta.timestamp + 1)
         mock_get_trades.return_value = after_trades
 
         evaluated = ev.evaluate_pending_deltas(config)
@@ -180,7 +180,7 @@ class TestEvaluatePendingDeltas:
 
         # After: 30% win rate (big drop)
         now = time.time() * 1000
-        after_trades = _make_trades(15, win_rate=0.3, avg_pnl=-0.01, base_time=delta.timestamp + 1)
+        after_trades = _make_trades(30, win_rate=0.3, avg_pnl=-0.01, base_time=delta.timestamp + 1)
         mock_get_trades.return_value = after_trades
 
         evaluated = ev.evaluate_pending_deltas(config)
@@ -202,9 +202,9 @@ class TestEvaluatePendingDeltas:
         mock_get_trades.return_value = before_trades
         delta = ev.record_delta("momentum_pct_swing", 0.02, 0.03, "test", "immediate_healer", config)
 
-        # After: 52% win rate (within threshold)
+        # After: ~37% win rate (11/30 wins) — snapshot takes first 20 → 11/20=55%, +5% vs 50% before, below 8% threshold
         now = time.time() * 1000
-        after_trades = _make_trades(15, win_rate=0.52, avg_pnl=0.01, base_time=delta.timestamp + 1)
+        after_trades = _make_trades(30, win_rate=0.37, avg_pnl=0.01, base_time=delta.timestamp + 1)
         mock_get_trades.return_value = after_trades
 
         evaluated = ev.evaluate_pending_deltas(config)
@@ -232,7 +232,7 @@ class TestEvaluatePendingDeltas:
 
         # Both worsened
         now = time.time() * 1000
-        after_trades = _make_trades(15, win_rate=0.2, avg_pnl=-0.03,
+        after_trades = _make_trades(30, win_rate=0.2, avg_pnl=-0.03,
                                      base_time=max(delta1.timestamp, delta2.timestamp) + 1)
         mock_get_trades.return_value = after_trades
 
@@ -261,7 +261,7 @@ class TestEvaluatePendingDeltas:
         config.momentum_pct_swing = 0.03
 
         # Worsened performance
-        after_trades = _make_trades(15, win_rate=0.2, avg_pnl=-0.03, base_time=delta.timestamp + 1)
+        after_trades = _make_trades(30, win_rate=0.2, avg_pnl=-0.03, base_time=delta.timestamp + 1)
         mock_get_trades.return_value = after_trades
 
         evaluated = ev.evaluate_pending_deltas(config)

@@ -1,21 +1,50 @@
 """Fear & Greed Contrarian Strategy."""
 
+import threading
 import time
 import uuid
 from typing import Optional
 
 from src.types import TradeSignal, MarketContext
 
+STRATEGY_META = {
+    "strategies": [
+        {"id": "fear_greed_contrarian", "function": "scan_fear_greed_contrarian",
+         "description": "Contrarian trades on extreme Fear & Greed Index readings",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["fear_greed"],
+}
+
 _ELIGIBLE_SYMBOLS = {"BTC", "ETH"}
 _prev_fgi = 50
-_activated = False
+
+# Track which symbols have an open FGI position to avoid duplicate entries.
+# Cleared when FGI normalizes (20 < fgi < 80).
+_open_symbols: set[str] = set()
+_REENTRY_COOLDOWN_S = 1800  # 30 min cooldown after close before re-entry
+_close_cooldown: dict[str, float] = {}
+_fgi_lock = threading.Lock()
+
+
+def on_position_opened(symbol: str) -> None:
+    """Called by main.py when a fear_greed_contrarian position is actually opened."""
+    with _fgi_lock:
+        _open_symbols.add(symbol)
+
+
+def on_position_closed(symbol: str) -> None:
+    """Called by main.py when a fear_greed_contrarian position closes."""
+    with _fgi_lock:
+        _open_symbols.discard(symbol)
+        _close_cooldown[symbol] = time.time() + _REENTRY_COOLDOWN_S
 
 
 def scan_fear_greed_contrarian(
     symbol: str, product_id: str, current_price: float,
     ctx: MarketContext,
 ) -> Optional[TradeSignal]:
-    global _prev_fgi, _activated
+    global _prev_fgi
     if symbol not in _ELIGIBLE_SYMBOLS:
         return None
     now = time.time() * 1000
@@ -24,15 +53,33 @@ def scan_fear_greed_contrarian(
     delta = fgi - _prev_fgi
     _prev_fgi = fgi
 
-    if _activated and 20 < fgi < 80:
-        _activated = False
+    with _fgi_lock:
+        # Reset when FGI normalizes
+        if 20 < fgi < 80:
+            _open_symbols.clear()
+
+        # Don't signal if we already have an open position for this symbol
+        if symbol in _open_symbols:
+            return None
+
+        # Post-close cooldown to prevent rapid re-entry spam
+        now_s = time.time()
+        if symbol in _close_cooldown and now_s < _close_cooldown[symbol]:
+            return None
+
+        # Purge expired cooldowns to prevent unbounded growth
+        expired = [s for s, t in _close_cooldown.items() if now_s >= t]
+        for s in expired:
+            del _close_cooldown[s]
 
     # Extreme Fear: contrarian long
-    if fgi <= 15 and not _activated:
-        extremeness = min(30, (15 - fgi) * 2)
+    # Skip if already in bear phase with extreme fear — capitulation may continue
+    if fgi <= 20 and ctx.phase == "bear":
+        return None
+    if fgi <= 20:
+        extremeness = min(30, (20 - fgi) * 2)
         momentum_bonus = 10 if delta < -5 else 0
         score = min(82, 52 + extremeness + momentum_bonus)
-        _activated = True
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
             strategy="fear_greed_contrarian", side="long", tier="swing", score=score,
@@ -45,10 +92,9 @@ def scan_fear_greed_contrarian(
         )
 
     # Extreme Greed: contrarian short
-    if fgi >= 85 and not _activated and ctx.phase != "bull":
+    if fgi >= 85 and ctx.phase == "bull":
         extremeness = min(25, (fgi - 85) * 1.5)
         score = min(75, 45 + extremeness)
-        _activated = True
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
             strategy="fear_greed_contrarian", side="short", tier="swing", score=score,

@@ -28,6 +28,16 @@ export default defineSchema({
     pnlPct: v.optional(v.float64()),
     exitReason: v.optional(v.string()),
     paperTrading: v.boolean(),
+    // P&L and risk tracking fields
+    maePct: v.optional(v.float64()),
+    mfePct: v.optional(v.float64()),
+    partialExitPct: v.optional(v.float64()),
+    trancheCount: v.optional(v.float64()),
+    avgEntryPrice: v.optional(v.float64()),
+    originalQuantity: v.optional(v.float64()),
+    entrySizeUsd: v.optional(v.float64()),
+    totalCommission: v.optional(v.float64()),
+    initialStopPrice: v.optional(v.float64()),
   })
     .index("by_status", ["status"])
     .index("by_positionId", ["positionId"])

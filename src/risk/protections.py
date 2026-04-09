@@ -93,7 +93,8 @@ class StoplossGuard(ProtectionRule):
         if position.exit_reason == "trailing_stop" and pnl_usd < 0:
             self._consecutive += 1
             self._recent_stops.append(time.time() * 1000)
-        else:
+        elif pnl_usd > 5.0:
+            # Only reset streak on meaningful wins (>$5), not breakeven/dust profits
             self._consecutive = 0
 
     def check(self, ctx: ProtectionContext) -> ProtectionVerdict:
@@ -115,14 +116,19 @@ class StoplossGuard(ProtectionRule):
 
 
 class MaxDrawdownGuard(ProtectionRule):
-    """Block when daily drawdown exceeds a threshold percentage."""
+    """Block when daily drawdown exceeds a threshold percentage.
+
+    Tracks cumulative P&L from session start. Peak starts at 0 (break-even)
+    so that early losses are properly detected as drawdown from the starting point.
+    """
 
     name = "max_drawdown"
 
-    def __init__(self, max_drawdown_pct: float = 0.15):
+    def __init__(self, max_drawdown_pct: float = 0.15, starting_equity: float = 10_000):
         self.max_drawdown_pct = max_drawdown_pct
-        self._peak_equity: float = 0
-        self._current_equity: float = 0
+        self._starting_equity = starting_equity
+        self._peak_equity: float = starting_equity
+        self._current_equity: float = starting_equity
 
     def on_trade_closed(self, position: Position, pnl_usd: float) -> None:
         self._current_equity += pnl_usd
@@ -140,8 +146,8 @@ class MaxDrawdownGuard(ProtectionRule):
         return ProtectionVerdict(allowed=True)
 
     def on_day_reset(self) -> None:
-        self._peak_equity = 0
-        self._current_equity = 0
+        # Reset to current equity level, not zero
+        self._peak_equity = self._current_equity
 
 
 class CooldownPeriod(ProtectionRule):
@@ -198,6 +204,7 @@ class RapidDrawdownHalt(ProtectionRule):
         self._daily_pnl: float = 0.0
         self._weekly_pnl: float = 0.0
         self._trade_count_today: int = 0
+        self._week_start_day: int = time.gmtime().tm_yday
 
     def on_trade_closed(self, position: Position, pnl_usd: float) -> None:
         self._daily_pnl += pnl_usd
@@ -229,7 +236,11 @@ class RapidDrawdownHalt(ProtectionRule):
     def on_day_reset(self) -> None:
         self._daily_pnl = 0.0
         self._trade_count_today = 0
-        # Weekly PnL is NOT reset daily — it accumulates
+        # Reset weekly PnL every 7 days
+        current_day = time.gmtime().tm_yday
+        if current_day - self._week_start_day >= 7 or current_day < self._week_start_day:
+            self._weekly_pnl = 0.0
+            self._week_start_day = current_day
 
 
 # ── Protection Chain ──────────────────────────────────────────────────────

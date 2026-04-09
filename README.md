@@ -9,6 +9,8 @@
 [![Claude](https://img.shields.io/badge/Powered%20by-Claude%20Opus-8A2BE2?logo=anthropic)](https://anthropic.com)
 [![Paper Trading](https://img.shields.io/badge/Paper%20Trading-default-orange)](.env.example)
 
+[**Live Portfolio Dashboard →**](https://prateekjain.io/kaizen-trader)
+
 </div>
 
 ---
@@ -43,10 +45,10 @@ The full audit trail — every trade, every diagnosis, every config snapshot, ev
 The bot runs as a single Python process with three continuous stages:
 
 **1 — Signal ingestion:**
-Coinbase WebSocket streams price ticks and L2 order book updates. Six external APIs (CryptoPanic, LunarCrush, Whale Alert, Binance Futures, DeFiLlama, Alternative.me) poll on independent schedules and update an in-memory `MarketContext`. Each signal fetcher has a circuit breaker (3 failures -> 5-minute cooldown).
+Coinbase WebSocket streams price ticks and L2 order book updates. Ten external APIs (CryptoPanic, LunarCrush, Whale Alert, Binance Futures, DeFiLlama, Alternative.me, Token Unlocks, Options, Stablecoin Flows, Derivatives) poll on independent schedules and update an in-memory `MarketContext`. Each signal fetcher has a circuit breaker (3 failures -> 5-min cooldown).
 
 **2 — Trade engine:**
-On every tick (throttled to 2s/symbol), 11 strategy scanners run against the current price and context. Strategies are auto-discovered from `src/strategies/` via the registry. Signals pass the qualification scorer (multi-signal aggregation), are sized via quarter-Kelly, and routed to the executor (paper by default, Coinbase Advanced REST in live mode). A declarative protection chain blocks new positions when daily loss limits, max positions, or cooldowns are hit.
+On every tick (throttled to 2s/symbol), 14 strategy scanners run against the current price and context. Strategies are auto-discovered from `src/strategies/` via the registry. Signals pass the qualification scorer (multi-signal aggregation), are sized via quarter-Kelly, and routed to the executor (paper by default, Coinbase Advanced REST in live mode). A declarative protection chain blocks new positions when daily loss limits, max positions, or cooldowns are hit.
 
 **3 — Self-healing:**
 Four feedback loops run in parallel — immediate rule-based patching after every loss, periodic Claude deep analysis, delta evaluation to auto-revert bad changes, and Darwinian strategy selection. Details below.
@@ -96,6 +98,11 @@ See [`docs/architecture.md`](docs/architecture.md) for Mermaid diagrams, data fl
 | `narrative_momentum` | Social velocity for a sector spikes 3x — buy the sector laggard | Swing |
 | `protocol_revenue` | DeFiLlama: protocol fees 2x above 7d avg, token hasn't moved yet | Swing |
 
+### Cross-exchange
+| Strategy | Entry condition | Tier |
+|---|---|---|
+| `cross_exchange_divergence` | Price divergence >1% between Coinbase and Binance spot — trade the lagging exchange | Swing |
+
 ---
 
 ## Signal sources
@@ -109,6 +116,10 @@ See [`docs/architecture.md`](docs/architecture.md) for Mermaid diagrams, data fl
 | **Binance Futures** | Funding rates, open interest, real-time liquidation stream | `funding_extreme`, `liquidation_cascade` |
 | **DeFiLlama** | Daily fees for 2000+ protocols | `protocol_revenue` |
 | **Alternative.me** | Fear & Greed Index (updated daily, free, no auth) | `fear_greed_contrarian`, qualification scorer |
+| **Token Unlocks** | Token unlock schedule data | `listing_pump`, risk filter |
+| **Options Sentiment** | Options market put/call ratio, max pain | Qualification scorer |
+| **Stablecoin Flows** | USDT/USDC mint/burn and exchange flows | Qualification scorer |
+| **Derivatives Data** | OI changes, leverage profiles, liquidation levels | `liquidation_cascade`, qualification scorer |
 
 All signal fetchers use per-endpoint circuit breakers (3 failures -> 5-min reset) and return stale cache warnings after 2x TTL.
 
@@ -182,7 +193,7 @@ Main thread
 ├── CoinbaseWebSocket thread       (price ticks + L2 book)
 ├── Exit checker thread            (every 5s — trailing stops, max hold)
 ├── Market context refresh thread  (every 2min — fear/greed)
-├── Signal refresh thread          (every 3min — news, social, funding, whale, protocol)
+├── Signal refresh thread          (every 2.5min — news, social, funding, whale, protocol)
 ├── Self-healing analysis thread   (every 60min — Claude)
 ├── Strategy evaluation thread     (every 1h — Darwinian selector + delta evaluator)
 ├── Health check HTTP server       (port 8080)
@@ -195,7 +206,7 @@ Coordination: `threading.Event` for shutdown, `Lock`/`RLock` on shared state, `q
 
 ## Storage
 
-**Convex** — the sole database. Writes are async (queued, flushed every 1s via background thread). Reads are sync (blocking Convex queries). Tables: `positions`, `trades`, `logs`, `diagnoses`, `scanner_config_history`, `parameter_deltas`, `github_issues`, `trade_journal`. Real-time subscriptions for the dashboard via `useQuery`. 15-minute metric aggregation cron.
+**Convex** — the sole database. Writes are async (queued, flushed every 1s via background thread). Reads are sync (blocking Convex queries). Tables: `positions`, `trades`, `logs`, `diagnoses`, `scanner_config_history`, `parameter_deltas`, `github_issues`, `trade_journal`, `metrics`. Real-time subscriptions for the dashboard via `useQuery`. 15-minute metric aggregation cron.
 
 ---
 
@@ -207,7 +218,7 @@ src/
 ├── config.py                        Parameter defaults, hard bounds, env vars
 ├── main.py                          Trading pipeline + health check + thread monitor
 │
-├── strategies/                      One file per strategy (11 total)
+├── strategies/                      One file per strategy (14 total)
 │   ├── registry.py                  Auto-discovery — scan for scan_*/on_* functions
 │   ├── momentum.py                  Rolling price/volume, freshness gate
 │   ├── mean_reversion.py            VWAP + RSI(14)
@@ -215,6 +226,8 @@ src/
 │   ├── liquidation_cascade.py       Cascade rider + exhaustion dip buyer
 │   ├── orderbook_imbalance.py       L2 book, bid/ask depth ratio
 │   ├── whale_tracker.py             2h net flow window
+│   ├── fear_greed_contrarian.py     Fear & Greed extremes
+│   ├── cross_exchange_divergence.py Cross-exchange price divergence
 │   └── ...                          correlation_break, listing_pump, narrative_momentum, etc.
 │
 ├── signals/                         External API integrations (all with circuit breakers)
@@ -224,7 +237,11 @@ src/
 │   ├── whale.py                     Whale Alert
 │   ├── funding.py                   Binance Futures
 │   ├── fear_greed.py                Alternative.me
-│   └── protocol.py                  DeFiLlama
+│   ├── protocol.py                  DeFiLlama
+│   ├── token_unlocks.py             Token unlock schedules
+│   ├── options.py                   Options sentiment (put/call, max pain)
+│   ├── stablecoin.py                USDT/USDC mint/burn and exchange flows
+│   └── derivatives.py               OI, leverage, liquidation levels
 │
 ├── feeds/
 │   └── coinbase_ws.py               WebSocket with ping/pong, reconnect, thread-safe book
@@ -268,7 +285,9 @@ src/
 │   └── convex_client.py             Convex SDK wrapper with background flush
 │
 └── utils/
-    └── safe_math.py                 NaN/Inf guards for scoring and sizing
+    ├── safe_math.py                 NaN/Inf guards for scoring and sizing
+    ├── binance_symbols.py           Binance symbol helpers
+    └── cache.py                     TTL cache
 
 scripts/
 ├── analyze_logs.py                  Trigger Claude analysis manually
@@ -276,7 +295,7 @@ scripts/
 └── backtest.py                      CLI backtesting tool
 
 convex/                              Convex serverless functions
-├── schema.ts                        8 tables
+├── schema.ts                        9 tables
 ├── mutations.ts                     9 write mutations
 ├── queries.ts                       10 read queries for dashboard
 ├── crons.ts                         15-minute metric aggregation
@@ -292,8 +311,8 @@ docs/
 ## Robustness
 
 - **Thread safety**: All mutable global state protected with `Lock`/`RLock`. Per-thread batch flags via `threading.local()`. Double-checked locking on strategy registry.
-- **Circuit breakers**: Per-endpoint breakers on all 6 signal fetchers (3 failures -> 5-min cooldown).
-- **Division guards**: Every division in all 11 strategies guarded against zero denominators.
+- **Circuit breakers**: Per-endpoint breakers on all 10 signal fetchers (3 failures -> 5-min cooldown).
+- **Division guards**: Every division in all 14 strategies guarded against zero denominators.
 - **NaN/Inf guards**: `safe_score()`/`safe_ratio()` at scoring and sizing boundaries.
 - **Memory bounds**: All rolling buffers capped with expiry-based purging.
 - **Execution safety**: Rate limiting, exponential backoff retries, idempotent order IDs, partial fill handling.
@@ -305,6 +324,24 @@ docs/
 ## Getting started
 
 See [`docs/setup.md`](docs/setup.md) for installation, configuration, deployment, and adding custom strategies.
+
+## Why not multi-agent simulation (MiroFish)?
+
+We evaluated [MiroFish](https://github.com/666ghj/MiroFish), an open-source swarm intelligence engine that uses CAMEL-OASIS to simulate social agent interactions and generate prediction reports. After reading the actual source code and benchmarking the compute requirements, we concluded it is not a good fit for this system. Here's why:
+
+**Latency kills real-time trading.** MiroFish's minimum useful simulation (10 agents, 10 rounds) takes 1–5 minutes. A medium run (30 agents, 40 rounds) takes 5–20 minutes. The full default (100 agents, 72 rounds) takes 30–90 minutes. Our signal refresh cycle is 2 minutes and scalp strategies need sub-second signals. There is no way to make MiroFish a real-time signal source.
+
+**Cost doesn't scale on a small portfolio.** Each simulation makes ~1 LLM call per active agent per round. A 30-agent, 40-round simulation generates ~900 LLM calls. Running hourly across 20 symbols at $1–4/sim (qwen-plus) costs $480–1,920/day — 3–12% of a $6K portfolio annualized just on simulation inference. Even with gpt-4o-mini ($0.10–0.50/sim), it's $48–240/day.
+
+**LLM agent consensus is not independent signal.** N LLM agents share the same training data and biases. Their "consensus" is one opinion amplified N times, not N independent views. This is fundamentally different from real social media sentiment where thousands of humans with different information sets form opinions independently.
+
+**No proven prediction accuracy.** The OASIS research paper (arXiv:2411.11581) demonstrates qualitative social phenomena — echo chambers, opinion cascades, information polarization — not directional price prediction. Zero published evidence exists that LLM agent swarms produce actionable alpha for crypto markets. Traditional agent-based models for finance are useful for understanding market dynamics and tail risks, not for point-in-time price forecasts.
+
+**Simpler alternatives already exist in our stack.** Our Claude-powered log analyzer (`src/self_healing/log_analyzer.py`) already does deep pattern analysis every 60 minutes. LunarCrush provides real social sentiment from actual humans. A single Claude API call analyzing the same news articles MiroFish would ingest produces comparable analytical quality at 1/100th the cost and 1/60th the latency.
+
+**The one defensible use case** — batch pre-event scenario analysis (1–3 simulations/day before token unlocks or protocol upgrades) — costs $3–12/day but remains speculative. We may revisit if published benchmarks demonstrate measurable prediction accuracy for financial markets.
+
+---
 
 ## License
 

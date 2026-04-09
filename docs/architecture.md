@@ -18,7 +18,7 @@ flowchart LR
     subgraph engine["Trading Engine"]
         direction LR
         REG["Strategy Registry\nauto-discovery"]
-        STRAT["11 Strategies"]
+        STRAT["14 Strategies"]
         QUAL["Qualification Scorer"]
         KELLY["Kelly Sizer"]
         PROT{"Protection Chain"}
@@ -79,7 +79,7 @@ flowchart TB
     end
 
     subgraph convex["Convex (Free)"]
-        TABLES["8 Tables\npositions + trades + logs\ndiagnoses + deltas + config\ngithub_issues + metrics"]
+        TABLES["9 Tables\npositions + trades + logs\ndiagnoses + deltas + config\ngithub_issues + trade_journal\n+ metrics"]
         CRON["Cron: 15-min\nmetric aggregation"]
     end
 
@@ -173,7 +173,7 @@ Early versions asked Claude directly for a parameter patch and got overconfident
 
 ### Why circuit breakers on signal fetchers?
 
-Each of the 6 external APIs (CryptoPanic, LunarCrush, Whale Alert, Binance Futures, DeFiLlama, Alternative.me) has an independent circuit breaker:
+Each of the 10 external APIs (CryptoPanic, LunarCrush, Whale Alert, Binance Futures, DeFiLlama, Alternative.me, Token Unlocks, Options, Stablecoin, Derivatives) has an independent circuit breaker:
 
 - **Closed** (normal): requests pass through
 - **Open** (after 3 failures): all requests short-circuit for 5 minutes
@@ -272,9 +272,23 @@ diagnoses     -- id, position_id, symbol, strategy, pnl_pct, hold_ms,
               -- action, parameter_changes (JSON), timestamp
 
 scanner_config_history  -- id, config (JSON), reason, timestamp
+
+parameterDeltas  -- id, parameter, old_value, new_value, reason, source,
+                 -- trades_before_snapshot, trades_after_snapshot,
+                 -- evaluation_status, verdict, timestamp
+
+githubIssues     -- id, issue_number, title, body, trigger_type, trigger_data,
+                 -- created_at, status
+
+tradeJournal     -- id, position_id, symbol, strategy, r_multiple, hold_hours,
+                 -- mae_pct, mfe_pct, partial_exit_pct, exit_reason, pnl_pct,
+                 -- regime_at_entry, regime_at_exit, timestamp
+
+metrics          -- id, window_start_ms, window_end_ms, error_count, warn_count,
+                 -- trade_count, healing_count, avg_pnl_pct, win_rate, computed_at
 ```
 
-Indexes on: `positions(status)`, `positions(symbol)`, `trades(position_id)`, `logs(ts)`, `logs(level)`, `logs(symbol)`.
+Indexes on: `positions(status)`, `positions(symbol)`, `positions(closedAt)`, `trades(position_id)`, `logs(ts)`, `logs(level)`, `logs(symbol)`, `parameterDeltas(evaluationStatus)`, `parameterDeltas(timestamp)`, `githubIssues(triggerType, triggerData)`, `githubIssues(status)`, `tradeJournal(timestamp)`, `tradeJournal(strategy)`, `metrics(computedAt)`.
 
 ## GitHub automation
 

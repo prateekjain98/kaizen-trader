@@ -9,7 +9,17 @@ from src.types import TradeDiagnosis
 from src.automation.github_issues import create_blind_spot_issue
 
 
+_SCALP_STRATEGIES = {"momentum_scalp", "orderbook_imbalance"}
+
+
+def _infer_tier(strategy: str) -> str:
+    return "scalp" if strategy in _SCALP_STRATEGIES else "swing"
+
+
 def _hold_bucket(hold_ms: float) -> str:
+    # Heuristic: if value is suspiciously small, it's likely in seconds not milliseconds
+    if 0 < hold_ms < 1000:
+        hold_ms *= 1000
     hours = hold_ms / 3_600_000
     if hours < 1:
         return "<1h"
@@ -62,10 +72,11 @@ class BlindSpotDetector:
 
     def record_unknown(self, diagnosis: TradeDiagnosis) -> Optional[UnknownFingerprint]:
         """Record an 'unknown' diagnosis. Returns the fingerprint if it just crossed the threshold."""
+        tier = _infer_tier(diagnosis.strategy)
         bucket = _hold_bucket(diagnosis.hold_ms)
         key = _fingerprint_key(
             diagnosis.strategy,
-            "swing",  # tier extracted from strategy name convention
+            tier,
             diagnosis.market_phase_at_entry,
             diagnosis.exit_reason,
             bucket,
@@ -78,7 +89,7 @@ class BlindSpotDetector:
             if fp is None:
                 fp = UnknownFingerprint(
                     strategy=diagnosis.strategy,
-                    tier="swing",
+                    tier=tier,
                     market_phase=diagnosis.market_phase_at_entry,
                     exit_reason=diagnosis.exit_reason,
                     hold_bucket=bucket,
@@ -130,7 +141,8 @@ class BlindSpotDetector:
                         exit_reason: str, hold_ms: float) -> Optional[str]:
         """Check if a promoted blind spot matches. Called before returning 'unknown'."""
         bucket = _hold_bucket(hold_ms)
-        key = _fingerprint_key(strategy, "swing", market_phase, exit_reason, bucket)
+        tier = _infer_tier(strategy)
+        key = _fingerprint_key(strategy, tier, market_phase, exit_reason, bucket)
         with self._lock:
             return self._promoted.get(key)
 

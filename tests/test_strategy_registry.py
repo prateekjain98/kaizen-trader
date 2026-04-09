@@ -11,10 +11,10 @@ from src.strategies.registry import (
 # Update this when adding or removing a strategy module.
 EXPECTED_STRATEGIES = {
     "correlation_break", "cross_exchange_divergence", "fear_greed_contrarian",
-    "funding_extreme", "liquidation_cascade", "liquidation_event",
-    "listing_announcement", "mean_reversion", "momentum",
+    "funding_extreme", "liquidation_event",
+    "listing_announcement", "mean_reversion", "momentum_swing", "momentum_scalp",
     "narrative_momentum", "orderbook_imbalance", "protocol_revenue",
-    "whale_accumulation", "whale_transfer",
+    "whale_accumulation",
 }
 
 

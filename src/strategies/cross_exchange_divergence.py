@@ -43,6 +43,8 @@ class PriceSnapshot:
 _divergence_history: dict[str, list[PriceSnapshot]] = {}
 _HISTORY_WINDOW_MS = 3_600_000
 _MAX_HISTORY_PER_SYMBOL = 120
+_cooldowns: dict[str, float] = {}
+_COOLDOWN_MS = 300_000  # 5 minutes between signals for same symbol
 
 
 def _fetch_binance_price(symbol: str) -> Optional[float]:
@@ -154,6 +156,13 @@ def scan_cross_exchange_divergence(
     if symbol.upper() not in _BINANCE_MAP:
         return None
 
+    # Per-symbol cooldown to prevent rapid-fire signals
+    now_cd = time.time() * 1000
+    if symbol in _cooldowns and now_cd < _cooldowns[symbol]:
+        # Still record the price snapshot to keep history fresh
+        record_price_snapshot(symbol, current_price)
+        return None
+
     snap = record_price_snapshot(symbol, current_price)
     if snap is None:
         return None
@@ -166,47 +175,51 @@ def scan_cross_exchange_divergence(
     current_div = stats["current_div_pct"]
     now = time.time() * 1000
 
-    # Need at least 0.1% absolute divergence to be meaningful
-    if abs(current_div) < 0.10:
+    # Divergence must exceed round-trip fees (~1.0-1.5% across exchanges) to have positive expected value.
+    # Require at least 1.0% absolute divergence as minimum edge.
+    _MIN_DIVERGENCE_PCT = 1.0
+    if abs(current_div) < _MIN_DIVERGENCE_PCT:
         return None
 
     # Coinbase significantly overpriced → SHORT (expect price to drop to Binance level)
-    if z >= 2.0 and current_div > 0.15:
-        score = min(78, 40 + abs(z) * 8 + abs(current_div) * 15)
+    if z >= 2.5 and current_div > _MIN_DIVERGENCE_PCT:
+        score = min(95, 50 + abs(z) * 6 + abs(current_div) * 10)
+        _cooldowns[symbol] = now + _COOLDOWN_MS
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
-            strategy="cross_exchange_divergence", side="short", tier="scalp",
-            score=score, confidence="medium",
+            strategy="cross_exchange_divergence", side="short", tier="swing",
+            score=score, confidence="high",
             sources=["price_action", "correlation"],
             reasoning=(
                 f"Coinbase {current_div:+.2f}% above Binance (z={z:.1f}), "
                 f"avg spread {stats['avg_div_pct']:.3f}% ± {stats['std_div_pct']:.3f}%"
             ),
             entry_price=current_price,
-            stop_price=current_price * 1.005,  # tight stop — this is scalp
-            target_price=snap.binance_price,  # target = Binance price
+            stop_price=current_price * 1.02,  # 2% stop — room for swing
+            target_price=snap.binance_price,
             suggested_size_usd=50,
-            expires_at=now + 600_000,  # 10 min — dislocations resolve fast
+            expires_at=now + 3_600_000,  # 1h — larger dislocations take longer to resolve
             created_at=now,
         )
 
     # Coinbase significantly underpriced → LONG (expect price to rise to Binance level)
-    if z <= -2.0 and current_div < -0.15:
-        score = min(78, 40 + abs(z) * 8 + abs(current_div) * 15)
+    if z <= -2.5 and current_div < -_MIN_DIVERGENCE_PCT:
+        score = min(95, 50 + abs(z) * 6 + abs(current_div) * 10)
+        _cooldowns[symbol] = now + _COOLDOWN_MS
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
-            strategy="cross_exchange_divergence", side="long", tier="scalp",
-            score=score, confidence="medium",
+            strategy="cross_exchange_divergence", side="long", tier="swing",
+            score=score, confidence="high",
             sources=["price_action", "correlation"],
             reasoning=(
                 f"Coinbase {current_div:+.2f}% below Binance (z={z:.1f}), "
                 f"avg spread {stats['avg_div_pct']:.3f}% ± {stats['std_div_pct']:.3f}%"
             ),
             entry_price=current_price,
-            stop_price=current_price * 0.995,  # tight stop
+            stop_price=current_price * 0.98,  # 2% stop
             target_price=snap.binance_price,
             suggested_size_usd=50,
-            expires_at=now + 600_000,
+            expires_at=now + 3_600_000,
             created_at=now,
         )
 
