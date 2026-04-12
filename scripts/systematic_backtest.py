@@ -27,7 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.types import TradeSignal, Position, ScannerConfig, MarketContext
 from src.config import CONFIG_BOUNDS, default_scanner_config
-from src.backtesting.data_loader import load_klines
+from src.backtesting.data_loader import load_klines, load_futures_klines
+from src.backtesting.funding_loader import load_funding_rates
+from src.backtesting.oi_loader import load_open_interest
 from src.indicators.core import compute_rsi, compute_atr, compute_ema, compute_bollinger_bands, compute_adx, compute_macd, compute_obv, OHLCV
 
 # ---------------------------------------------------------------------------
@@ -1148,58 +1150,110 @@ class FearGreedSimulator(StrategySimulator):
 
 
 class FundingExtremeSimulator(StrategySimulator):
-    """Simulates funding rate extremes from price volatility."""
+    """Simulates funding rate extremes using REAL Binance funding rate + OI data."""
     strategy_id = "funding_extreme"
     tier = "swing"
+
+    _EIGHT_HOURS_MS = 8 * 3_600_000
+
+    def __init__(self):
+        super().__init__()
+        self.funding_data: dict[str, list[dict]] = {}  # symbol -> sorted funding records
+        self.oi_data: dict[str, list[dict]] = {}        # symbol -> sorted OI records
 
     def required_candles(self):
         return 20
 
     def data_feeds(self):
-        return ["klines"]
+        return ["klines", "funding", "oi"]
 
-    def scan(self, symbol, candles, config, ctx, now_ms):
+    def _find_nearest_funding(self, symbol: str, ts: float) -> Optional[float]:
+        """Find the nearest funding rate to the given timestamp (round to nearest 8h)."""
+        records = self.funding_data.get(symbol, [])
+        if not records:
+            return None
+        # Binary-ish search: find closest funding_time
+        best = None
+        best_dist = float("inf")
+        for r in records:
+            dist = abs(r["funding_time"] - ts)
+            if dist < best_dist:
+                best_dist = dist
+                best = r["funding_rate"]
+            elif dist > best_dist:
+                break  # records are sorted, so once distance starts growing we can stop
+        # Only use if within 8h window
+        if best_dist <= self._EIGHT_HOURS_MS:
+            return best
+        return None
+
+    def _compute_oi_change_pct(self, symbol: str, ts: float) -> Optional[float]:
+        """Compute OI change pct over the last 8 hours from real OI data."""
+        records = self.oi_data.get(symbol, [])
+        if not records:
+            return None
+        # Find current OI (nearest to ts)
+        current_oi = None
+        past_oi = None
+        target_past = ts - self._EIGHT_HOURS_MS
+
+        for r in records:
+            if r["timestamp"] <= ts:
+                current_oi = r["sum_open_interest"]
+            if r["timestamp"] <= target_past:
+                past_oi = r["sum_open_interest"]
+
+        if current_oi is None or past_oi is None or past_oi == 0:
+            return None
+        return ((current_oi - past_oi) / past_oi) * 100
+
+    def scan(self, symbol, candles, config, ctx, now_ms, **kwargs):
         if self._check_cooldown(symbol, now_ms):
             return None
         if len(candles) < 10:
             return None
 
-        # Derive synthetic funding rate from recent price action
-        # In reality: strong uptrend + high volume -> positive funding
-        # Strong downtrend + high volume -> negative funding
-        recent = candles[-8:]
-        pct_change = (recent[-1]["close"] - recent[0]["close"]) / recent[0]["close"]
-        vol_ratio = _compute_volume_ratio(candles, 10)
+        # Look up real funding rate at this timestamp
+        funding_rate = self._find_nearest_funding(symbol, now_ms)
+        if funding_rate is None:
+            return None
 
-        # Simulate funding rate: correlated with trend strength
-        synthetic_funding = pct_change * 0.05  # 5% of price change as funding proxy
+        # Look up real OI change
+        oi_change_pct = self._compute_oi_change_pct(symbol, now_ms)
+        if oi_change_pct is None:
+            oi_change_pct = 0.0  # default if OI data unavailable
+
         threshold = config.funding_rate_extreme_threshold
-        # Backtest fix: require 3x threshold — 173 funding_squeeze losses at 2x
+        if threshold == 0:
+            return None
+
+        # Match production logic: require 3x threshold minimum
         min_magnitude = threshold * 3
         price = candles[-1]["close"]
 
-        # Positive funding extreme -> short (overleveraged longs)
-        if synthetic_funding > min_magnitude and vol_ratio > 1.5:
-            mag_score = min(40, (synthetic_funding / threshold - 1) * 20)
-            # Backtest fix: raise base score to avoid low_qual_score losses
-            score = min(88, 55 + mag_score)
+        # Short: over-leveraged longs — funding extreme + OI not spiking too much
+        if funding_rate > min_magnitude and oi_change_pct < 15:
+            mag_score = min(40, (funding_rate / threshold - 1) * 20)
+            oi_score = min(20, oi_change_pct / 5) if oi_change_pct > 0 else 0
+            score = min(88, 55 + mag_score + oi_score)
             self._set_cooldown(symbol, now_ms, config.cooldown_ms_swing)
             return TradeSignal(
                 id=str(uuid.uuid4()), symbol=symbol, product_id=f"{symbol}-USD",
                 strategy="funding_extreme", side="short", tier="swing",
                 score=score, confidence="medium" if score > 70 else "low",
                 sources=["funding_rates"],
-                reasoning=f"{symbol} synthetic funding={synthetic_funding*100:.3f}% (threshold={threshold*100:.3f}%)",
+                reasoning=f"{symbol} funding={funding_rate*100:.3f}%, OI change={oi_change_pct:+.1f}%",
                 entry_price=price, stop_price=price * 1.06,
                 target_price=price * 0.92,  # R:R fix: 8% target vs 6% stop = 1.33:1
                 suggested_size_usd=60, expires_at=now_ms + 14_400_000, created_at=now_ms,
             )
 
-        # Negative funding extreme -> long (short squeeze)
-        # Backtest fix: block longs during extreme_fear (12 wrong_market_phase losses)
-        if (synthetic_funding < -min_magnitude and vol_ratio > 1.3
+        # Long: short squeeze — OI should be DECREASING (shorts closing/getting liquidated)
+        # Block longs during extreme_fear (wrong_market_phase losses)
+        if (funding_rate < -min_magnitude
+                and oi_change_pct < -5
                 and ctx.phase != "extreme_fear"):
-            mag_score = min(35, (-synthetic_funding / threshold - 1) * 18)
+            mag_score = min(35, (-funding_rate / threshold - 1) * 18)
             score = min(85, 52 + mag_score)
             self._set_cooldown(symbol, now_ms, config.cooldown_ms_swing)
             return TradeSignal(
@@ -1207,9 +1261,9 @@ class FundingExtremeSimulator(StrategySimulator):
                 strategy="funding_extreme", side="long", tier="swing",
                 score=score, confidence="medium" if score > 68 else "low",
                 sources=["funding_rates"],
-                reasoning=f"{symbol} synthetic funding={synthetic_funding*100:.3f}% (neg extreme)",
-                entry_price=price, stop_price=price * 0.94,
-                target_price=price * 1.08,  # R:R fix: 8% target vs 6% stop = 1.33:1
+                reasoning=f"{symbol} funding={funding_rate*100:.3f}% (neg), OI change={oi_change_pct:+.1f}%",
+                entry_price=price, stop_price=price * 0.95,
+                target_price=price * 1.08,  # R:R fix: 8% target vs 5% stop = 1.6:1
                 suggested_size_usd=70, expires_at=now_ms + 14_400_000, created_at=now_ms,
             )
         return None
@@ -1259,21 +1313,48 @@ class LiquidationCascadeSimulator(StrategySimulator):
 
 
 class CrossExchangeSimulator(StrategySimulator):
-    """Simulates cross-exchange divergence using detrended residuals + ATR stops."""
+    """Simulates cross-exchange divergence using REAL spot vs futures price data.
+
+    Uses Binance spot vs Binance futures as a cross-venue proxy.
+    Spot/futures basis divergence is a real tradeable signal.
+    """
     strategy_id = "cross_exchange_divergence"
     tier = "swing"
+
+    _MIN_DIVERGENCE_PCT = 1.0  # Must exceed round-trip fees
+    _HISTORY_SIZE = 120
 
     def __init__(self):
         super().__init__()
         self._divergence_history: dict[str, list[float]] = {}
+        self.futures_candles: dict[str, list[dict]] = {}  # symbol -> sorted futures candles
 
     def required_candles(self):
         return 25
 
     def data_feeds(self):
-        return ["klines"]
+        return ["klines", "futures_klines"]
 
-    def scan(self, symbol, candles, config, ctx, now_ms):
+    def _get_futures_close_at(self, symbol: str, ts: float) -> Optional[float]:
+        """Find the futures close price at or nearest to the given timestamp."""
+        candles = self.futures_candles.get(symbol, [])
+        if not candles:
+            return None
+        best = None
+        best_dist = float("inf")
+        for c in candles:
+            dist = abs(c["open_time"] - ts)
+            if dist < best_dist:
+                best_dist = dist
+                best = c["close"]
+            elif dist > best_dist:
+                break  # sorted, distance growing
+        # Only use if within 1 hour
+        if best_dist <= 3_600_000:
+            return best
+        return None
+
+    def scan(self, symbol, candles, config, ctx, now_ms, **kwargs):
         if self._check_cooldown(symbol, now_ms):
             return None
         if len(candles) < 20:
@@ -1281,75 +1362,67 @@ class CrossExchangeSimulator(StrategySimulator):
         if ctx.phase in ("extreme_fear", "extreme_greed"):
             return None
 
-        # Momentum filter: skip during sharp moves (divergences won't revert)
-        mom_6h = _compute_momentum_pct(candles, min(len(candles), 6))
-        if mom_6h is not None and abs(mom_6h) > 0.05:
+        # Get spot and futures prices at current timestamp
+        spot_close = candles[-1]["close"]
+        futures_close = self._get_futures_close_at(symbol, now_ms)
+
+        if futures_close is None or futures_close <= 0 or spot_close <= 0:
             return None
 
-        # BB width filter: skip dead-flat markets (noise triggers z-score)
-        closes_20 = [c["close"] for c in candles[-20:]]
-        bb = compute_bollinger_bands(closes_20)
-        if bb and bb[3] < 0.02:
-            return None
+        # Compute divergence: (spot - futures) / futures * 100
+        divergence_pct = (spot_close - futures_close) / futures_close * 100
 
-        # Detrended residual as divergence proxy (better than raw high-low range)
-        n = len(closes_20)
-        x_mean = (n - 1) / 2
-        y_mean = sum(closes_20) / n
-        sum_xy = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(closes_20))
-        sum_xx = sum((i - x_mean) ** 2 for i in range(n))
-        slope = sum_xy / sum_xx if sum_xx > 0 else 0
-        predicted = y_mean + slope * (n - 1 - x_mean)
-        residual_pct = (closes_20[-1] - predicted) / predicted if predicted > 0 else 0
-        synthetic_div = abs(residual_pct)
-
+        # Build rolling divergence history for z-score computation
         hist = self._divergence_history.setdefault(symbol, [])
-        hist.append(synthetic_div)
-        if len(hist) > 120:
-            self._divergence_history[symbol] = hist[-120:]
+        hist.append(divergence_pct)
+        if len(hist) > self._HISTORY_SIZE:
+            self._divergence_history[symbol] = hist[-self._HISTORY_SIZE:]
+            hist = self._divergence_history[symbol]
         if len(hist) < 10:
             return None
 
+        # Compute z-score over rolling window (matching production logic)
         avg = sum(hist) / len(hist)
         std = (sum((d - avg) ** 2 for d in hist) / (len(hist) - 1)) ** 0.5 if len(hist) > 1 else 0.001
         if std < 0.001:
             return None
         z = (hist[-1] - avg) / std
-        price = candles[-1]["close"]
+
+        price = spot_close
 
         # ATR-adaptive stops
         atr = _compute_atr_from_candles(candles)
         if atr and atr > 0 and price > 0:
             atr_pct = atr / price
-            stop_dist = max(0.015, min(0.03, atr_pct * 2.0))
+            stop_dist = max(0.008, min(0.02, atr_pct * 1.5))
         else:
-            stop_dist = 0.02
-        # Target = 1.5x stop distance for positive EV
-        target_dist = stop_dist * 1.5
+            stop_dist = 0.01
 
-        if z >= 3.0 and synthetic_div > 0.005:
-            score = min(95, 50 + abs(z) * 6 + synthetic_div * 500)
+        # Spot overpriced vs futures -> SHORT (expect reversion)
+        if z >= 2.5 and divergence_pct > self._MIN_DIVERGENCE_PCT:
+            score = min(95, 50 + abs(z) * 6 + abs(divergence_pct) * 10)
             self._set_cooldown(symbol, now_ms, 300_000)
             return TradeSignal(
                 id=str(uuid.uuid4()), symbol=symbol, product_id=f"{symbol}-USD",
                 strategy="cross_exchange_divergence", side="short", tier="swing",
                 score=score, confidence="high", sources=["price_action", "correlation"],
-                reasoning=f"{symbol} detrended residual {residual_pct*100:.2f}% (z={z:.1f})",
+                reasoning=f"{symbol} spot {divergence_pct:+.2f}% vs futures (z={z:.1f}), avg spread {avg:.3f}% +/- {std:.3f}%",
                 entry_price=price, stop_price=price * (1 + stop_dist),
-                target_price=price * (1 - target_dist),
+                target_price=futures_close,  # target = convergence to futures price
                 suggested_size_usd=50, expires_at=now_ms + 3_600_000, created_at=now_ms,
             )
 
-        if z <= -3.0 and synthetic_div > 0.005:
-            score = min(95, 50 + abs(z) * 6 + synthetic_div * 500)
+        # Spot underpriced vs futures -> LONG (expect reversion)
+        if z <= -2.5 and divergence_pct < -self._MIN_DIVERGENCE_PCT:
+            score = min(95, 50 + abs(z) * 6 + abs(divergence_pct) * 10)
             self._set_cooldown(symbol, now_ms, 300_000)
             return TradeSignal(
                 id=str(uuid.uuid4()), symbol=symbol, product_id=f"{symbol}-USD",
                 strategy="cross_exchange_divergence", side="long", tier="swing",
                 score=score, confidence="high", sources=["price_action", "correlation"],
-                reasoning=f"{symbol} detrended residual {residual_pct*100:.2f}% (z={z:.1f})",
+                reasoning=f"{symbol} spot {divergence_pct:+.2f}% vs futures (z={z:.1f}), avg spread {avg:.3f}% +/- {std:.3f}%",
                 entry_price=price, stop_price=price * (1 - stop_dist),
-                target_price=price * (1 + target_dist),
+                target_price=futures_close,  # target = convergence to futures price
                 suggested_size_usd=50, expires_at=now_ms + 3_600_000, created_at=now_ms,
             )
         return None
@@ -1805,7 +1878,7 @@ class EMACrossoverSimulator(StrategySimulator):
 ALL_SIMULATORS: dict[str, type] = {
     # === PROFITABLE over 5yr/57 symbols ===
     "correlation_break": CorrelationBreakSimulator,    # 52.9% WR, 9554 trades
-    # "funding_extreme": FundingExtremeSimulator,       # needs self-healing; -$2.7M in combined mode
+    "funding_extreme": FundingExtremeSimulator,          # real funding + OI data
     "listing_pump": ListingPumpSimulator,               # 45.1% WR, 51 trades
     # "correlation_break_eth": CorrelationBreakEthSimulator,  # 54% WR but net negative in combined
     # === UNPROFITABLE — disabled ===
@@ -1819,7 +1892,7 @@ ALL_SIMULATORS: dict[str, type] = {
     # "rsi_divergence": RSIDivergenceSimulator,         # FIXED — added after class definition
     # "volume_breakout": VolumeBreakoutSimulator,       # 36.4% WR, bankrupt
     # "mean_reversion": MeanReversionSimulator,         # 0 trades
-    # "cross_exchange_divergence": CrossExchangeSimulator,
+    "cross_exchange_divergence": CrossExchangeSimulator,  # real spot vs futures data
     # "orderbook_imbalance": OrderbookImbalanceSimulator,
     # "momentum_scalp": MomentumScalpSimulator,
     # "narrative_momentum": NarrativeMomentumSimulator,
@@ -2531,6 +2604,70 @@ class CombinedBacktester:
                 print(f"ERROR: {e}")
         print(f"  Loaded data for {len(symbol_candles)}/{len(self.symbols)} symbols\n")
 
+        # Load external data feeds for strategies that need them
+        symbol_funding: dict[str, list[dict]] = {}
+        symbol_oi: dict[str, list[dict]] = {}
+        symbol_futures: dict[str, list[dict]] = {}
+
+        # Check which data feeds are needed by active simulators
+        needs_funding = any(
+            "funding" in cls().data_feeds()
+            for cls in ALL_SIMULATORS.values()
+        )
+        needs_oi = any(
+            "oi" in cls().data_feeds()
+            for cls in ALL_SIMULATORS.values()
+        )
+        needs_futures = any(
+            "futures_klines" in cls().data_feeds()
+            for cls in ALL_SIMULATORS.values()
+        )
+
+        if needs_funding:
+            print("Loading funding rate data...")
+            for symbol in symbol_candles:
+                print(f"  Funding {symbol}...", end=" ", flush=True)
+                try:
+                    data = load_funding_rates(symbol, self.start_ms, self.end_ms)
+                    if data:
+                        symbol_funding[symbol] = data
+                        print(f"{len(data)} records")
+                    else:
+                        print("NO DATA")
+                except Exception as e:
+                    print(f"ERROR: {e}")
+            print(f"  Loaded funding for {len(symbol_funding)}/{len(symbol_candles)} symbols\n")
+
+        if needs_oi:
+            print("Loading open interest data...")
+            for symbol in symbol_candles:
+                print(f"  OI {symbol}...", end=" ", flush=True)
+                try:
+                    data = load_open_interest(symbol, self.start_ms, self.end_ms)
+                    if data:
+                        symbol_oi[symbol] = data
+                        print(f"{len(data)} records")
+                    else:
+                        print("NO DATA")
+                except Exception as e:
+                    print(f"ERROR: {e}")
+            print(f"  Loaded OI for {len(symbol_oi)}/{len(symbol_candles)} symbols\n")
+
+        if needs_futures:
+            print("Loading futures kline data...")
+            for symbol in symbol_candles:
+                print(f"  Futures {symbol}...", end=" ", flush=True)
+                try:
+                    data = load_futures_klines(symbol, "1h", self.start_ms, self.end_ms)
+                    if data:
+                        symbol_futures[symbol] = data
+                        print(f"{len(data)} candles")
+                    else:
+                        print("NO DATA")
+                except Exception as e:
+                    print(f"ERROR: {e}")
+            print(f"  Loaded futures for {len(symbol_futures)}/{len(symbol_candles)} symbols\n")
+
         if not symbol_candles:
             print("ERROR: No data loaded.")
             return {}
@@ -2538,7 +2675,15 @@ class CombinedBacktester:
         # Use all strategies from the registry
         simulators: dict[str, StrategySimulator] = {}
         for sid, cls in ALL_SIMULATORS.items():
-            simulators[sid] = cls()
+            sim = cls()
+            # Inject external data into simulators that need it
+            if hasattr(sim, "funding_data") and symbol_funding:
+                sim.funding_data = symbol_funding
+            if hasattr(sim, "oi_data") and symbol_oi:
+                sim.oi_data = symbol_oi
+            if hasattr(sim, "futures_candles") and symbol_futures:
+                sim.futures_candles = symbol_futures
+            simulators[sid] = sim
 
         config = copy.deepcopy(default_scanner_config)
         # Build unified timeline
