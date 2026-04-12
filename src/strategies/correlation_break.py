@@ -76,7 +76,7 @@ def scan_correlation_break(
 ) -> Optional[TradeSignal]:
     if symbol in _BLACKLIST:
         return None
-    if ctx.phase in ("extreme_greed", "extreme_fear"):
+    if ctx.phase == "extreme_greed":
         return None
     now = time.time() * 1000
 

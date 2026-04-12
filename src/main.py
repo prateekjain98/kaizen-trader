@@ -1045,17 +1045,27 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
             symbol=pos.symbol, strategy=pos.strategy)
         # If no holdings exist, force-close the stale position to stop retry loop
         if "No holdings" in (trade.error or ""):
-            log("warn", f"Force-closing stale position {pos.symbol} — no holdings to sell",
+            # Compute actual P&L from entry price vs current price
+            if pos.side == "long":
+                fc_pnl_pct = (current_price - pos.avg_entry_price) / pos.avg_entry_price if pos.avg_entry_price > 0 else 0
+            else:
+                fc_pnl_pct = (pos.avg_entry_price - current_price) / pos.avg_entry_price if pos.avg_entry_price > 0 else 0
+            entry_basis = pos.entry_size_usd if pos.entry_size_usd > 0 else pos.size_usd
+            fc_pnl_usd = pos.partial_realized_pnl + (fc_pnl_pct * pos.size_usd)
+            fc_pnl_pct_total = fc_pnl_usd / entry_basis if entry_basis > 0 else fc_pnl_pct
+
+            log("warn", f"Force-closing stale position {pos.symbol} — no holdings to sell "
+                f"(entry={pos.avg_entry_price:.6f} exit={current_price:.6f} pnl={fc_pnl_pct_total:.2%})",
                 symbol=pos.symbol, strategy=pos.strategy)
             pos.status = "closed"
             pos.exit_price = current_price
             pos.closed_at = now
-            pos.pnl_usd = 0
-            pos.pnl_pct = 0
+            pos.pnl_usd = fc_pnl_usd
+            pos.pnl_pct = fc_pnl_pct_total
             pos.exit_reason = "force_closed_no_holdings"
             with batch_writes():
-                update_position_close(pos.id, current_price, 0, 0, "force_closed_no_holdings")
-            register_close(pos, 0)
+                update_position_close(pos.id, current_price, fc_pnl_usd, fc_pnl_pct_total, "force_closed_no_holdings")
+            register_close(pos, fc_pnl_usd)
         return
 
     exit_price = trade.price if trade.price > 0 else current_price

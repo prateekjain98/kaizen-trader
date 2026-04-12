@@ -134,9 +134,9 @@ def scan_momentum(
         # Backtest fix: reject pump tops — moves >8% in 1h are usually exhausted
         if swing["pct"] > 0.08:
             return None
-        # Backtest fix: skip longs during extreme_fear and bear phases
-        # (44 low_volatility_chop + 38 adverse_move losses in bear/fear markets)
-        if ctx.phase in ("extreme_fear", "bear"):
+        # Backtest fix: skip longs during bear phases (38 adverse_move losses)
+        # extreme_fear removed — momentum with volume confirmation is valid in fear
+        if ctx.phase == "bear":
             return None
         volume_ok = swing["current_volume"] >= swing["avg_volume"] * config.volume_multiplier_swing
         if volume_ok:

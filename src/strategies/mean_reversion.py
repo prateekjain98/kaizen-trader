@@ -98,7 +98,7 @@ def scan_mean_reversion(
     # Mean reversion longs during capitulation catch falling knives.
     if (deviation < -config.vwap_deviation_pct and rsi < config.rsi_oversold
             and volume_ratio > 1.5
-            and ctx.phase not in ("extreme_greed", "extreme_fear", "bear")):
+            and ctx.phase not in ("extreme_greed", "bear")):
         dev_score = min(30, abs(deviation) * 500)
         rsi_score = min(20, config.rsi_oversold - rsi)
         score = min(90, 50 + dev_score + rsi_score)  # Raised base from 40 to pass higher min_qual

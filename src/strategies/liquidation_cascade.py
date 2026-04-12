@@ -98,7 +98,7 @@ def scan_liquidation_cascade(
 
     # Strategy A: Ride cascade — raised from $2M to $3M (19 adverse_move losses at $2M)
     if (win.total_long_liqs_usd > 3_000_000 and oi_drop > 0.05
-            and ctx.phase != "extreme_fear"):
+            and ctx.phase not in ("bear",)):
         size_score = min(30, win.total_long_liqs_usd / 200_000)
         oi_score = min(20, oi_drop * 200)
         score = min(85, 45 + size_score + oi_score)
@@ -121,7 +121,7 @@ def scan_liquidation_cascade(
     # Backtest fix: also block dip buys during extreme_fear (6 wrong_market_phase losses)
     # Raised from $5M to $8M — require stronger cascade exhaustion signal
     if (win.total_long_liqs_usd > 8_000_000 and price_drop_pct > 0.05
-            and cascade_exhausted and ctx.phase not in ("bear", "extreme_fear")):
+            and cascade_exhausted and ctx.phase != "bear"):
         drop_score = min(30, price_drop_pct * 200)
         score = min(82, 52 + drop_score)
         return TradeSignal(

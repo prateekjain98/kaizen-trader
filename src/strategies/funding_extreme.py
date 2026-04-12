@@ -85,7 +85,7 @@ def scan_funding_extreme(
     # Backtest fix: block longs during extreme_fear (wrong_market_phase losses)
     if (funding.funding_rate < -min_magnitude
             and funding.open_interest_change_pct < -5
-            and ctx.phase != "extreme_fear"):
+            and ctx.phase not in ("bear",)):
         mag_score = min(35, (-funding.funding_rate / threshold - 1) * 18)
         score = min(85, 52 + mag_score)
         return TradeSignal(

@@ -52,11 +52,14 @@ class CoinbaseWebSocket:
         self._thread: Optional[threading.Thread] = None
         self._tick_count = 0
         self._last_tick_time = time.time()
+        self._stop_event = threading.Event()
+        self._last_vol_24h: dict[str, float] = {}  # track 24h volume to compute tick deltas
 
     def connect(self) -> None:
         if self._status in ("connected", "connecting"):
             return
         self._status = "connecting"
+        self._stop_event.clear()
 
         try:
             from coinbase.websocket import WSClient
@@ -67,53 +70,89 @@ class CoinbaseWebSocket:
         api_key = env.coinbase_api_key or ""
         api_secret = env.coinbase_api_secret or ""
 
+        # Use retry=False so we control reconnection ourselves
         if api_key and api_secret:
             self._client = WSClient(
                 api_key=api_key,
                 api_secret=api_secret,
                 on_message=self._on_message,
                 on_close=self._on_close,
+                retry=False,
             )
         else:
             self._client = WSClient(
                 on_message=self._on_message,
                 on_close=self._on_close,
+                retry=False,
             )
 
         def _run():
-            try:
-                self._client.open()
-                self._status = "connected"
-                log("info", f"Coinbase WS connected — subscribing to {len(self.product_ids)} products")
+            from coinbase.websocket import WSClientConnectionClosedException, WSClientException
 
-                # Subscribe to ticker (public) and level2 (requires auth)
-                self._client.subscribe(
-                    product_ids=self.product_ids,
-                    channels=["ticker", "heartbeats"],
-                )
-                if api_key:
-                    try:
-                        self._client.subscribe(
-                            product_ids=self.product_ids,
-                            channels=["level2"],
-                        )
-                    except Exception as e:
-                        log("warn", f"Coinbase WS level2 subscription failed (auth issue?): {e}")
-
-                log("info", "Coinbase WS subscriptions sent")
-
-                from coinbase.websocket import WSClientConnectionClosedException, WSClientException
+            while not self._stop_event.is_set():
                 try:
-                    self._client.run_forever_with_exception_check()
+                    self._client.open()
+                    self._status = "connected"
+                    log("info", f"Coinbase WS connected — subscribing to {len(self.product_ids)} products")
+
+                    self._client.subscribe(
+                        product_ids=self.product_ids,
+                        channels=["ticker", "heartbeats"],
+                    )
+                    # Level2 disabled — causes connection drops from EU servers.
+                    # Orderbook data is fetched via REST fallback in orderbook_imbalance strategy.
+                    # if api_key:
+                    #     try:
+                    #         self._client.subscribe(
+                    #             product_ids=self.product_ids,
+                    #             channels=["level2"],
+                    #         )
+                    #     except Exception as e:
+                    #         log("warn", f"Coinbase WS level2 subscription failed: {e}")
+
+                    log("info", "Coinbase WS subscriptions sent")
+
+                    # Keep the thread alive — sleep_with_exception_check will raise
+                    # if the SDK's internal WS thread encounters an error.
+                    # Also break if _on_close fired (status changed to disconnected).
+                    while not self._stop_event.is_set() and self._status == "connected":
+                        self._client.sleep_with_exception_check(sleep=5)
+
                 except WSClientConnectionClosedException:
-                    log("warn", "Coinbase WS connection closed — will reconnect")
+                    log("warn", "Coinbase WS connection closed — reconnecting in 5s")
                 except WSClientException as e:
-                    log("warn", f"Coinbase WS error: {e}")
-            except Exception as e:
-                log("error", f"Coinbase WS connection failed: {e}")
-            finally:
+                    log("warn", f"Coinbase WS error: {e} — reconnecting in 5s")
+                except Exception as e:
+                    log("error", f"Coinbase WS connection failed: {e} — reconnecting in 5s")
+
                 self._status = "disconnected"
-                self._schedule_reconnect()
+                if self._stop_event.is_set():
+                    break
+
+                # Wait before reconnecting, but check stop event
+                if self._stop_event.wait(timeout=5):
+                    break
+
+                # Create a fresh client for reconnection
+                try:
+                    if api_key and api_secret:
+                        self._client = WSClient(
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            on_message=self._on_message,
+                            on_close=self._on_close,
+                            retry=False,
+                        )
+                    else:
+                        self._client = WSClient(
+                            on_message=self._on_message,
+                            on_close=self._on_close,
+                            retry=False,
+                        )
+                except Exception as e:
+                    log("error", f"Failed to create WS client: {e}")
+                    if self._stop_event.wait(timeout=10):
+                        break
 
         self._thread = threading.Thread(target=_run, daemon=True, name="coinbase-ws")
         self._thread.start()
@@ -135,7 +174,13 @@ class CoinbaseWebSocket:
                     symbol = product_id.replace("-USD", "")
                     try:
                         price = float(t["price"])
-                        volume = float(t.get("volume_24_h", 0))
+                        # Use per-tick volume if available, fallback to 24h volume
+                        # Coinbase ticker provides volume_24_h (cumulative) — not per-tick
+                        # Use the difference from last known 24h volume as proxy for tick volume
+                        raw_vol_24h = float(t.get("volume_24_h", 0))
+                        last_vol = self._last_vol_24h.get(symbol, raw_vol_24h)
+                        volume = max(0, raw_vol_24h - last_vol) if last_vol > 0 else 0
+                        self._last_vol_24h[symbol] = raw_vol_24h
                         if price > 0:
                             self.on_tick(symbol, price, volume)
                             self._tick_count += 1
@@ -182,18 +227,10 @@ class CoinbaseWebSocket:
                 self.on_book(symbol, bids, asks)
 
     def _on_close(self) -> None:
+        was_connected = self._status == "connected"
         self._status = "disconnected"
-        log("warn", "Coinbase WS disconnected")
-
-    def _schedule_reconnect(self) -> None:
-        """Reconnect after a brief delay."""
-        def _reconnect():
-            time.sleep(5)
-            if self._status == "disconnected":
-                log("info", "Coinbase WS reconnecting...")
-                self.connect()
-        t = threading.Thread(target=_reconnect, daemon=True)
-        t.start()
+        if was_connected:
+            log("warn", "WebSocket disconnected — reconnecting")
 
     def check_health(self, max_silence_s: float = 30.0) -> bool:
         """Check if WS is receiving ticks. Force-reconnect if stale."""
@@ -214,13 +251,12 @@ class CoinbaseWebSocket:
                 self._client.close()
             except Exception:
                 pass
-        self._client = None
+        # The _run loop will detect the disconnection and reconnect automatically
         self._tick_count = 0
         self._last_tick_time = time.time()
-        time.sleep(1)
-        self.connect()
 
     def disconnect(self) -> None:
+        self._stop_event.set()
         if self._client:
             try:
                 self._client.close()

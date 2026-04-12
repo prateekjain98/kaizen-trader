@@ -73,10 +73,10 @@ def scan_fear_greed_contrarian(
             del _close_cooldown[s]
 
     # Extreme Fear: contrarian long
-    # Backtest finding: FGI≤15 works, FGI≤20 produces too many weak signals
-    # Raised base score to 68 to survive self-healing min_qual_score raises
-    if fgi <= 15:
-        extremeness = min(20, (15 - fgi) * 3)
+    # FGI≤20 = extreme fear zone — this is the strategy's core use case
+    # Score scales with extremeness so weaker signals (16-20) get lower scores
+    if fgi <= 20:
+        extremeness = min(20, (20 - fgi) * 2)
         momentum_bonus = 10 if delta < -5 else 0
         score = min(88, 68 + extremeness + momentum_bonus)
         return TradeSignal(
