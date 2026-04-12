@@ -38,15 +38,24 @@ from src.indicators.core import compute_rsi, compute_atr, compute_ema, compute_b
 # ---------------------------------------------------------------------------
 
 DEFAULT_SYMBOLS = [
-    # 65 symbols with verified data from early 2020
-    "BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "LINK", "LTC", "ETC",
-    "ATOM", "XLM", "TRX", "XTZ", "EOS", "NEO", "DASH", "ZEC", "QTUM",
-    "VET", "IOTA", "ONT", "ICX", "ZIL", "BAT", "ENJ", "THETA", "HBAR",
-    "ONE", "HOT", "CHZ", "IOST", "KAVA", "BAND", "RVN", "STX", "FET",
-    "COMP", "KNC", "BNT", "RLC", "ANKR", "ARPA", "CELR", "CHR", "COS",
-    "COTI", "CTSI", "CVC", "DENT", "DUSK", "FUN", "HIVE", "IOTX",
-    "LSK", "MBL", "MDT", "MTL", "OGN", "ONG", "TFUEL", "WAN", "WIN",
-    "ZRX", "ALGO", "MATIC", "ARDR",
+    # Tier 1: Top 30 by market cap (all have data from 2020+)
+    "BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "SOL", "DOT", "LINK",
+    "LTC", "AVAX", "UNI", "ATOM", "ETC", "XLM", "TRX", "ALGO", "MATIC",
+    "FIL", "AAVE", "EOS", "XTZ", "THETA", "VET", "NEO", "DASH", "ZEC",
+    "COMP", "SNX", "MKR",
+    # Tier 2: Mid-cap alts with 2020+ data
+    "SUSHI", "YFI", "CRV", "BAL", "KNC", "REN", "BAND", "KAVA", "QTUM",
+    "ZIL", "BAT", "ENJ", "HBAR", "ONE", "HOT", "CHZ", "IOST", "ONT",
+    "ICX", "IOTA", "ZRX", "RVN", "STX", "FET", "ANKR", "CELR", "CHR",
+    "COTI", "CTSI", "CVC", "DENT", "DUSK", "FUN", "IOTX", "MTL", "OGN",
+    "RLC", "ARPA", "BNT", "LSK",
+    # Tier 3: Newer listings with 2021+ data
+    "NEAR", "FTM", "SAND", "MANA", "AXS", "GALA", "IMX", "LDO", "APE",
+    "OP", "ARB", "SUI", "APT", "SEI", "INJ", "TIA", "BONK", "WIF",
+    "PEPE", "FLOKI", "ORDI", "RENDER", "PENDLE", "JUP", "WLD", "STRK",
+    "ONDO", "DYDX", "GMX", "GRT", "ROSE", "FLOW",
+    # Tier 4: Additional small caps
+    "COS", "ONG", "TFUEL", "WAN", "WIN", "HIVE", "MBL", "MDT", "ARDR",
 ]
 DEFAULT_START = "2020-01-01"
 DEFAULT_END = "2025-03-31"
@@ -495,11 +504,11 @@ class StrategySimulator:
     def _kelly_size(self, qual_score: float) -> float:
         if self.balance < 50:
             return 0
-        fraction = 0.15  # 15% of balance per trade
+        fraction = 0.25  # 25% of balance — matches combined mode
         qual_mult = 0.5 + (qual_score / 100)
         raw = fraction * self.balance * qual_mult
-        # Cap at 25% of balance
-        max_position = self.balance * 0.25
+        # Cap at 40% of balance per position
+        max_position = self.balance * 0.40
         return max(10, min(raw, max_position))
 
     def _check_cooldown(self, symbol: str, now_ms: float) -> bool:
@@ -2056,13 +2065,38 @@ class SystematicBacktester:
             print(f"  Loading exchange listing dates...")
             all_listings = load_exchange_listings(symbols=self.symbols)
             events = get_listing_events_in_range(all_listings, self.start_ms, self.end_ms)
+
+            # Collect ALL listed symbols and dynamically load their kline data
+            listed_syms: set[str] = set()
             for evt in events:
                 sym = evt["symbol"]
-                if sym in symbol_candles or sym in self.symbols:
-                    # Keep earliest listing per symbol
-                    if sym not in sim.listing_events or evt["listing_date_ms"] < sim.listing_events[sym]:
-                        sim.listing_events[sym] = evt["listing_date_ms"]
-            print(f"  Listing events loaded: {len(sim.listing_events)} symbols in range")
+                # Normalize Binance Futures 1000x prefix (e.g. 1000PEPE -> PEPE)
+                if sym.startswith("1000"):
+                    sym = sym[4:]
+                if sym.startswith("1000000"):
+                    sym = sym[7:]
+                if sym not in sim.listing_events or evt["listing_date_ms"] < sim.listing_events.get(sym, float("inf")):
+                    sim.listing_events[sym] = evt["listing_date_ms"]
+                listed_syms.add(sym)
+
+            # Download kline data for listed symbols not already loaded
+            new_syms = listed_syms - set(symbol_candles.keys())
+            if new_syms:
+                print(f"  Downloading klines for {len(new_syms)} newly-listed symbols...")
+                loaded_count = 0
+                for i, sym in enumerate(sorted(new_syms)):
+                    try:
+                        candles = load_klines(sym, "1h", self.start_ms, self.end_ms)
+                        if candles:
+                            symbol_candles[sym] = candles
+                            loaded_count += 1
+                    except Exception:
+                        pass
+                    if (i + 1) % 25 == 0:
+                        print(f"    {i+1}/{len(new_syms)} probed ({loaded_count} loaded)...")
+                print(f"  Loaded klines for {loaded_count}/{len(new_syms)} new symbols")
+
+            print(f"  Listing events: {len(sim.listing_events)} symbols in backtest range")
 
         # Build unified timeline
         all_timestamps: set[int] = set()
@@ -2313,35 +2347,53 @@ class SystematicBacktester:
                 last_new = changes[-1]["new"]
                 print(f"  {key}: {first_old:.4f} -> {last_new:.4f} ({len(changes)} adjustments)")
 
-        # Overall
-        total_trades = sum(r.total_trades for r in self.results)
-        total_pnl = sum(r.total_pnl_usd for r in self.results)
-        total_wins = sum(r.wins for r in self.results)
-        print(f"\nOverall: {total_trades} trades, ${total_pnl:,.2f} PnL, "
-              f"{total_wins/max(1,total_trades)*100:.1f}% win rate")
-        print(f"Starting balance: ${DEFAULT_BALANCE:,.0f} → Final: ${DEFAULT_BALANCE + total_pnl:,.0f} "
-              f"({total_pnl/DEFAULT_BALANCE*100:.0f}% return)")
-
-        # Yearly breakdown
-        all_closed = []
-        for r in self.results:
-            # We don't have direct access to closed positions in result,
-            # but we can approximate from loss_analyses timestamps
-            pass
-
-        # Annualized return
+        # CAGR calculation
         try:
             start_dt = datetime.datetime.strptime(self.start_date, "%Y-%m-%d")
             end_dt = datetime.datetime.strptime(self.end_date, "%Y-%m-%d")
             years = max(0.1, (end_dt - start_dt).days / 365.25)
-            if total_pnl > 0:
-                total_return = (DEFAULT_BALANCE + total_pnl) / DEFAULT_BALANCE
-                annualized = (total_return ** (1 / years) - 1) * 100
-                print(f"Annualized return: {annualized:.1f}% over {years:.1f} years")
-            else:
-                print(f"Annualized return: negative over {years:.1f} years")
         except Exception:
-            pass
+            years = 1.0
+
+        # Per-strategy CAGR
+        print(f"\n{'='*80}")
+        print(f"PER-STRATEGY CAGR ({years:.1f} years, {self.start_date} to {self.end_date})")
+        print(f"{'='*80}")
+        print(f"{'Strategy':35s} {'Trades':>7s} {'Win%':>6s} {'Final Balance':>15s} {'Total Return':>13s} {'CAGR':>10s}")
+        print(f"{'-'*86}")
+
+        for r in sorted(active, key=lambda x: -x.total_pnl_usd):
+            final = DEFAULT_BALANCE + r.total_pnl_usd
+            total_return_pct = (r.total_pnl_usd / DEFAULT_BALANCE) * 100
+            if final > 0 and final > DEFAULT_BALANCE:
+                cagr = ((final / DEFAULT_BALANCE) ** (1 / years) - 1) * 100
+                cagr_str = f"{cagr:,.1f}%"
+            elif final > 0:
+                cagr = -((DEFAULT_BALANCE / final) ** (1 / years) - 1) * 100
+                cagr_str = f"{cagr:,.1f}%"
+            else:
+                cagr_str = "BANKRUPT"
+            wr = (r.wins / r.total_trades * 100) if r.total_trades > 0 else 0
+            print(f"{r.strategy:35s} {r.total_trades:7d} {wr:5.1f}% ${final:>14,.2f} {total_return_pct:>+12,.1f}% {cagr_str:>10s}")
+
+        # Overall
+        total_trades = sum(r.total_trades for r in self.results)
+        total_pnl = sum(r.total_pnl_usd for r in self.results)
+        total_wins = sum(r.wins for r in self.results)
+        overall_final = DEFAULT_BALANCE + total_pnl
+        overall_return = (total_pnl / DEFAULT_BALANCE) * 100
+
+        print(f"{'-'*86}")
+        print(f"{'OVERALL (sum of isolated)':35s} {total_trades:7d} {total_wins/max(1,total_trades)*100:5.1f}% ${overall_final:>14,.2f} {overall_return:>+12,.1f}%")
+
+        if overall_final > DEFAULT_BALANCE:
+            overall_cagr = ((overall_final / DEFAULT_BALANCE) ** (1 / years) - 1) * 100
+            print(f"\nOverall CAGR: {overall_cagr:,.1f}% over {years:.1f} years")
+        else:
+            print(f"\nOverall CAGR: negative over {years:.1f} years")
+
+        print(f"Starting balance: ${DEFAULT_BALANCE:,.0f} per strategy (isolated mode)")
+        print(f"Symbols loaded: {len([s for s in self.symbols])}")
 
 
 # ---------------------------------------------------------------------------
