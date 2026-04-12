@@ -30,6 +30,7 @@ from src.config import CONFIG_BOUNDS, default_scanner_config
 from src.backtesting.data_loader import load_klines, load_futures_klines
 from src.backtesting.funding_loader import load_funding_rates
 from src.backtesting.oi_loader import load_open_interest
+from src.backtesting.listing_loader import load_exchange_listings, get_listing_events_in_range
 from src.indicators.core import compute_rsi, compute_atr, compute_ema, compute_bollinger_bands, compute_adx, compute_macd, compute_obv, OHLCV
 
 # ---------------------------------------------------------------------------
@@ -1605,31 +1606,77 @@ class WhaleTrackerSimulator(StrategySimulator):
 
 
 class ListingPumpSimulator(StrategySimulator):
-    """Detects listing-like events from klines: sudden massive volume + price spike
-    on a token that previously had very low volume, mimicking a new exchange listing."""
+    """Detects exchange listing events using REAL listing dates from Binance Futures
+    exchangeInfo onboardDate + volume/price confirmation from klines.
+
+    Two modes:
+    1. Real listing events: uses listing_events data (symbol -> listing_date_ms)
+       Fires signal within 6h AFTER the listing date when volume confirms
+    2. Fallback: original volume explosion + price spike heuristic
+    """
     strategy_id = "listing_pump"
     tier = "swing"
+
+    _LISTING_WINDOW_MS = 6 * 3_600_000  # 6h window after listing to enter
 
     def __init__(self):
         super().__init__()
         self._signaled: set[str] = set()  # only one listing signal per symbol
+        self.listing_events: dict[str, int] = {}  # symbol -> listing_date_ms
 
     def required_candles(self):
         return 24
 
     def data_feeds(self):
-        return ["klines"]
+        return ["klines", "listings"]
 
     def scan(self, symbol, candles, config, ctx, now_ms):
         # Only signal once per symbol (listings are one-time events)
         if symbol in self._signaled:
             return None
+        if len(candles) < 6:
+            return None
+
+        price = candles[-1]["close"]
+
+        # --- Mode 1: Real listing event data ---
+        listing_ms = self.listing_events.get(symbol)
+        if listing_ms:
+            age_ms = now_ms - listing_ms
+            # Signal within 6h window after listing
+            if 0 <= age_ms <= self._LISTING_WINDOW_MS:
+                # Confirm with volume: need at least 3x normal volume
+                if len(candles) >= 12:
+                    baseline = candles[:-6]
+                    recent = candles[-6:]
+                    baseline_vol = sum(c["volume"] for c in baseline) / len(baseline) if baseline else 0
+                    recent_vol = sum(c["volume"] for c in recent) / len(recent) if recent else 0
+                    vol_ratio = recent_vol / baseline_vol if baseline_vol > 0 else 10.0
+                else:
+                    vol_ratio = 5.0  # assume high volume near listing
+
+                if vol_ratio >= 2.0:
+                    self._signaled.add(symbol)
+                    freshness_bonus = max(0, 15 - int(age_ms / 60_000 / 60))  # hours since listing
+                    vol_score = min(20, vol_ratio * 3)
+                    score = min(95, 55 + freshness_bonus + vol_score)
+
+                    return TradeSignal(
+                        id=str(uuid.uuid4()), symbol=symbol, product_id=f"{symbol}-USD",
+                        strategy="listing_pump", side="long", tier="swing",
+                        score=score, confidence="high" if score > 80 else "medium",
+                        sources=["listing_detector"],
+                        reasoning=f"{symbol} Binance listing {int(age_ms/3_600_000)}h ago, {vol_ratio:.1f}x vol",
+                        entry_price=price, stop_price=price * 0.85,
+                        target_price=price * 1.20,
+                        suggested_size_usd=120, expires_at=now_ms + self._LISTING_WINDOW_MS, created_at=now_ms,
+                    )
+            return None  # outside window
+
+        # --- Mode 2: Fallback — volume explosion heuristic ---
         if len(candles) < 24:
             return None
 
-        # Detect listing-like pattern:
-        # 1. First 12 candles = "baseline" (low volume or just appeared)
-        # 2. Recent 6 candles = massive volume spike + strong price move
         baseline = candles[-24:-6]
         recent = candles[-6:]
 
@@ -1952,7 +1999,7 @@ class SystematicBacktester:
 
         # Check if strategy can be meaningfully backtested
         # Allow feeds we can load: klines, btc_klines, funding, oi, futures_klines
-        _LOADABLE_FEEDS = {"klines", "btc_klines", "funding", "oi", "futures_klines"}
+        _LOADABLE_FEEDS = {"klines", "btc_klines", "funding", "oi", "futures_klines", "listings"}
         feeds = sim.data_feeds()
         unloadable = [f for f in feeds if f not in _LOADABLE_FEEDS]
         if unloadable:
@@ -2004,6 +2051,18 @@ class SystematicBacktester:
                 except Exception as e:
                     print(f"    {sym}: futures kline error: {e}")
             print(f"  Futures data loaded for {len(sim.futures_candles)} symbols")
+
+        if "listings" in feeds and hasattr(sim, "listing_events"):
+            print(f"  Loading exchange listing dates...")
+            all_listings = load_exchange_listings(symbols=self.symbols)
+            events = get_listing_events_in_range(all_listings, self.start_ms, self.end_ms)
+            for evt in events:
+                sym = evt["symbol"]
+                if sym in symbol_candles or sym in self.symbols:
+                    # Keep earliest listing per symbol
+                    if sym not in sim.listing_events or evt["listing_date_ms"] < sim.listing_events[sym]:
+                        sim.listing_events[sym] = evt["listing_date_ms"]
+            print(f"  Listing events loaded: {len(sim.listing_events)} symbols in range")
 
         # Build unified timeline
         all_timestamps: set[int] = set()
