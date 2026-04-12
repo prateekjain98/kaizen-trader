@@ -133,25 +133,25 @@ class TradeDiagnosis:
 
 @dataclass
 class ScannerConfig:
-    momentum_pct_swing: float = 0.02
-    momentum_pct_scalp: float = 0.025
-    volume_multiplier_swing: float = 2.0
+    momentum_pct_swing: float = 0.03  # Raised from 0.02; backtest self-healer kept raising to 0.04
+    momentum_pct_scalp: float = 0.035  # Raised from 0.025; backtest: 10 entered_pump_top at lower threshold
+    volume_multiplier_swing: float = 2.5  # Raised from 2.0; require stronger volume confirmation
     volume_multiplier_scalp: float = 2.5
     lookback_ms_swing: float = 3_600_000
     lookback_ms_scalp: float = 300_000
     cooldown_ms_swing: float = 43_200_000
     cooldown_ms_scalp: float = 1_200_000
-    vwap_deviation_pct: float = 0.03
+    vwap_deviation_pct: float = 0.04  # Raised from 0.03; small deviations don't revert reliably
     rsi_oversold: float = 30
     rsi_overbought: float = 70
-    min_qual_score_swing: float = 55
-    min_qual_score_scalp: float = 45
+    min_qual_score_swing: float = 65  # Raised from 55; too many marginal signals were passing
+    min_qual_score_scalp: float = 55  # Raised from 45
     base_trail_pct_swing: float = 0.07
     base_trail_pct_scalp: float = 0.04
     max_trail_pct: float = 0.20
     max_hold_ms_swing: float = 43_200_000
     max_hold_ms_scalp: float = 7_200_000
-    funding_rate_extreme_threshold: float = 0.001
+    funding_rate_extreme_threshold: float = 0.002  # Raised from 0.001; with 3x multiplier = 0.006 effective
     narrative_velocity_threshold: float = 3.0
     max_watchlist: float = 50
 

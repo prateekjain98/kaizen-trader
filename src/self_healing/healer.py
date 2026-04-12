@@ -8,6 +8,7 @@ from src.config import CONFIG_BOUNDS
 from src.self_healing.blind_spots import get_detector
 from src.self_healing.delta_evaluator import get_evaluator
 from src.storage.database import insert_diagnosis, snapshot_config, log
+from typing import Optional
 from src.types import Position, ScannerConfig, TradeDiagnosis
 
 _MAX_ADAPTATIONS_PER_SESSION = 20
@@ -25,7 +26,7 @@ def _adjust(config: ScannerConfig, key: str, delta: float) -> None:
     setattr(config, key, _clamp(current + delta, key))
 
 
-def _classify_loss_reason(p: Position) -> str:
+def _classify_loss_reason(p: Position, config: Optional["ScannerConfig"] = None) -> str:
     # Skip diagnosis if position was never properly closed
     if p.closed_at is None:
         return "unknown"
@@ -37,13 +38,19 @@ def _classify_loss_reason(p: Position) -> str:
     # which tracks worst price during hold and gives false "pump top" diagnoses
     momentum_at_entry = getattr(p, "momentum_at_entry", 0.0) or 0.0
 
-    if momentum_at_entry > 0.08 and hold_hours < 4:
-        return "entered_pump_top"
+    # Priority: check stop_too_tight BEFORE pump_top — short holds with stop exits
+    # are definitively stop-related, while momentum_at_entry can be a coincidence
     if hold_hours < 2 and p.exit_reason == "trailing_stop":
         return "stop_too_tight"
+    if momentum_at_entry > 0.08 and hold_hours < 4:
+        return "entered_pump_top"
     if hold_hours > 20 and pnl_pct < -0.05:
         return "stop_too_wide"
-    if p.qual_score < 55:
+    # Use config-aware threshold instead of hardcoded 55
+    min_qual = 55
+    if config:
+        min_qual = config.min_qual_score_scalp if p.tier == "scalp" else config.min_qual_score_swing
+    if p.qual_score < min_qual:
         return "low_qual_score"
     if p.strategy == "funding_extreme":
         return "funding_squeeze"
@@ -103,11 +110,12 @@ def _apply_loss_adaptation(p: Position, reason: str, config: ScannerConfig) -> d
 
     elif reason == "funding_squeeze":
         old_val = config.funding_rate_extreme_threshold
-        _adjust(config, "funding_rate_extreme_threshold", -0.0001)
+        # RAISE threshold to require stronger funding extremes (was -0.0001, which made it worse)
+        _adjust(config, "funding_rate_extreme_threshold", +0.0002)
         new_val = config.funding_rate_extreme_threshold
         old_values["funding_rate_extreme_threshold"] = old_val
         changes["funding_rate_extreme_threshold"] = new_val
-        action = f"lower funding threshold {old_val*100:.3f}% -> {new_val*100:.3f}%"
+        action = f"raise funding threshold {old_val*100:.3f}% -> {new_val*100:.3f}%"
 
     else:
         action = "no change — unknown loss reason"
@@ -132,7 +140,7 @@ def on_position_closed(p: Position, config: ScannerConfig, market_phase: str) ->
             return
         _adaptation_count += 1
 
-    loss_reason = _classify_loss_reason(p)
+    loss_reason = _classify_loss_reason(p, config)
     hold_ms = (p.closed_at or time.time() * 1000) - p.opened_at
     result = _apply_loss_adaptation(p, loss_reason, config)
 

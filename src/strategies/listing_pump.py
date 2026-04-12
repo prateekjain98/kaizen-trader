@@ -22,7 +22,7 @@ class ListingAnnouncement:
 _seen_listings: set[str] = set()
 _listing_timestamps: dict[str, float] = {}
 _lock = threading.Lock()
-_LISTING_EXPIRY_MS = 48 * 3_600_000
+_LISTING_EXPIRY_MS = 6 * 3_600_000  # 6 hours — listing pumps exhaust quickly
 _last_cleanup: float = 0
 
 STRATEGY_META = {
@@ -79,6 +79,7 @@ def on_listing_announcement(listing: ListingAnnouncement, current_price: float) 
         reasoning=f"{listing.symbol} new {listing.exchange} listing {int(age_ms/60_000)}m ago"
                   + (" (first major exchange)" if listing.is_new_to_major_exchanges else ""),
         entry_price=current_price, stop_price=current_price * 0.85,
+        target_price=current_price * 1.20,  # R:R fix: 20% target vs 15% stop = 1.33:1
         suggested_size_usd=120,
         expires_at=now + _LISTING_EXPIRY_MS, created_at=now,
     )

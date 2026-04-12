@@ -104,7 +104,11 @@ def scan_orderbook_imbalance(
     if total_depth < 500_000:
         return None
 
-    imbalance_ratio = bid_depth / (ask_depth + 1)
+    # Require minimum depth on both sides to avoid false signals from empty books
+    if bid_depth < 50_000 or ask_depth < 50_000:
+        return None
+
+    imbalance_ratio = bid_depth / ask_depth
 
     # Bid wall support
     if imbalance_ratio > 3.0 and bid_depth > 2_000_000:
@@ -118,6 +122,7 @@ def scan_orderbook_imbalance(
                 confidence="low", sources=["orderbook"],
                 reasoning=f"{symbol} bid/ask ratio {imbalance_ratio:.1f}x within 1%, ${bid_depth/1e6:.1f}M bid wall",
                 entry_price=current_price, stop_price=current_price * 0.98,
+                target_price=current_price * 1.03,  # R:R fix: 3% target vs 2% stop = 1.5:1
                 suggested_size_usd=40,
                 expires_at=now + 300_000, created_at=now,
             )
@@ -134,6 +139,7 @@ def scan_orderbook_imbalance(
                 confidence="low", sources=["orderbook"],
                 reasoning=f"{symbol} ask/bid ratio {1/max(imbalance_ratio, 0.001):.1f}x within 1%, ${ask_depth/1e6:.1f}M ask wall",
                 entry_price=current_price, stop_price=current_price * 1.02,
+                target_price=current_price * 0.97,  # R:R fix: 3% target vs 2% stop = 1.5:1
                 suggested_size_usd=35,
                 expires_at=now + 300_000, created_at=now,
             )

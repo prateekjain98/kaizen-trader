@@ -129,12 +129,21 @@ def scan_momentum(
     # Swing tier — use volatility-adjusted threshold
     swing = _compute_momentum(swing_samples)
     adj_threshold_swing = _vol_adjusted_threshold(symbol, config.momentum_pct_swing, current_price)
-    adj_threshold_swing = max(0.015, adj_threshold_swing)
+    adj_threshold_swing = max(0.02, adj_threshold_swing)
     if swing and swing["pct"] >= adj_threshold_swing:
+        # Backtest fix: reject pump tops — moves >8% in 1h are usually exhausted
+        if swing["pct"] > 0.08:
+            return None
+        # Backtest fix: skip longs during extreme_fear and bear phases
+        # (44 low_volatility_chop + 38 adverse_move losses in bear/fear markets)
+        if ctx.phase in ("extreme_fear", "bear"):
+            return None
         volume_ok = swing["current_volume"] >= swing["avg_volume"] * config.volume_multiplier_swing
         if volume_ok:
             market_bonus = 5 if ctx.phase == "bull" else (-15 if ctx.phase == "bear" else 0)
-            score = min(95, 55 + swing["pct"] * 200 + market_bonus)
+            # Clip momentum pct to avoid all extreme moves scoring identically
+            clipped_pct = min(swing["pct"], 0.15)
+            score = min(95, 55 + clipped_pct * 200 + market_bonus)
             if score >= config.min_qual_score_swing:
                 _set_cooldown(symbol, config.cooldown_ms_swing)
                 return TradeSignal(
@@ -145,7 +154,9 @@ def scan_momentum(
                     sources=["price_action"],
                     reasoning=f"{symbol} +{swing['pct']*100:.1f}% in 1h with {swing['current_volume']/swing['avg_volume']:.1f}x volume spike",
                     entry_price=current_price,
+                    # Target = 1.5x stop distance — realistic for 1h momentum
                     stop_price=current_price * (1 - config.base_trail_pct_swing),
+                    target_price=current_price * (1 + config.base_trail_pct_swing * 1.5),
                     suggested_size_usd=100,
                     expires_at=now + 300_000, created_at=now,
                 )
@@ -153,19 +164,22 @@ def scan_momentum(
     # Scalp tier — use volatility-adjusted threshold
     scalp = _compute_momentum(scalp_samples)
     adj_threshold_scalp = _vol_adjusted_threshold(symbol, config.momentum_pct_scalp, current_price)
-    adj_threshold_scalp = max(0.008, adj_threshold_scalp)
+    adj_threshold_scalp = max(0.015, adj_threshold_scalp)
     if scalp and scalp["pct"] >= adj_threshold_scalp:
         volume_ok = scalp["current_volume"] >= scalp["avg_volume"] * config.volume_multiplier_scalp
         recent_2m = [s for s in scalp_samples if s.ts >= now - 120_000]
         freshness_pct = (
             (recent_2m[-1].price - recent_2m[0].price) / recent_2m[0].price
-            if len(recent_2m) > 0 and recent_2m[0].price > 0
+            if len(recent_2m) >= 2 and recent_2m[0].price > 0
             else 0
         )
-        fresh_enough = (freshness_pct / scalp["pct"] >= 0.4) if scalp["pct"] > 0 else False
+        # Check the move is accelerating: recent 2m contributes >40% of 5m move
+        # AND the recent move is positive (still going up, not reversing)
+        fresh_enough = (freshness_pct > 0 and freshness_pct / scalp["pct"] >= 0.4) if scalp["pct"] > 0 else False
 
         if volume_ok and fresh_enough:
-            score = min(90, 50 + scalp["pct"] * 150)
+            clipped_pct_s = min(scalp["pct"], 0.10)
+            score = min(90, 50 + clipped_pct_s * 150)
             if score >= config.min_qual_score_scalp:
                 _set_cooldown(symbol, config.cooldown_ms_scalp)
                 return TradeSignal(
@@ -177,6 +191,7 @@ def scan_momentum(
                     reasoning=f"{symbol} +{scalp['pct']*100:.1f}% in 5m with {scalp['current_volume']/scalp['avg_volume']:.1f}x volume, fresh move",
                     entry_price=current_price,
                     stop_price=current_price * (1 - config.base_trail_pct_scalp),
+                    target_price=current_price * (1 + config.base_trail_pct_scalp * 1.5),
                     suggested_size_usd=40,
                     expires_at=now + 60_000, created_at=now,
                 )

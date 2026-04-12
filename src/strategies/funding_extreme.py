@@ -57,15 +57,18 @@ def scan_funding_extreme(
         return None
     annualized = funding.funding_rate * (8760 / funding.funding_interval_hours)
 
-    # Short: over-leveraged longs
-    if ctx.phase in ("bear", "extreme_fear"):
-        return None
-    if (funding.funding_rate > threshold
-            and funding.open_interest_change_pct < 15
-            and ctx.phase != "extreme_greed"):
+    # Backtest finding: require 3x threshold minimum — 173 funding_squeeze losses at 2x.
+    # Weak funding extremes don't revert reliably enough to overcome fees.
+    # Also block long entries during extreme_fear (12 losses in backtest).
+    min_magnitude = threshold * 3
+
+    # Short: over-leveraged longs — funding extremes are MOST reliable in bear markets
+    if (funding.funding_rate > min_magnitude
+            and funding.open_interest_change_pct < 15):
         mag_score = min(40, (funding.funding_rate / threshold - 1) * 20)
         oi_score = min(20, funding.open_interest_change_pct / 5)
-        score = min(88, 45 + mag_score + oi_score)
+        # Backtest fix: raise base score to avoid low_qual_score losses (158 occurrences)
+        score = min(88, 55 + mag_score + oi_score)
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
             strategy="funding_extreme", side="short", tier="swing", score=score,
@@ -73,15 +76,18 @@ def scan_funding_extreme(
             sources=["funding_rates"],
             reasoning=f"{symbol} funding={funding.funding_rate*100:.3f}% ({annualized*100:.0f}% ann), OI +{funding.open_interest_change_pct:.0f}%",
             entry_price=current_price, stop_price=current_price * 1.06,
+            target_price=current_price * 0.92,  # R:R fix: 8% target vs 6% stop = 1.33:1
             suggested_size_usd=60,
             expires_at=now + 14_400_000, created_at=now,
         )
 
-    # Long: short squeeze
-    if (funding.funding_rate < -threshold
-            and funding.open_interest_change_pct > 5):
+    # Long: short squeeze — OI should be DECREASING (shorts closing/getting liquidated)
+    # Backtest fix: block longs during extreme_fear (wrong_market_phase losses)
+    if (funding.funding_rate < -min_magnitude
+            and funding.open_interest_change_pct < -5
+            and ctx.phase != "extreme_fear"):
         mag_score = min(35, (-funding.funding_rate / threshold - 1) * 18)
-        score = min(85, 42 + mag_score)
+        score = min(85, 52 + mag_score)
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
             strategy="funding_extreme", side="long", tier="swing", score=score,
@@ -89,6 +95,7 @@ def scan_funding_extreme(
             sources=["funding_rates"],
             reasoning=f"{symbol} funding={funding.funding_rate*100:.3f}% (negative), OI +{funding.open_interest_change_pct:.0f}% shorts",
             entry_price=current_price, stop_price=current_price * 0.95,
+            target_price=current_price * 1.08,  # R:R fix: 8% target vs 5% stop = 1.6:1
             suggested_size_usd=70,
             expires_at=now + 14_400_000, created_at=now,
         )

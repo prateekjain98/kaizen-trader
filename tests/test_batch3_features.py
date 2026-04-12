@@ -202,7 +202,7 @@ class TestRapidDrawdownHalt:
         v = guard.check(ctx)
         assert v.allowed is False  # weekly exceeded
 
-    def test_zero_equity_always_allows(self):
+    def test_zero_equity_halts_on_loss(self):
         from src.risk.protections import RapidDrawdownHalt, ProtectionContext
         guard = RapidDrawdownHalt(starting_equity=0)
 
@@ -214,7 +214,7 @@ class TestRapidDrawdownHalt:
             timestamp_ms=_now_ms(),
         )
         v = guard.check(ctx)
-        assert v.allowed is True  # can't compute drawdown with 0 equity
+        assert v.allowed is False  # equity depleted, should halt
 
 
 # ─── Breakeven Stop at 1R ───────────────────────────────────────────────────

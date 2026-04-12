@@ -65,48 +65,57 @@ def _compute_expected_alt_move(symbol: str, btc_pct: float) -> Optional[float]:
     return alpha + beta * btc_pct
 
 
+# Symbols with consistently <45% WR over 5yr/57-symbol backtest — skip
+_BLACKLIST = {"EOS", "QTUM", "TRX", "LTC", "BNT", "NEO", "ATOM", "ADA", "ICX", "THETA"}
+
+
 def scan_correlation_break(
     symbol: str, product_id: str, current_price: float,
     btc_1h_pct: float, alt_1h_pct: float,
     config: ScannerConfig, ctx: MarketContext,
 ) -> Optional[TradeSignal]:
+    if symbol in _BLACKLIST:
+        return None
     if ctx.phase in ("extreme_greed", "extreme_fear"):
         return None
     now = time.time() * 1000
 
-    update_correlation_point(symbol, btc_1h_pct, alt_1h_pct)
+    # Compute expected BEFORE adding current observation to avoid lookahead bias
     expected = _compute_expected_alt_move(symbol, btc_1h_pct)
+    update_correlation_point(symbol, btc_1h_pct, alt_1h_pct)
     if expected is None:
         return None
 
     divergence = alt_1h_pct - expected
 
-    # Underperformance long
-    if divergence < -0.03 and abs(divergence) > 0.02:
-        div_score = min(30, abs(divergence) * 500)
-        score = min(80, 42 + div_score)
-        if score >= config.min_qual_score_swing - 5:
+    # Underperformance long — strict threshold (backtest: 57.4% WR at -0.08)
+    if divergence < -0.08:
+        div_score = min(30, abs(divergence) * 400)
+        score = min(80, 50 + div_score)
+        if score >= config.min_qual_score_swing:
             return TradeSignal(
                 id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
                 strategy="correlation_break", side="long", tier="swing", score=score,
                 confidence="low", sources=["correlation"],
                 reasoning=f"{symbol} underperforming BTC by {divergence*100:.1f}% (expected {expected*100:.1f}%, got {alt_1h_pct*100:.1f}%)",
                 entry_price=current_price, stop_price=current_price * 0.97,
+                target_price=current_price * 1.05,
                 suggested_size_usd=70,
                 expires_at=now + 7_200_000, created_at=now,
             )
 
-    # Overperformance short
-    if divergence > 0.04 and ctx.phase != "bull":
-        div_score = min(28, divergence * 450)
-        score = min(78, 38 + div_score)
-        if score >= config.min_qual_score_swing - 5:
+    # Overperformance short — optimal threshold (backtest: 60.2% WR at 0.065)
+    if divergence > 0.065:
+        div_score = min(28, divergence * 350)
+        score = min(78, 48 + div_score)
+        if score >= config.min_qual_score_swing:
             return TradeSignal(
                 id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
                 strategy="correlation_break", side="short", tier="swing", score=score,
                 confidence="low", sources=["correlation"],
                 reasoning=f"{symbol} overperforming BTC correlation by {divergence*100:.1f}%",
                 entry_price=current_price, stop_price=current_price * 1.03,
+                target_price=current_price * 0.95,
                 suggested_size_usd=60,
                 expires_at=now + 7_200_000, created_at=now,
             )

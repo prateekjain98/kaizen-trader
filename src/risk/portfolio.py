@@ -159,12 +159,20 @@ def compute_max_drawdown() -> float:
         returns_snapshot = list(_daily_returns)
     if not returns_snapshot:
         return 0
-    peak = equity = max_dd = 0.0
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
     for r in returns_snapshot:
         equity += r
         if equity > peak:
             peak = equity
-        dd = (peak - equity) / peak if peak > 0 else 0
+        # Use absolute drawdown when peak is non-positive (early losses)
+        if peak > 0:
+            dd = (peak - equity) / peak
+        elif equity < 0:
+            dd = abs(equity) / max(1.0, abs(peak) + abs(equity))
+        else:
+            dd = 0.0
         if dd > max_dd:
             max_dd = dd
     return max_dd
