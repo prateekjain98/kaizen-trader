@@ -1223,17 +1223,16 @@ class FundingExtremeSimulator(StrategySimulator):
         if oi_change_pct is None:
             oi_change_pct = 0.0  # default if OI data unavailable
 
-        threshold = config.funding_rate_extreme_threshold
-        if threshold == 0:
-            return None
-
-        # Match production logic: require 3x threshold minimum
-        min_magnitude = threshold * 3
+        # Real funding rates are much smaller than the synthetic proxy used before.
+        # Typical extreme: 0.0005-0.001 per 8h period (0.05-0.1%).
+        # Use a fixed threshold calibrated to real data, not the config value
+        # which was tuned for the old synthetic (pct_change * 0.05) proxy.
+        min_magnitude = 0.0005  # 0.05% per period — top decile of funding rates
         price = candles[-1]["close"]
 
         # Short: over-leveraged longs — funding extreme + OI not spiking too much
         if funding_rate > min_magnitude and oi_change_pct < 15:
-            mag_score = min(40, (funding_rate / threshold - 1) * 20)
+            mag_score = min(40, (funding_rate / min_magnitude - 1) * 20)
             oi_score = min(20, oi_change_pct / 5) if oi_change_pct > 0 else 0
             score = min(88, 55 + mag_score + oi_score)
             self._set_cooldown(symbol, now_ms, config.cooldown_ms_swing)
@@ -1253,7 +1252,7 @@ class FundingExtremeSimulator(StrategySimulator):
         if (funding_rate < -min_magnitude
                 and oi_change_pct < -5
                 and ctx.phase != "extreme_fear"):
-            mag_score = min(35, (-funding_rate / threshold - 1) * 18)
+            mag_score = min(35, (-funding_rate / min_magnitude - 1) * 18)
             score = min(85, 52 + mag_score)
             self._set_cooldown(symbol, now_ms, config.cooldown_ms_swing)
             return TradeSignal(
@@ -1952,17 +1951,59 @@ class SystematicBacktester:
         sim = sim_class()
 
         # Check if strategy can be meaningfully backtested
+        # Allow feeds we can load: klines, btc_klines, funding, oi, futures_klines
+        _LOADABLE_FEEDS = {"klines", "btc_klines", "funding", "oi", "futures_klines"}
         feeds = sim.data_feeds()
-        if any(f not in ("klines", "btc_klines") for f in feeds):
-            if all(f not in ("klines", "btc_klines") for f in feeds):
-                print(f"  {strategy_id}: SKIPPED (requires {feeds} — not available in backtest)")
-                return StrategyBacktestResult(
-                    strategy=strategy_id, total_trades=0, wins=0, losses=0,
-                    win_rate=0, total_pnl_usd=0, max_drawdown_pct=0, avg_hold_hours=0,
-                    loss_analyses=[], parameter_changes=[],
-                    issues_found=[f"Cannot backtest: requires {feeds}"],
-                    data_quality_score=0, final_config=dataclasses.asdict(config),
-                )
+        unloadable = [f for f in feeds if f not in _LOADABLE_FEEDS]
+        if unloadable:
+            print(f"  {strategy_id}: SKIPPED (requires {unloadable} — not available in backtest)")
+            return StrategyBacktestResult(
+                strategy=strategy_id, total_trades=0, wins=0, losses=0,
+                win_rate=0, total_pnl_usd=0, max_drawdown_pct=0, avg_hold_hours=0,
+                loss_analyses=[], parameter_changes=[],
+                issues_found=[f"Cannot backtest: requires {unloadable}"],
+                data_quality_score=0, final_config=dataclasses.asdict(config),
+            )
+
+        # Load external data feeds if needed
+        if "funding" in feeds and hasattr(sim, "funding_data"):
+            print(f"  Loading funding rate data...")
+            for sym in self.symbols:
+                try:
+                    data = load_funding_rates(sym, self.start_ms, self.end_ms)
+                    if data:
+                        sim.funding_data[sym] = data
+                        if self.verbose:
+                            print(f"    {sym}: {len(data)} funding records")
+                except Exception as e:
+                    print(f"    {sym}: funding load error: {e}")
+            print(f"  Funding data loaded for {len(sim.funding_data)} symbols")
+
+        if "oi" in feeds and hasattr(sim, "oi_data"):
+            print(f"  Loading open interest data...")
+            for sym in self.symbols:
+                try:
+                    data = load_open_interest(sym, self.start_ms, self.end_ms)
+                    if data:
+                        sim.oi_data[sym] = data
+                        if self.verbose:
+                            print(f"    {sym}: {len(data)} OI records")
+                except Exception as e:
+                    print(f"    {sym}: OI load error: {e}")
+            print(f"  OI data loaded for {len(sim.oi_data)} symbols")
+
+        if "futures_klines" in feeds and hasattr(sim, "futures_candles"):
+            print(f"  Loading futures kline data...")
+            for sym in self.symbols:
+                try:
+                    data = load_futures_klines(sym, "1h", self.start_ms, self.end_ms)
+                    if data:
+                        sim.futures_candles[sym] = data
+                        if self.verbose:
+                            print(f"    {sym}: {len(data)} futures candles")
+                except Exception as e:
+                    print(f"    {sym}: futures kline error: {e}")
+            print(f"  Futures data loaded for {len(sim.futures_candles)} symbols")
 
         # Build unified timeline
         all_timestamps: set[int] = set()
