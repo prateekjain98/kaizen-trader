@@ -125,7 +125,8 @@ def _get_divergence_stats(symbol: str) -> Optional[dict]:
 
     # compute_zscore returns 0.0 for zero variance; also reject near-zero std
     avg_div = sum(divs) / len(divs)
-    std_div = (sum((d - avg_div) ** 2 for d in divs) / len(divs)) ** 0.5
+    # Use sample std (n-1) not population std (n) for small sample sizes
+    std_div = (sum((d - avg_div) ** 2 for d in divs) / (len(divs) - 1)) ** 0.5
     if std_div < 0.001:
         return None  # no variance = no signal
 
@@ -181,6 +182,11 @@ def scan_cross_exchange_divergence(
     if abs(current_div) < _MIN_DIVERGENCE_PCT:
         return None
 
+    # Backtest fix: skip signals in extreme market phases where divergence persists.
+    # 46 adverse_move + 35 low_volatility_chop losses in trending/extreme markets.
+    if ctx.phase in ("extreme_fear", "extreme_greed"):
+        return None
+
     # Coinbase significantly overpriced → SHORT (expect price to drop to Binance level)
     if z >= 2.5 and current_div > _MIN_DIVERGENCE_PCT:
         score = min(95, 50 + abs(z) * 6 + abs(current_div) * 10)
@@ -195,10 +201,10 @@ def scan_cross_exchange_divergence(
                 f"avg spread {stats['avg_div_pct']:.3f}% ± {stats['std_div_pct']:.3f}%"
             ),
             entry_price=current_price,
-            stop_price=current_price * 1.02,  # 2% stop — room for swing
+            stop_price=current_price * 1.008,  # R:R fix: 0.8% stop vs ~1% target — tight stop, rely on mean reversion
             target_price=snap.binance_price,
             suggested_size_usd=50,
-            expires_at=now + 3_600_000,  # 1h — larger dislocations take longer to resolve
+            expires_at=now + 3_600_000,
             created_at=now,
         )
 
@@ -216,7 +222,7 @@ def scan_cross_exchange_divergence(
                 f"avg spread {stats['avg_div_pct']:.3f}% ± {stats['std_div_pct']:.3f}%"
             ),
             entry_price=current_price,
-            stop_price=current_price * 0.98,  # 2% stop
+            stop_price=current_price * 0.992,  # R:R fix: 0.8% stop vs ~1% target — tight stop, rely on mean reversion
             target_price=snap.binance_price,
             suggested_size_usd=50,
             expires_at=now + 3_600_000,

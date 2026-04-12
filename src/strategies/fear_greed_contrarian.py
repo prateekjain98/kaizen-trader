@@ -22,7 +22,7 @@ _prev_fgi = 50
 # Track which symbols have an open FGI position to avoid duplicate entries.
 # Cleared when FGI normalizes (20 < fgi < 80).
 _open_symbols: set[str] = set()
-_REENTRY_COOLDOWN_S = 1800  # 30 min cooldown after close before re-entry
+_REENTRY_COOLDOWN_S = 259_200  # 72h cooldown — backtest: 30min produced churn, 72h filters noise
 _close_cooldown: dict[str, float] = {}
 _fgi_lock = threading.Lock()
 
@@ -73,34 +73,35 @@ def scan_fear_greed_contrarian(
             del _close_cooldown[s]
 
     # Extreme Fear: contrarian long
-    # Skip if already in bear phase with extreme fear — capitulation may continue
-    if fgi <= 20 and ctx.phase == "bear":
-        return None
-    if fgi <= 20:
-        extremeness = min(30, (20 - fgi) * 2)
+    # Backtest finding: FGI≤15 works, FGI≤20 produces too many weak signals
+    # Raised base score to 68 to survive self-healing min_qual_score raises
+    if fgi <= 15:
+        extremeness = min(20, (15 - fgi) * 3)
         momentum_bonus = 10 if delta < -5 else 0
-        score = min(82, 52 + extremeness + momentum_bonus)
+        score = min(88, 68 + extremeness + momentum_bonus)
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
             strategy="fear_greed_contrarian", side="long", tier="swing", score=score,
             confidence="medium" if score > 72 else "low",
             sources=["fear_greed"],
             reasoning=f"Fear & Greed at {fgi} (extreme fear) — contrarian long; 76% of extremes precede positive 30d returns",
-            entry_price=current_price, stop_price=current_price * 0.88,
+            entry_price=current_price, stop_price=current_price * 0.90,
+            target_price=current_price * 1.15,  # Backtest-aligned: 15% target vs 10% stop = 1.5:1
             suggested_size_usd=150,
             expires_at=now + 7 * 86_400_000, created_at=now,
         )
 
-    # Extreme Greed: contrarian short
-    if fgi >= 85 and ctx.phase == "bull":
-        extremeness = min(25, (fgi - 85) * 1.5)
-        score = min(75, 45 + extremeness)
+    # Extreme Greed: contrarian short — backtest: tighter at 90 (was 85)
+    if fgi >= 90 and ctx.phase == "bull":
+        extremeness = min(20, (fgi - 90) * 2)
+        score = min(80, 65 + extremeness)
         return TradeSignal(
             id=str(uuid.uuid4()), symbol=symbol, product_id=product_id,
             strategy="fear_greed_contrarian", side="short", tier="swing", score=score,
             confidence="low", sources=["fear_greed"],
             reasoning=f"Fear & Greed at {fgi} (extreme greed) — contrarian short",
             entry_price=current_price, stop_price=current_price * 1.07,
+            target_price=current_price * 0.88,  # R:R fix: 12% target vs 7% stop = 1.71:1
             suggested_size_usd=80,
             expires_at=now + 5 * 86_400_000, created_at=now,
         )

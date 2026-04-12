@@ -63,16 +63,17 @@ def update_narrative_social_data(narrative_id: str, current_mentions: int, basel
             _narrative_states[narrative_id] = NarrativeState(id=narrative_id)
         _evict_lru_if_needed()
         state = _narrative_states[narrative_id]
-    state.social_velocity = current_mentions / baseline_mentions if baseline_mentions > 0 else 1
-    state.baseline_velocity = baseline_mentions
-    state.last_updated = time.time() * 1000
+        # Mutate state inside lock to prevent concurrent read/write races
+        state.social_velocity = current_mentions / baseline_mentions if baseline_mentions > 0 else 1
+        state.baseline_velocity = baseline_mentions
+        state.last_updated = time.time() * 1000
 
 
 def update_narrative_member_price(narrative_id: str, symbol: str, price_change_pct: float) -> None:
     with _lock:
         state = _narrative_states.get(narrative_id)
-    if state:
-        state.member_price_changes[symbol] = price_change_pct
+        if state:
+            state.member_price_changes[symbol] = price_change_pct
 
 
 def _find_laggard(state: NarrativeState, product_id_map: dict[str, str]) -> Optional[dict]:
@@ -131,6 +132,7 @@ def scan_narrative_momentum(
                 sources=["social"],
                 reasoning=f"{narrative_id.replace('_', ' ')} narrative velocity {state.social_velocity:.1f}x; {laggard['symbol']} lagging by {laggard['price_change_pct']*100:.1f}%",
                 entry_price=current_price, stop_price=current_price * 0.94,
+                target_price=current_price * 1.10,  # R:R fix: 10% target vs 6% stop = 1.67:1
                 suggested_size_usd=80,
                 expires_at=now + 7_200_000, created_at=now,
             )

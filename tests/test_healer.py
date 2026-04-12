@@ -94,8 +94,12 @@ class TestClassifyLossReason:
         )
         assert _classify_loss_reason(p) == "unknown"
 
-    def test_pump_top_priority_over_tight_stop(self):
-        """When both pump top and tight stop conditions met, pump top wins (checked first)."""
+    def test_tight_stop_priority_over_pump_top(self):
+        """When both pump top and tight stop conditions met, stop_too_tight wins.
+
+        Short holds with trailing_stop exits are definitively stop-related,
+        while momentum_at_entry can be coincidental.
+        """
         now = time.time() * 1000
         p = make_position(
             entry_price=2000, low_watermark=1800,
@@ -104,6 +108,18 @@ class TestClassifyLossReason:
             exit_reason="trailing_stop", status="closed",
         )
         p.momentum_at_entry = 0.10  # high momentum triggers pump top
+        assert _classify_loss_reason(p) == "stop_too_tight"
+
+    def test_pump_top_when_not_tight_stop(self):
+        """Pump top detected when hold > 2h (not tight stop)."""
+        now = time.time() * 1000
+        p = make_position(
+            entry_price=2000, low_watermark=1800,
+            opened_at=now - 3 * 3_600_000,  # 3 hours (> 2h, still < 4h)
+            closed_at=now, pnl_pct=-0.05,
+            exit_reason="trailing_stop", status="closed",
+        )
+        p.momentum_at_entry = 0.10
         assert _classify_loss_reason(p) == "entered_pump_top"
 
 

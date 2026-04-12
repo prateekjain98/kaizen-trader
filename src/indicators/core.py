@@ -164,9 +164,9 @@ def compute_adx(candles: list[OHLCV], period: int = 14) -> Optional[tuple[float,
     if len(tr_list) < period:
         return None
 
-    # Wilder smoothing
+    # Wilder smoothing — seed with AVERAGE (not sum) per Wilder's original formula
     def _wilder_smooth(values: list[float], p: int) -> list[float]:
-        smoothed = [sum(values[:p])]
+        smoothed = [sum(values[:p]) / p]
         for v in values[p:]:
             smoothed.append(smoothed[-1] - smoothed[-1] / p + v)
         return smoothed
@@ -192,7 +192,7 @@ def compute_adx(candles: list[OHLCV], period: int = 14) -> Optional[tuple[float,
         return None
 
     adx_smoothed = _wilder_smooth(dx_list, period)
-    adx = adx_smoothed[-1] / period if adx_smoothed else 0
+    adx = adx_smoothed[-1] if adx_smoothed else 0
 
     last_tr = smoothed_tr[-1]
     if last_tr == 0:

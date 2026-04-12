@@ -89,7 +89,7 @@ class DeltaEvaluator:
             if len(trades_after) < self.MIN_TRADES_FOR_EVAL:
                 continue
 
-            after = self._compute_snapshot(trades_after[:20])
+            after = self._compute_snapshot(trades_after)
             delta.trades_after = after
             delta.evaluation_timestamp = time.time() * 1000
 
@@ -116,8 +116,8 @@ class DeltaEvaluator:
                         f"Delta WORSENED but revert cap reached: {delta.parameter} "
                         f"(win_rate {before.win_rate:.1%} -> {after.win_rate:.1%})",
                         data={"delta_id": delta.id, "parameter": delta.parameter})
-            elif (win_rate_change > self.WORSENED_WIN_RATE_DROP
-                  and pnl_change > -self.WORSENED_PNL_DROP):
+            elif (win_rate_change > 0.02 and pnl_change > 0):
+                # "improved" requires BOTH win rate increase AND positive PnL change
                 delta.verdict = "improved"
                 delta.evaluation_status = "evaluated"
                 log("info",

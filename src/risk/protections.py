@@ -212,9 +212,11 @@ class RapidDrawdownHalt(ProtectionRule):
         self._trade_count_today += 1
 
     def check(self, ctx: ProtectionContext) -> ProtectionVerdict:
-        equity = self._starting_equity
+        # Use current equity (starting + cumulative P&L) instead of fixed starting equity
+        equity = self._starting_equity + self._weekly_pnl
         if equity <= 0:
-            return ProtectionVerdict(allowed=True)
+            return ProtectionVerdict(allowed=False, rule_name=self.name,
+                                    reason="EMERGENCY HALT: equity depleted")
 
         daily_dd = -self._daily_pnl / equity if self._daily_pnl < 0 else 0
         weekly_dd = -self._weekly_pnl / equity if self._weekly_pnl < 0 else 0

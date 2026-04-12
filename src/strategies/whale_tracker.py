@@ -75,8 +75,8 @@ def scan_whale_accumulation(
         return None
     net_ratio = net / total_flow
 
-    # Accumulation
-    if net_ratio > 0.4 and state.outflow_from_exchange > 5_000_000:
+    # Accumulation — use symmetric threshold with distribution
+    if net_ratio > 0.4 and state.outflow_from_exchange > 7_000_000:
         flow_score = min(30, state.outflow_from_exchange / 1_000_000)
         ratio_score = min(20, net_ratio * 20)
         score = min(88, 45 + flow_score + ratio_score)
@@ -86,13 +86,14 @@ def scan_whale_accumulation(
             confidence="medium" if score > 70 else "low",
             sources=["whale_alert"],
             reasoning=f"{symbol} ${state.outflow_from_exchange/1e6:.0f}M net outflow from exchanges in 2h",
-            entry_price=current_price, stop_price=current_price * 0.93,
+            entry_price=current_price, stop_price=current_price * 0.95,
+            target_price=current_price * 1.08,  # R:R fix: 8% target vs 5% stop = 1.6:1
             suggested_size_usd=100,
             expires_at=now + 21_600_000, created_at=now,
         )
 
-    # Distribution
-    if net_ratio < -0.5 and state.inflow_to_exchange > 10_000_000:
+    # Distribution — symmetric threshold with accumulation
+    if net_ratio < -0.5 and state.inflow_to_exchange > 7_000_000:
         flow_score = min(25, state.inflow_to_exchange / 1_000_000)
         ratio_score = min(20, -net_ratio * 20)
         score = min(84, 40 + flow_score + ratio_score)
@@ -103,6 +104,7 @@ def scan_whale_accumulation(
             sources=["whale_alert"],
             reasoning=f"{symbol} ${state.inflow_to_exchange/1e6:.0f}M whale inflows to exchanges in 2h",
             entry_price=current_price, stop_price=current_price * 1.04,
+            target_price=current_price * 0.93,  # R:R fix: 7% target vs 4% stop = 1.75:1
             suggested_size_usd=80,
             expires_at=now + 14_400_000, created_at=now,
         )

@@ -1043,6 +1043,19 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
     if trade.status == "failed":
         log("error", f"Exit trade failed for {pos.symbol}: {trade.error}",
             symbol=pos.symbol, strategy=pos.strategy)
+        # If no holdings exist, force-close the stale position to stop retry loop
+        if "No holdings" in (trade.error or ""):
+            log("warn", f"Force-closing stale position {pos.symbol} — no holdings to sell",
+                symbol=pos.symbol, strategy=pos.strategy)
+            pos.status = "closed"
+            pos.exit_price = current_price
+            pos.closed_at = now
+            pos.pnl_usd = 0
+            pos.pnl_pct = 0
+            pos.exit_reason = "force_closed_no_holdings"
+            with batch_writes():
+                update_position_close(pos.id, current_price, 0, 0, "force_closed_no_holdings")
+            register_close(pos, 0)
         return
 
     exit_price = trade.price if trade.price > 0 else current_price

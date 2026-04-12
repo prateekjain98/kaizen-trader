@@ -99,7 +99,10 @@ class StrategySelector:
                 wins = [p for p in pnl_pcts if p > 0]
 
                 h.rolling_win_rate = len(wins) / len(recent)
-                h.consecutive_losses = _max_consecutive_losses(pnl_pcts)
+                # Don't overwrite real-time consecutive_losses from on_trade_closed —
+                # use max of historical and current to preserve real-time streak
+                historical_max = _max_consecutive_losses(pnl_pcts)
+                h.consecutive_losses = max(h.consecutive_losses, historical_max)
 
                 # Compute rolling Sharpe
                 mean_pnl = _mean(pnl_pcts)
@@ -122,7 +125,8 @@ class StrategySelector:
                 # Re-enable check: if disabled and now above thresholds
                 elif h.disabled_at:
                     days_disabled = (now - h.disabled_at) / (86_400_000)
-                    sharpe_ok = h.rolling_sharpe is None or h.rolling_sharpe >= 0.3
+                    # Require actual positive Sharpe data to re-enable — None means insufficient data
+                    sharpe_ok = h.rolling_sharpe is not None and h.rolling_sharpe >= 0.3
                     winrate_ok = h.rolling_win_rate >= self.config.min_win_rate * 1.5
 
                     if sharpe_ok and winrate_ok and days_disabled >= self.config.probation_days:

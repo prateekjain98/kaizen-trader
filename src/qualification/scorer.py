@@ -262,7 +262,11 @@ def _oi_funding_composite(signal: TradeSignal, deriv: Optional[DerivativesData])
     adj = 0.0
 
     # High OI + extreme funding = overleveraged, liquidation risk
-    high_oi = deriv.open_interest_usd > 500_000_000  # >$500M OI = significant
+    # Use relative OI threshold — $500M absolute only works for BTC/ETH
+    # For altcoins, even $50M OI is significant
+    high_oi = (deriv.open_interest_usd > 500_000_000
+               or (deriv.open_interest_usd > 50_000_000
+                   and signal.symbol not in ("BTC", "ETH")))
     high_positive_funding = deriv.funding_rate > 0.0008  # very positive
     high_negative_funding = deriv.funding_rate < -0.0008  # very negative
 
@@ -387,17 +391,22 @@ def qualify(
     stablecoin: Optional[StablecoinFlows] = None,
     has_unlock_risk: bool = False,
 ) -> QualificationResult:
-    # Fee-aware filter: reject signals where stop distance is too close to round-trip fees
+    # Fee-aware filter: reject signals where target-to-stop ratio is structurally poor
     round_trip_fee_pct = env.commission_per_side * 2
     if signal.entry_price > 0 and signal.stop_price and signal.stop_price > 0:
         stop_distance_pct = abs(signal.entry_price - signal.stop_price) / signal.entry_price
         # If stop is less than 3x the round-trip fee, the risk/reward is structurally poor
         if stop_distance_pct < round_trip_fee_pct * 3:
-            return QualificationResult(
-                score=0, passed=False,
-                breakdown={"fee_filter": f"stop {stop_distance_pct:.2%} < 3x fees {round_trip_fee_pct*3:.2%}"},
-                reasoning=f"REJECTED: stop distance {stop_distance_pct:.2%} too close to fees {round_trip_fee_pct:.2%}",
-            )
+            # But allow if target gives sufficient reward (R:R > 2)
+            target_distance = 0.0
+            if signal.target_price and signal.target_price > 0:
+                target_distance = abs(signal.target_price - signal.entry_price) / signal.entry_price
+            if target_distance < stop_distance_pct * 2:
+                return QualificationResult(
+                    score=0, passed=False,
+                    breakdown={"fee_filter": f"stop {stop_distance_pct:.2%} < 3x fees {round_trip_fee_pct*3:.2%}"},
+                    reasoning=f"REJECTED: stop distance {stop_distance_pct:.2%} too close to fees {round_trip_fee_pct:.2%}",
+                )
 
     news_adj = _news_adjustment(signal, news)
     social_adj = _social_adjustment(signal, social)
@@ -412,10 +421,17 @@ def qualify(
     # Cap combined regime + derivatives/OI penalty to avoid double-penalizing the same condition
     _regime_deriv_combined = regime_adj + deriv_adj + oi_funding_adj
     if _regime_deriv_combined < -12:
-        _scale = -12 / _regime_deriv_combined  # proportionally scale back
-        regime_adj *= _scale
-        deriv_adj *= _scale
-        oi_funding_adj *= _scale
+        # Only scale negative components to avoid flipping positive adjustments negative
+        neg_sum = sum(v for v in (regime_adj, deriv_adj, oi_funding_adj) if v < 0)
+        if neg_sum < 0:
+            _scale = (-12 - _regime_deriv_combined + neg_sum) / neg_sum
+            _scale = max(0, min(1, _scale))
+            if regime_adj < 0:
+                regime_adj *= _scale
+            if deriv_adj < 0:
+                deriv_adj *= _scale
+            if oi_funding_adj < 0:
+                oi_funding_adj *= _scale
     leverage_adj = _leverage_profile_adjustment(signal, derivatives)
     flow_adj = _exchange_flow_adjustment(signal)
     stable_adj = _stablecoin_adjustment(signal, stablecoin)

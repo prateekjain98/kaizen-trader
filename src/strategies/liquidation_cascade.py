@@ -85,15 +85,19 @@ def scan_liquidation_cascade(
 ) -> Optional[TradeSignal]:
     with _windows_lock:
         win = _windows.get(symbol)
-    if not win or len(win.events) < 3:
+    if not win or len(win.events) < 5:
+        return None
+    # Require minimum total liquidation volume to filter out noise
+    total_liqs = win.total_long_liqs_usd + win.total_short_liqs_usd
+    if total_liqs < 500_000:
         return None
     now = time.time() * 1000
 
     oi_drop = ((win.oi_at_window_start - win.current_oi) / win.oi_at_window_start
                if win.oi_at_window_start > 0 else 0)
 
-    # Strategy A: Ride cascade
-    if (win.total_long_liqs_usd > 2_000_000 and oi_drop > 0.05
+    # Strategy A: Ride cascade — raised from $2M to $3M (19 adverse_move losses at $2M)
+    if (win.total_long_liqs_usd > 3_000_000 and oi_drop > 0.05
             and ctx.phase != "extreme_fear"):
         size_score = min(30, win.total_long_liqs_usd / 200_000)
         oi_score = min(20, oi_drop * 200)
@@ -105,6 +109,7 @@ def scan_liquidation_cascade(
             sources=["liquidation_data"],
             reasoning=f"{symbol} ${win.total_long_liqs_usd/1e6:.1f}M longs liq'd in 10m, OI down {oi_drop*100:.0f}%",
             entry_price=current_price, stop_price=current_price * 1.025,
+            target_price=current_price * 0.96,  # R:R fix: 4% target vs 2.5% stop = 1.6:1
             suggested_size_usd=50, expires_at=now + 600_000, created_at=now,
         )
 
@@ -113,8 +118,10 @@ def scan_liquidation_cascade(
     cascade_exhausted = (oi_drop > 0.10 and win.events
                          and win.events[-1].ts >= now - 300_000)
 
-    if (win.total_long_liqs_usd > 5_000_000 and price_drop_pct > 0.05
-            and cascade_exhausted and ctx.phase != "bear"):
+    # Backtest fix: also block dip buys during extreme_fear (6 wrong_market_phase losses)
+    # Raised from $5M to $8M — require stronger cascade exhaustion signal
+    if (win.total_long_liqs_usd > 8_000_000 and price_drop_pct > 0.05
+            and cascade_exhausted and ctx.phase not in ("bear", "extreme_fear")):
         drop_score = min(30, price_drop_pct * 200)
         score = min(82, 52 + drop_score)
         return TradeSignal(
@@ -124,6 +131,7 @@ def scan_liquidation_cascade(
             sources=["liquidation_data"],
             reasoning=f"{symbol} down {price_drop_pct*100:.0f}% from cascade, ${win.total_long_liqs_usd/1e6:.1f}M liq'd, OI stabilizing",
             entry_price=current_price, stop_price=current_price * 0.97,
+            target_price=current_price * 1.05,  # R:R fix: 5% target vs 3% stop = 1.67:1
             suggested_size_usd=90, expires_at=now + 3_600_000, created_at=now,
         )
 
