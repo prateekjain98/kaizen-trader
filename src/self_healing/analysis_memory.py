@@ -17,7 +17,8 @@ from typing import Optional
 
 from src.storage.database import log
 
-_MEMORY_FILE = "data/analysis_memory.json"
+from pathlib import Path as _Path
+_MEMORY_FILE = str(_Path(__file__).resolve().parents[2] / "data" / "analysis_memory.json")
 _MAX_WORKING_MEMORY = 3
 
 # Tiered decay rates (per day)
@@ -58,7 +59,7 @@ class AnalysisMemory:
         if not os.path.exists(_MEMORY_FILE):
             return
         try:
-            with open(_MEMORY_FILE) as f:
+            with open(_MEMORY_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             self._state.working_memory = data.get("working_memory", [])
             self._state.insights = [
@@ -78,7 +79,7 @@ class AnalysisMemory:
                 "insights": [asdict(i) for i in self._state.insights],
                 "last_decay_at": self._state.last_decay_at,
             }
-            with open(_MEMORY_FILE, "w") as f:
+            with open(_MEMORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception as err:
             log("warn", f"Analysis memory save failed: {err}")
@@ -89,7 +90,7 @@ class AnalysisMemory:
             # Working memory: FIFO, max 3
             self._state.working_memory.append(summary)
             if len(self._state.working_memory) > _MAX_WORKING_MEMORY:
-                self._state.working_memory.pop(0)
+                self._state.working_memory = self._state.working_memory[-_MAX_WORKING_MEMORY:]
 
             # Short-term insights
             now = time.time() * 1000

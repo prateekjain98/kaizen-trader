@@ -46,7 +46,7 @@ class TestClassifyLossReason:
             exit_reason="trailing_stop", status="closed",
         )
         p.momentum_at_entry = 0.10  # high momentum triggers entered_pump_top
-        assert _classify_loss_reason(p) == "entered_pump_top"
+        assert _classify_loss_reason(p, ScannerConfig()) == "entered_pump_top"
 
     def test_stop_too_tight(self):
         """Short hold + trailing stop exit -> stop too tight."""
@@ -57,7 +57,7 @@ class TestClassifyLossReason:
             closed_at=now, pnl_pct=-0.01,
             exit_reason="trailing_stop", status="closed",
         )
-        assert _classify_loss_reason(p) == "stop_too_tight"
+        assert _classify_loss_reason(p, ScannerConfig()) == "stop_too_tight"
 
     def test_stop_too_wide(self):
         """Long hold + big loss -> stop too wide."""
@@ -68,7 +68,7 @@ class TestClassifyLossReason:
             closed_at=now, pnl_pct=-0.06,
             exit_reason="trailing_stop", status="closed",
         )
-        assert _classify_loss_reason(p) == "stop_too_wide"
+        assert _classify_loss_reason(p, ScannerConfig()) == "stop_too_wide"
 
     def test_low_qual_score(self):
         """Low quality score but no other conditions met -> low qual."""
@@ -80,7 +80,7 @@ class TestClassifyLossReason:
             exit_reason="trailing_stop", status="closed",
             qual_score=50,
         )
-        assert _classify_loss_reason(p) == "low_qual_score"
+        assert _classify_loss_reason(p, ScannerConfig()) == "low_qual_score"
 
     def test_unknown(self):
         """No specific pattern matched -> unknown."""
@@ -92,7 +92,7 @@ class TestClassifyLossReason:
             exit_reason="trailing_stop", status="closed",
             qual_score=70,
         )
-        assert _classify_loss_reason(p) == "unknown"
+        assert _classify_loss_reason(p, ScannerConfig()) == "unknown"
 
     def test_tight_stop_priority_over_pump_top(self):
         """When both pump top and tight stop conditions met, stop_too_tight wins.
@@ -108,7 +108,7 @@ class TestClassifyLossReason:
             exit_reason="trailing_stop", status="closed",
         )
         p.momentum_at_entry = 0.10  # high momentum triggers pump top
-        assert _classify_loss_reason(p) == "stop_too_tight"
+        assert _classify_loss_reason(p, ScannerConfig()) == "stop_too_tight"
 
     def test_pump_top_when_not_tight_stop(self):
         """Pump top detected when hold > 2h (not tight stop)."""
@@ -120,7 +120,7 @@ class TestClassifyLossReason:
             exit_reason="trailing_stop", status="closed",
         )
         p.momentum_at_entry = 0.10
-        assert _classify_loss_reason(p) == "entered_pump_top"
+        assert _classify_loss_reason(p, ScannerConfig()) == "entered_pump_top"
 
 
 # ── _apply_loss_adaptation ────────────────────────────────────────────────
@@ -165,12 +165,12 @@ class TestApplyLossAdaptation:
         result = _apply_loss_adaptation(p, "low_qual_score", config)
         assert config.min_qual_score_swing == old_val + 2
 
-    def test_funding_squeeze_lowers_threshold(self):
+    def test_funding_squeeze_raises_threshold(self):
         config = ScannerConfig()
         old_val = config.funding_rate_extreme_threshold
         p = make_position()
         result = _apply_loss_adaptation(p, "funding_squeeze", config)
-        assert abs(config.funding_rate_extreme_threshold - (old_val - 0.0001)) < 1e-10
+        assert abs(config.funding_rate_extreme_threshold - (old_val + 0.0002)) < 1e-10
 
     def test_unknown_makes_no_change(self):
         config = ScannerConfig()

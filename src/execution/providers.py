@@ -88,7 +88,7 @@ class BinanceProvider:
     def _sign_and_post(self, params: str) -> dict:
         """Sign params with HMAC and POST to Binance Futures order endpoint."""
         signature = hmac.new(
-            env.binance_api_secret.encode(), params.encode(), hashlib.sha256
+            env.binance_api_secret.encode(), params.encode(), "sha256"
         ).hexdigest()
         resp = requests.post(
             f"{self.FAPI_BASE}/fapi/v1/order",
@@ -158,7 +158,7 @@ class BinanceProvider:
         timestamp = int(time.time() * 1000)
         params = f"timestamp={timestamp}"
         signature = hmac.new(
-            env.binance_api_secret.encode(), params.encode(), hashlib.sha256
+            env.binance_api_secret.encode(), params.encode(), "sha256"
         ).hexdigest()
 
         try:

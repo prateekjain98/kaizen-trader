@@ -3,6 +3,7 @@
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -260,7 +261,7 @@ _MAX_CANDLES = 250  # enough for EMA200 + some margin
 _CANDLE_INTERVAL_MS = 60_000  # 1-minute candles
 
 _lock = threading.Lock()
-_candle_buffers: dict[str, list[OHLCV]] = {}
+_candle_buffers: dict[str, deque[OHLCV]] = {}
 _snapshot_cache: dict[str, IndicatorSnapshot] = {}
 _snapshot_ttl_ms = 5_000  # recompute at most every 5 seconds
 
@@ -275,7 +276,7 @@ def push_tick(symbol: str, price: float, volume: float) -> None:
             del _candle_buffers[oldest]
             _snapshot_cache.pop(oldest, None)
 
-        buf = _candle_buffers.setdefault(symbol, [])
+        buf = _candle_buffers.setdefault(symbol, deque(maxlen=_MAX_CANDLES))
 
         if buf and (now - buf[-1].ts) < _CANDLE_INTERVAL_MS:
             # Update current candle
@@ -290,8 +291,6 @@ def push_tick(symbol: str, price: float, volume: float) -> None:
                 open=price, high=price, low=price, close=price,
                 volume=volume, ts=now,
             ))
-            if len(buf) > _MAX_CANDLES:
-                buf.pop(0)
 
 
 def get_atr(symbol: str, period: int = 14) -> Optional[float]:
@@ -436,7 +435,7 @@ _HTF_INTERVALS = {
 _MAX_HTF_CANDLES = 200
 
 _htf_lock = threading.Lock()
-_htf_buffers: dict[str, dict[str, list[OHLCV]]] = {}  # symbol -> timeframe -> candles
+_htf_buffers: dict[str, dict[str, deque[OHLCV]]] = {}  # symbol -> timeframe -> candles
 
 
 def push_htf_candle(symbol: str, timeframe: str, candle: OHLCV) -> None:
@@ -444,10 +443,8 @@ def push_htf_candle(symbol: str, timeframe: str, candle: OHLCV) -> None:
     with _htf_lock:
         if symbol not in _htf_buffers:
             _htf_buffers[symbol] = {}
-        buf = _htf_buffers[symbol].setdefault(timeframe, [])
+        buf = _htf_buffers[symbol].setdefault(timeframe, deque(maxlen=_MAX_HTF_CANDLES))
         buf.append(candle)
-        if len(buf) > _MAX_HTF_CANDLES:
-            buf.pop(0)
 
 
 def _aggregate_to_htf(symbol: str) -> None:

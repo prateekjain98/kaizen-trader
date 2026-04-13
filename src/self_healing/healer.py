@@ -7,8 +7,7 @@ from src.config import CONFIG_BOUNDS
 from src.self_healing.blind_spots import get_detector
 from src.self_healing.delta_evaluator import get_evaluator
 from src.storage.database import insert_diagnosis, snapshot_config, log
-from typing import Optional
-from src.types import Position, ScannerConfig, TradeDiagnosis
+from src.types import LossReason, Position, ScannerConfig, TradeDiagnosis
 
 _MAX_ADAPTATIONS_PER_SESSION = 20
 _lock = threading.Lock()
@@ -25,7 +24,7 @@ def _adjust(config: ScannerConfig, key: str, delta: float) -> None:
     setattr(config, key, _clamp(current + delta, key))
 
 
-def _classify_loss_reason(p: Position, config: Optional["ScannerConfig"] = None) -> str:
+def _classify_loss_reason(p: Position, config: ScannerConfig) -> LossReason:
     # Skip diagnosis if position was never properly closed
     if p.closed_at is None:
         return "unknown"
@@ -45,10 +44,7 @@ def _classify_loss_reason(p: Position, config: Optional["ScannerConfig"] = None)
         return "entered_pump_top"
     if hold_hours > 20 and pnl_pct < -0.05:
         return "stop_too_wide"
-    # Use config-aware threshold instead of hardcoded 55
-    min_qual = 55
-    if config:
-        min_qual = config.min_qual_score_scalp if p.tier == "scalp" else config.min_qual_score_swing
+    min_qual = config.min_qual_score_scalp if p.tier == "scalp" else config.min_qual_score_swing
     if p.qual_score < min_qual:
         return "low_qual_score"
     if p.strategy == "funding_extreme":

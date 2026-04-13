@@ -3,6 +3,7 @@
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -17,8 +18,8 @@ class PriceSample:
     ts: float
 
 
-_swing_buffers: dict[str, list[PriceSample]] = {}
-_scalp_buffers: dict[str, list[PriceSample]] = {}
+_swing_buffers: dict[str, deque[PriceSample]] = {}
+_scalp_buffers: dict[str, deque[PriceSample]] = {}
 _cooldowns: dict[str, float] = {}
 _lock = threading.Lock()
 
@@ -73,17 +74,17 @@ def push_price_sample(symbol: str, price: float, volume_24h: float) -> None:
             oldest_key = min(_scalp_buffers, key=lambda k: _scalp_buffers[k][-1].ts if _scalp_buffers[k] else 0)
             del _scalp_buffers[oldest_key]
 
-        sw = _swing_buffers.setdefault(symbol, [])
+        sw = _swing_buffers.setdefault(symbol, deque())
         sw.append(sample)
         cutoff = now - 3_600_000
         while sw and sw[0].ts < cutoff:
-            sw.pop(0)
+            sw.popleft()
 
-        sc = _scalp_buffers.setdefault(symbol, [])
+        sc = _scalp_buffers.setdefault(symbol, deque())
         sc.append(sample)
         cutoff = now - 300_000
         while sc and sc[0].ts < cutoff:
-            sc.pop(0)
+            sc.popleft()
 
 
 def _compute_momentum(samples: list[PriceSample]) -> Optional[dict]:

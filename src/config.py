@@ -9,6 +9,7 @@ load_dotenv()
 
 
 def _optional(key: str) -> str | None:
+    # `or None` intentionally converts empty strings to None (treat as unset)
     return os.environ.get(key) or None
 
 
@@ -16,7 +17,10 @@ def _num(key: str, fallback: float) -> float:
     v = os.environ.get(key)
     if not v:
         return fallback
-    return float(v)
+    try:
+        return float(v)
+    except ValueError:
+        return fallback
 
 
 def _bool(key: str, fallback: bool) -> bool:

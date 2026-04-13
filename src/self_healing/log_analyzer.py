@@ -19,6 +19,9 @@ from src.evaluation.metrics import compute_metrics, format_metrics
 from src.evaluation.strategy_selector import StrategySelector
 from src.types import ScannerConfig
 
+from dataclasses import fields as _dataclass_fields
+_ALLOWED_CONFIG_KEYS = {f.name for f in _dataclass_fields(ScannerConfig)}
+
 
 class StrategyInsight(BaseModel):
     strategy: str
@@ -209,6 +212,9 @@ def _apply_changes(config: ScannerConfig, changes: list[ParameterChange]) -> dic
             continue
 
         key = change.parameter
+        if key not in _ALLOWED_CONFIG_KEYS:
+            rejected.append(f"{change.parameter} — not a recognized ScannerConfig field")
+            continue
         bounds = CONFIG_BOUNDS.get(key)
         if not bounds:
             rejected.append(f"{change.parameter} — unknown parameter")
@@ -353,10 +359,8 @@ def _ensemble_verify(prompt: str, primary_changes: list[ParameterChange],
                     ensemble_params[c.parameter] += 1
         except Exception as err:
             log("warn", f"Ensemble run (temp={temp}) failed: {err}")
-            # If an ensemble run fails, give all primary changes a bonus vote
-            # so they aren't unfairly filtered out
-            for p in ensemble_params:
-                ensemble_params[p] = max(ensemble_params[p], 2)
+            # Failed run: do NOT grant bonus votes — require all successful
+            # runs to agree, otherwise we bypass the filter entirely
 
     # Keep only changes with 2+ votes (appeared in primary + at least 1 ensemble)
     surviving = [c for c in primary_changes if ensemble_params.get(c.parameter, 0) >= 2]
@@ -411,8 +415,8 @@ def run_analysis(config: ScannerConfig,
             json_str = json_str[:-3]
         json_str = json_str.strip()
         parsed = json.loads(json_str)
-    except Exception:
-        log("error", "Log analyzer: failed to parse Claude response as JSON",
+    except (json.JSONDecodeError, ValueError) as err:
+        log("error", f"Log analyzer: failed to parse Claude response as JSON — {err}",
             data={"preview": raw_text[:300]})
         return None
 

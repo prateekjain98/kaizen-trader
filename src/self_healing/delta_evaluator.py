@@ -182,6 +182,12 @@ class DeltaEvaluator:
         setattr(config, delta.parameter, reverted_value)
         snapshot_config(config, f"delta-revert: {delta.parameter} {delta.new_value} -> {reverted_value}")
 
+        # Record the revert itself as a new delta so the change history is complete
+        self.record_delta(
+            parameter=delta.parameter, old_value=delta.new_value, new_value=reverted_value,
+            reason=f"auto-revert of {delta.reason}", source="delta_evaluator", config=config,
+        )
+
 
 # Module singleton (double-checked lock pattern)
 _evaluator: Optional[DeltaEvaluator] = None

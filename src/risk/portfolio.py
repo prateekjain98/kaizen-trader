@@ -3,6 +3,7 @@
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -27,7 +28,7 @@ def _today_utc() -> str:
 _lock = threading.RLock()  # RLock: _get_chain() may re-enter from register_close
 _daily_stats = DailyStats(date=_today_utc())
 _open_positions: dict[str, Position] = {}
-_daily_returns: list[float] = []
+_daily_returns: deque[float] = deque(maxlen=365)
 _protection_chain: Optional[ProtectionChain] = None
 
 
@@ -57,8 +58,6 @@ def _maybe_reset_day() -> None:
         if _daily_stats.date != today:
             if _daily_stats.realized_pnl != 0:
                 _daily_returns.append(_daily_stats.realized_pnl)
-                if len(_daily_returns) > 365:
-                    _daily_returns.pop(0)
             _daily_stats = DailyStats(date=today)
             reset_needed = True
     if reset_needed:

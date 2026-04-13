@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 Side = Literal["long", "short"]
 Tier = Literal["scalp", "swing", "position"]
@@ -11,10 +11,16 @@ ExitReason = Literal["trailing_stop", "take_profit", "partial_take_profit", "tim
 
 StrategyId = Literal[
     "momentum_swing", "momentum_scalp", "listing_pump", "whale_accumulation",
-    "token_unlock_short", "mean_reversion", "funding_extreme", "liquidation_cascade",
-    "orderbook_imbalance", "narrative_momentum", "correlation_break", "smart_money_follow",
+    "mean_reversion", "funding_extreme", "liquidation_cascade",
+    "orderbook_imbalance", "narrative_momentum", "correlation_break",
     "protocol_revenue", "fear_greed_contrarian", "cross_exchange_divergence",
 ]
+
+TradeSide = Literal["buy", "sell"]
+
+SCALP_STRATEGY_IDS: frozenset[str] = frozenset({
+    "momentum_scalp", "orderbook_imbalance", "liquidation_cascade", "listing_pump",
+})
 
 SignalSource = Literal[
     "news", "social", "whale_alert", "on_chain", "listing_detector", "funding_rates",
@@ -71,7 +77,7 @@ class Position:
     max_hold_ms: float
     qual_score: float
     signal_id: str
-    status: str = "open"
+    status: Literal["open", "closed", "force_closed_no_holdings"] = "open"
     exit_price: Optional[float] = None
     closed_at: Optional[float] = None
     pnl_usd: Optional[float] = None
@@ -102,12 +108,12 @@ class Position:
 class Trade:
     id: str
     position_id: str
-    side: str
+    side: TradeSide
     symbol: str
     quantity: float
     size_usd: float
     price: float
-    status: str
+    status: Literal["pending", "filled", "error"]
     paper_trading: bool
     placed_at: float
     commission: float = 0.0
@@ -127,7 +133,7 @@ class TradeDiagnosis:
     entry_qual_score: float
     market_phase_at_entry: str
     action: str
-    parameter_changes: dict
+    parameter_changes: dict[str, float]
     timestamp: float
 
 
@@ -158,7 +164,7 @@ class ScannerConfig:
 
 @dataclass
 class MarketContext:
-    phase: str
+    phase: MarketPhase
     btc_dominance: float
     fear_greed_index: float
     total_market_cap_change_d1: float
@@ -173,4 +179,4 @@ class LogEntry:
     ts: float
     symbol: Optional[str] = None
     strategy: Optional[str] = None
-    data: Optional[dict] = None
+    data: Optional[dict[str, Any]] = None

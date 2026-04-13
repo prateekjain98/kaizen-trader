@@ -1,6 +1,7 @@
 """Auto-create GitHub issues for blind spots, data gaps, and chronic underperformers."""
 
 import os
+import re
 import subprocess
 import threading
 import time
@@ -26,9 +27,15 @@ _lock = threading.Lock()
 MAX_ISSUES_PER_DAY = 3
 
 
+_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
 def _get_repo() -> str:
     """Read GITHUB_REPO from env at call time (not import time)."""
-    return os.environ.get("GITHUB_REPO", "")
+    repo = os.environ.get("GITHUB_REPO", "")
+    if repo and not _REPO_PATTERN.match(repo):
+        return ""
+    return repo
 
 
 def _reserve_slot(trigger_key: str) -> bool:
@@ -87,7 +94,11 @@ def _create_issue_via_gh(title: str, body: str, labels: list[str]) -> Optional[i
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             url = result.stdout.strip()
-            issue_number = int(url.rstrip("/").split("/")[-1])
+            try:
+                issue_number = int(url.rstrip("/").split("/")[-1])
+            except (ValueError, IndexError):
+                log("error", f"Could not parse issue number from URL: {url!r}")
+                return None
             log("info", f"GitHub issue #{issue_number} created: {title}")
             return issue_number
         else:

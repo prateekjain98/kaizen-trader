@@ -93,12 +93,13 @@ class TestWriteOperations:
         client.mutation.assert_called_once()
         assert client.mutation.call_args[0][0] == "mutations:insertTrade"
 
-    def test_log_enqueues_and_prints(self, mock_client, capsys):
+    def test_log_enqueues_and_prints(self, mock_client, caplog):
+        import logging
         storage, client = mock_client
-        storage.log("info", "Test message", symbol="ETH")
-        captured = capsys.readouterr()
-        assert "[INFO]" in captured.out
-        assert "Test message" in captured.out
+        with caplog.at_level(logging.INFO):
+            storage.log("info", "Test message", symbol="ETH")
+        assert "[INFO]" in caplog.text
+        assert "Test message" in caplog.text
         assert storage.pending_count == 1
 
     def test_insert_diagnosis(self, mock_client):
@@ -124,7 +125,7 @@ class TestWriteOperations:
         args = client.mutation.call_args[0][1]
         assert args["reason"] == "test snapshot"
         stored = json.loads(args["config"])
-        assert stored["momentum_pct_swing"] == 0.02
+        assert stored["momentum_pct_swing"] == 0.03
 
     def test_flush_error_does_not_crash(self, mock_client):
         storage, client = mock_client

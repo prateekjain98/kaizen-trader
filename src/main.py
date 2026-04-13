@@ -1,5 +1,6 @@
 """Self-Healing AI Crypto Trader — Main Entry Point."""
 
+import hmac as _hmac_mod
 import http.server
 import json
 import os
@@ -108,6 +109,8 @@ _market_ctx: MarketContext = MarketContext(
     phase="neutral", btc_dominance=50.0, fear_greed_index=50,
     total_market_cap_change_d1=0, timestamp=0,
 )
+
+_config_lock = threading.Lock()
 
 _price_lock = threading.Lock()
 _latest_prices: dict[str, float] = {}  # symbol -> latest price
@@ -427,7 +430,8 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         data={"qual_score": qual.score, "breakdown": qual.breakdown})
 
     # Block duplicate: don't open same symbol+strategy if already open
-    for pos in get_open_positions():
+    open_pos = get_open_positions()
+    for pos in open_pos:
         if pos.symbol == signal.symbol and pos.strategy == signal.strategy:
             return
 
@@ -444,7 +448,6 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         return
 
     # Correlation-aware discount: reduce size when stacking correlated assets
-    open_pos = get_open_positions()
     size_usd = apply_correlation_discount(size_usd, signal.symbol, signal.side, open_pos)
 
     # Sector exposure cap: don't exceed 30% portfolio in one group
@@ -681,6 +684,8 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
         should_sync = now_sync - _last_convex_sync_time >= _CONVEX_SYNC_INTERVAL_S
         if should_sync:
             _last_convex_sync_time = now_sync
+    # Sync outside _price_lock to avoid lock-ordering deadlock with portfolio._lock
+    if should_sync:
         for pos in get_open_positions():
             db_update_position_price(
                 pos.id, pos.current_price,
@@ -1367,10 +1372,17 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
             # Require auth token if configured
             if _HEALTH_TOKEN:
                 auth = self.headers.get("Authorization", "")
-                if auth != f"Bearer {_HEALTH_TOKEN}":
+                if not _hmac_mod.compare_digest(auth, f"Bearer {_HEALTH_TOKEN}"):
                     self.send_response(401)
                     self.end_headers()
                     return
+            else:
+                # No token configured — return minimal response to avoid leaking state
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "healthy"}).encode())
+                return
 
             open_positions = get_open_positions()
             registry = get_registry()

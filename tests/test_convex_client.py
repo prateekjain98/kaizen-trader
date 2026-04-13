@@ -171,7 +171,7 @@ class TestConvexStorageDataMapping(unittest.TestCase):
         assert call_args[0] == "mutations:snapshotConfig"
         payload = call_args[1]
         parsed = json.loads(payload["config"])
-        assert parsed["momentum_pct_swing"] == 0.02
+        assert parsed["momentum_pct_swing"] == 0.03
         assert payload["reason"] == "test snapshot"
 
 

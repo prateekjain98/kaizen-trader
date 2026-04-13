@@ -1,6 +1,7 @@
 """Binance Futures funding rate + open interest fetcher."""
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 
@@ -75,25 +76,25 @@ def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
 
         reverse_map = {v: k for k, v in SYMBOL_MAP.items()}
 
-        for binance_sym in binance_symbols:
+        def _fetch_oi(binance_sym: str) -> Optional[FundingData]:
             sym = reverse_map.get(binance_sym)
             if not sym:
-                continue
+                return None
             funding = funding_map.get(binance_sym)
             if not funding:
-                continue
-
+                return None
             try:
                 oi_res = requests.get(
-                    f"{_BASE}/fapi/v1/openInterest?symbol={binance_sym}", timeout=5
+                    f"{_BASE}/fapi/v1/openInterest",
+                    params={"symbol": binance_sym},
+                    timeout=5,
                 )
                 if oi_res.status_code != 200:
-                    continue
+                    return None
                 oi = oi_res.json()
                 oi_usd = float(oi["openInterest"])
                 oi_change = _compute_oi_change(binance_sym, oi_usd)
-
-                results.append(FundingData(
+                return FundingData(
                     symbol=sym,
                     binance_symbol=binance_sym,
                     funding_rate=float(funding["lastFundingRate"]),
@@ -101,10 +102,17 @@ def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
                     open_interest_usd=oi_usd,
                     open_interest_change_24h=oi_change,
                     sampled_at=now,
-                ))
+                )
             except Exception as err:
-                log("warn", f"Failed to parse funding data for a symbol: {err}")
-                continue
+                log("warn", f"Failed to parse funding data for {binance_sym}: {err}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=min(8, len(binance_symbols))) as pool:
+            futures = {pool.submit(_fetch_oi, bs): bs for bs in binance_symbols}
+            for future in as_completed(futures):
+                fd = future.result()
+                if fd is not None:
+                    results.append(fd)
 
         _breaker.record_success()
     except Exception as err:
