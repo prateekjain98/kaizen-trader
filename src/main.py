@@ -72,6 +72,7 @@ from src.risk.loss_cooldown import is_on_cooldown, record_trade_result
 from src.risk.regime_gate import is_regime_blocked
 from src.risk.scaling import get_initial_fraction, get_max_tranches, should_add_tranche, compute_tranche_size_usd
 from src.risk.adaptive_stops import compute_adaptive_stop
+from src.risk.signal_aggregator import SignalAggregator
 from src.storage.database import insert_trade_journal
 from src.evaluation.metrics import monte_carlo_significance
 
@@ -141,6 +142,9 @@ _last_scan_time: dict[str, float] = {}
 _MIN_SCAN_INTERVAL_S = 2.0  # at most one full scan per symbol every 2s
 _last_htf_aggregate: dict[str, float] = {}  # symbol -> last HTF aggregation time
 _HTF_AGGREGATE_INTERVAL_S = 60.0  # aggregate to higher timeframes every 60 seconds
+
+# Cross-strategy signal aggregation — deduplicates and boosts agreeing signals
+_signal_aggregator = SignalAggregator(window_ms=3000)
 
 
 # ─── Market context ──────────────────────────────────────────────────────────
@@ -313,7 +317,9 @@ def _scan_protocol_revenue_signals() -> None:
         )
         sig = scan_protocol_revenue(metric, current_price)
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
 
 
 # ─── Signal processing (qualify -> risk -> size -> execute) ───────────────────
@@ -752,7 +758,9 @@ def _try_scan(scan_fn, ctx: MarketContext) -> None:
     try:
         sig = scan_fn()
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
     except Exception as err:
         import traceback
         log("error", f"Strategy scan error: {err}", data={"traceback": traceback.format_exc()[-500:]})
@@ -783,7 +791,9 @@ def _try_scan_correlation(symbol: str, product_id: str, price: float, ctx: Marke
             config=config, ctx=ctx,
         )
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
     except Exception as err:
         log("error", f"Correlation break scan error for {symbol}: {err}")
 
@@ -798,7 +808,9 @@ def _scan_narrative_momentum(ctx: MarketContext) -> None:
     try:
         sig = scan_narrative_momentum(product_id_map, config, current_prices, ctx=ctx)
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
     except Exception as err:
         log("error", f"Narrative momentum scan error: {err}")
 
