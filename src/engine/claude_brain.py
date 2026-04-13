@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from src.engine.signal_detector import SignalPacket
-from src.storage.database import log
+from src.engine.log import log
 
 
 @dataclass
@@ -115,8 +115,7 @@ def _call_claude(prompt: str, model: str = "claude-haiku-4-5-20251001", max_toke
     """Call Claude API. Returns response text or None on error."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        log("warn", "ANTHROPIC_API_KEY not set — Claude brain disabled")
-        return None
+        return None  # Claude brain disabled — no API key
 
     try:
         import anthropic

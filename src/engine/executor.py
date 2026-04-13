@@ -14,7 +14,7 @@ from typing import Optional
 
 from src.config import env
 from src.engine.claude_brain import TradeDecision
-from src.storage.database import log
+from src.engine.log import log
 
 
 @dataclass
