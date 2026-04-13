@@ -447,6 +447,11 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         log("info", f"Sector exposure cap reached for {signal.symbol}", symbol=signal.symbol)
         return
 
+    # Proactive regime scaling: adjust size based on current volatility
+    from src.risk.regime_scaler import get_regime_scaling
+    regime_scaling = get_regime_scaling(signal.symbol)
+    size_usd *= regime_scaling.size_multiplier
+
     # DCA: swing positions enter with initial tranche fraction only
     initial_fraction = get_initial_fraction(signal.tier)
     full_size_usd = size_usd
@@ -504,6 +509,14 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
             stop_price = entry_price * (1 - trail_pct)
         else:
             stop_price = entry_price * (1 + trail_pct)
+
+    # Proactive regime scaling: adjust stop distance based on current volatility
+    trail_pct *= regime_scaling.stop_multiplier
+    trail_pct = min(trail_pct, config.max_trail_pct)
+    if signal.side == "long":
+        stop_price = entry_price * (1 - trail_pct)
+    else:
+        stop_price = entry_price * (1 + trail_pct)
 
     # Capture momentum at entry for self-healing diagnosis
     from src.strategies.momentum import get_swing_buffer
