@@ -20,7 +20,7 @@ from typing import Callable, Optional
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
-from src.storage.database import log
+from src.engine.log import log
 
 
 # ---------------------------------------------------------------------------

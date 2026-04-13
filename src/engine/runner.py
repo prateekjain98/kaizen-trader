@@ -18,7 +18,7 @@ from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_pric
 from src.engine.signal_detector import SignalDetector, SignalPacket
 from src.engine.claude_brain import ClaudeBrain
 from src.engine.executor import Executor
-from src.storage.database import log
+from src.engine.log import log
 
 
 class TradingEngine:
