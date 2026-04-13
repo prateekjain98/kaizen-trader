@@ -54,55 +54,30 @@ class TradeReview:
 # Prompt: single efficient scan every 60s
 # ---------------------------------------------------------------------------
 
-_TICK_PROMPT = """You are an autonomous crypto trading AI running in real-time. This is your 60-second market scan.
+_TICK_PROMPT = """Autonomous crypto trading brain — 60s scan.
 
-CURRENT TIME: {timestamp}
-FEAR & GREED INDEX: {fgi} ({fgi_class})
+TIME: {timestamp} | FGI: {fgi} ({fgi_class})
 
-PORTFOLIO:
-Balance: ${balance:,.2f}
-Daily P&L: ${daily_pnl:,.2f}
-Open positions ({n_positions}):
+PORTFOLIO: ${balance:,.0f} | Daily P&L: ${daily_pnl:+,.0f} | Positions: {n_positions}
 {positions_text}
 
-NEW SIGNALS (since last tick):
-{signals_text}
+SIGNALS: {signals_text}
 
-TOP FUNDING RATES:
-{funding_text}
+FUNDING (top): {funding_text}
 
-TRENDING TOKENS:
-{trending_text}
+TRENDING: {trending_text}
 
-RECENT LISTINGS:
-{listings_text}
+SOCIAL: Reddit {reddit_sentiment:+.1f} ({reddit_post_count} posts) | News: {news_text}
 
-YOUR PROVEN STRATEGIES (from backtesting):
-1. Correlation break: BTC-alt divergence mean reversion (57% WR, 197% CAGR)
-2. Coinbase listing pump: buy within 24h of listing (77% WR, +474%)
-3. Binance Futures listing pump: buy at listing (28% WR but +417% cumulative)
-4. Cross-exchange divergence: spot vs futures spread (73.5% WR)
-5. FGI contrarian: long at FGI<20, short at FGI>80 (61% WR on BTC/ETH)
-6. Funding squeeze: extreme negative funding = long, extreme positive = short
+LISTINGS: {listings_text}
 
-RULES:
-- Max $500 per position, max 10 positions
-- New Coinbase listing = ALWAYS BUY (77% WR proven)
-- New Binance Futures listing = BUY if token is trending or has social buzz
-- FGI < 15 = BUY BTC and ETH (proven contrarian edge)
-- Funding rate > 0.1% = SHORT opportunity, < -0.1% = LONG opportunity
-- NEVER chase a pump that already happened (>100% move = too late)
-- NEVER trade Binance SPOT listings (proven unprofitable)
-- Close positions that hit stop or target, or if thesis is invalidated
+STRATEGY RULES:
+• Correlation break (57% WR) • CB listing BUY (77%) • BF listing BUY+trending (28%) • Spot listing SKIP • FGI<15 BUY BTC/ETH • Funding squeeze ±0.1% • Thesis fail = CLOSE
+• Max $500/pos, 10 pos total • No >100% chases
 
-Respond with a JSON array of actions (can be empty if no action needed):
-[
-  {{"action": "BUY", "symbol": "XXX", "side": "long", "size_usd": 200, "stop_pct": 0.08, "target_pct": 0.15, "confidence": "high", "reasoning": "..."}},
-  {{"action": "CLOSE", "symbol": "YYY", "reasoning": "thesis invalidated"}},
-  ...
-]
-
-If nothing to do, respond: []"""
+JSON response [max 3 trades]:
+[{{"action":"BUY|CLOSE","symbol":"X","side":"long|short","size_usd":N,"stop_pct":0.08,"target_pct":0.15,"confidence":"high|med|low","reasoning":"..."}}]
+No action: []"""
 
 _REVIEW_PROMPT = """Trade closed. Quick analysis.
 
@@ -156,6 +131,11 @@ class ClaudeBrain:
         self.trending_tokens: list[str] = []
         self.recent_listings: list[dict] = []
 
+        # Social & News signals (FREE data sources)
+        self.reddit_sentiment: float = 0.0  # -1 (bearish) to +1 (bullish)
+        self.reddit_post_count: int = 0
+        self.latest_news: list[dict] = []  # [{title, url, published}]
+
     def _reset_daily(self):
         now = time.time()
         if now - self._last_reset > 86400:
@@ -178,29 +158,34 @@ class ClaudeBrain:
         """
         self._reset_daily()
 
-        # Build the prompt with ALL current state
-        positions_text = "\n".join(
-            f"  {p['symbol']} {p['side']} ${p.get('size_usd', 0):.0f} entry=${p.get('entry', 0):.4f} "
-            f"current=${p.get('current_price', 0):.4f} P&L={p.get('pnl_pct', 0):+.1f}%"
+        # Build the prompt with ALL current state — optimized for token efficiency
+        positions_text = " | ".join(
+            f"{p['symbol']} {p['side']:4s} ${p.get('size_usd', 0):.0f} {p.get('pnl_pct', 0):+.1f}%"
             for p in self.open_positions
-        ) if self.open_positions else "  (none)"
+        ) if self.open_positions else "(none)"
 
-        signals_text = "\n".join(
-            f"  [{p.signal_type}] {p.symbol} — {p.reasoning}"
-            for p in self.pending_signals
-        ) if self.pending_signals else "  (none)"
+        signals_text = " | ".join(
+            f"{p.symbol} [{p.signal_type[:3]}]"
+            for p in self.pending_signals[:5]
+        ) if self.pending_signals else "(none)"
 
-        funding_text = "\n".join(
-            f"  {sym:12s} {rate*100:+.4f}% {'← SHORT squeeze' if rate < -0.001 else '← LONG squeeze' if rate > 0.001 else ''}"
-            for sym, rate in sorted(self.funding_rates.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
-        ) if self.funding_rates else "  (none)"
+        funding_text = " | ".join(
+            f"{sym} {rate*100:+.2f}%"
+            for sym, rate in sorted(self.funding_rates.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+        ) if self.funding_rates else "(none)"
 
-        trending_text = ", ".join(self.trending_tokens[:7]) if self.trending_tokens else "(none)"
+        trending_text = ", ".join(self.trending_tokens[:5]) if self.trending_tokens else "(none)"
 
-        listings_text = "\n".join(
-            f"  {l.get('symbol', '?')} on {l.get('exchange', '?')} ({l.get('age_hours', 0):.0f}h ago)"
-            for l in self.recent_listings[:5]
-        ) if self.recent_listings else "  (none)"
+        listings_text = " | ".join(
+            f"{l.get('symbol', '?')}({l.get('age_hours', 0):.0f}h)"
+            for l in self.recent_listings[:3]
+        ) if self.recent_listings else "(none)"
+
+        # Format social and news signals — compact
+        news_text = "; ".join(
+            n.get('title', '')[:40]
+            for n in self.latest_news[:2]
+        ) if self.latest_news else "(none)"
 
         import datetime
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -215,10 +200,13 @@ class ClaudeBrain:
             funding_text=funding_text,
             trending_text=trending_text,
             listings_text=listings_text,
+            reddit_sentiment=self.reddit_sentiment,
+            reddit_post_count=self.reddit_post_count,
+            news_text=news_text,
         )
 
-        # Call Haiku for the scan
-        response = _call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=800)
+        # Call Haiku for the scan — optimized tokens
+        response = _call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=300)
         self.calls_today["haiku"] += 1
 
         # Clear processed signals

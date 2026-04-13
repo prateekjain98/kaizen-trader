@@ -1,5 +1,6 @@
 """Binance Futures funding rate + open interest fetcher."""
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ class FundingData:
     sampled_at: float
 
 
+_lock = threading.Lock()
 _oi_history: dict[str, dict] = {}
 
 from src.utils.binance_symbols import BINANCE_SYMBOL_MAP as SYMBOL_MAP  # noqa: E402
@@ -35,8 +37,9 @@ _breaker = CircuitBreaker("funding")
 
 def _compute_oi_change(symbol: str, current_oi: float) -> float:
     now = time.time() * 1000
-    prev = _oi_history.get(symbol)
-    _oi_history[symbol] = {"oi": current_oi, "ts": now}
+    with _lock:
+        prev = _oi_history.get(symbol)
+        _oi_history[symbol] = {"oi": current_oi, "ts": now}
     if not prev:
         return 0
     age_hours = (now - prev["ts"]) / 3_600_000
@@ -48,8 +51,9 @@ def _compute_oi_change(symbol: str, current_oi: float) -> float:
 def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
     global _last_fetch_at, _cached
     now = time.time() * 1000
-    if now - _last_fetch_at < _CACHE_TTL_MS:
-        return _cached
+    with _lock:
+        if now - _last_fetch_at < _CACHE_TTL_MS:
+            return _cached
 
     # Staleness warning
     if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
@@ -120,6 +124,7 @@ def fetch_funding_data(symbols: list[str]) -> list[FundingData]:
         _breaker.record_failure()
         return _cached
 
-    _last_fetch_at = now
-    _cached = results
+    with _lock:
+        _last_fetch_at = now
+        _cached = results
     return results

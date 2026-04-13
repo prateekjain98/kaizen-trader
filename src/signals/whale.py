@@ -1,6 +1,8 @@
 """Whale Alert large transaction fetcher."""
 
+import threading
 import time
+from collections import OrderedDict
 
 import requests
 
@@ -9,7 +11,9 @@ from src.signals._circuit_breaker import CircuitBreaker
 from src.storage.database import log
 
 MIN_USD = 3_000_000
-_seen_tx_ids: set[str] = set()
+_lock = threading.Lock()
+_seen_tx_ids: OrderedDict[str, None] = OrderedDict()  # insertion-ordered dedup
+_MAX_SEEN_TX = 5000
 _last_cursor: int = 0
 _last_fetch_at: float = 0
 _POLL_INTERVAL_MS = 120_000
@@ -32,8 +36,9 @@ def poll_whale_alerts(symbols: list[str]) -> None:
     if not env.whale_alert_api_key:
         return
     now = time.time() * 1000
-    if now - _last_fetch_at < _POLL_INTERVAL_MS:
-        return
+    with _lock:
+        if now - _last_fetch_at < _POLL_INTERVAL_MS:
+            return
 
     # Staleness warning
     if _last_fetch_at > 0 and now - _last_fetch_at > 2 * _POLL_INTERVAL_MS:
@@ -68,9 +73,10 @@ def poll_whale_alerts(symbols: list[str]) -> None:
         new_cursor = _last_cursor
         for tx in data.get("transactions", []):
             tx_id = tx["id"]
-            if tx_id in _seen_tx_ids:
-                continue
-            _seen_tx_ids.add(tx_id)
+            with _lock:
+                if tx_id in _seen_tx_ids:
+                    continue
+                _seen_tx_ids[tx_id] = None
 
             sym = tx["symbol"].upper()
             if sym not in symbols:
@@ -91,13 +97,12 @@ def poll_whale_alerts(symbols: list[str]) -> None:
                 symbol=sym,
                 data={"amount_usd": tx["amount_usd"], "from": tx["from"]["owner_type"], "to": tx["to"]["owner_type"]})
 
-        _last_cursor = new_cursor
-        _last_fetch_at = now
+        with _lock:
+            _last_cursor = new_cursor
+            _last_fetch_at = now
 
-        if len(_seen_tx_ids) > 5000:
-            keep = list(_seen_tx_ids)[-2000:]
-            _seen_tx_ids.clear()
-            _seen_tx_ids.update(keep)
+            while len(_seen_tx_ids) > _MAX_SEEN_TX:
+                _seen_tx_ids.popitem(last=False)  # evict oldest (insertion order)
 
     except Exception as err:
         log("warn", f"Whale Alert network error: {err}")

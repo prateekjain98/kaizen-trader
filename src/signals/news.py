@@ -1,6 +1,8 @@
 """CryptoPanic news sentiment fetcher."""
 
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -33,7 +35,8 @@ class NewsSentiment:
     sampled_at: float
 
 
-_mention_history: dict[str, list[int]] = {}
+_lock = threading.Lock()
+_mention_history: dict[str, deque[int]] = {}
 _last_fetch_at: float = 0
 _cached: list[NewsSentiment] = []
 _CACHE_TTL_MS = 300_000
@@ -63,11 +66,9 @@ def _score_votes(votes: dict) -> float:
 
 def _update_baseline(symbol: str, count: int) -> float:
     if symbol not in _mention_history:
-        _mention_history[symbol] = []
+        _mention_history[symbol] = deque(maxlen=7)
     hist = _mention_history[symbol]
     hist.append(count)
-    if len(hist) > 7:
-        hist.pop(0)
     avg = sum(hist) / len(hist) if hist else 1
     return count / avg if avg > 0 else 1.0
 
@@ -77,8 +78,9 @@ def fetch_news_sentiment(symbols: list[str]) -> list[NewsSentiment]:
     if not env.cryptopanic_token:
         return []
     now = time.time() * 1000
-    if now - _last_fetch_at < _CACHE_TTL_MS:
-        return _cached
+    with _lock:
+        if now - _last_fetch_at < _CACHE_TTL_MS:
+            return _cached
 
     # Staleness warning
     if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
@@ -130,6 +132,7 @@ def fetch_news_sentiment(symbols: list[str]) -> list[NewsSentiment]:
             sampled_at=now,
         ))
 
-    _last_fetch_at = now
-    _cached = sentiments
+    with _lock:
+        _last_fetch_at = now
+        _cached = sentiments
     return sentiments

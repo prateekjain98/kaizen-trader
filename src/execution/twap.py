@@ -5,6 +5,7 @@ Orders below the threshold execute as a single market order.
 """
 from __future__ import annotations
 
+import threading
 import time
 import logging
 from dataclasses import dataclass
@@ -42,7 +43,7 @@ def compute_twap_slices(
     slices = [slice_size] * n
 
     remainder = size_usd - sum(slices)
-    if remainder != 0:
+    if abs(remainder) > 1e-9:
         slices[-1] += remainder
 
     return slices
@@ -74,36 +75,40 @@ class TWAPExecutor:
             size_usd, symbol, len(slices), self._config.interval_s * (len(slices) - 1),
         )
 
-        total_qty = 0.0
-        total_cost = 0.0
-        total_commission = 0.0
-        last_trade: Optional[Trade] = None
+        # Execute first slice immediately so caller gets a trade back without blocking
+        first_trade = self._provider.buy(symbol, product_id, slices[0], position_id, market_price)
 
+        if len(slices) > 1:
+            remaining = slices[1:]
+            t = threading.Thread(
+                target=self._execute_remaining_slices,
+                args=(symbol, product_id, remaining, position_id, market_price),
+                daemon=True,
+            )
+            t.start()
+
+        return first_trade
+
+    def _execute_remaining_slices(
+        self,
+        symbol: str,
+        product_id: str,
+        slices: list[float],
+        position_id: str,
+        market_price: float,
+    ) -> None:
+        """Execute remaining TWAP slices in background."""
         for i, slice_usd in enumerate(slices):
-            trade = self._provider.buy(symbol, product_id, slice_usd, position_id, market_price)
-            total_qty += trade.quantity
-            total_cost += trade.quantity * trade.price
-            total_commission += trade.commission
-            last_trade = trade
-
-            if i < len(slices) - 1 and self._config.interval_s > 0:
+            if self._config.interval_s > 0:
                 time.sleep(self._config.interval_s)
-
-        avg_price = total_cost / total_qty if total_qty > 0 else market_price
-
-        return Trade(
-            id=last_trade.id if last_trade else "",
-            position_id=position_id,
-            side="buy",
-            symbol=symbol,
-            quantity=total_qty,
-            size_usd=size_usd,
-            price=avg_price,
-            status="filled",
-            paper_trading=last_trade.paper_trading if last_trade else True,
-            placed_at=last_trade.placed_at if last_trade else time.time() * 1000,
-            commission=total_commission,
-        )
+            try:
+                trade = self._provider.buy(symbol, product_id, slice_usd, position_id, market_price)
+                logger.info(
+                    "TWAP slice %d/%d filled: %s %.8f @ %.2f",
+                    i + 2, len(slices) + 1, symbol, trade.quantity, trade.price,
+                )
+            except Exception:
+                logger.exception("TWAP slice %d/%d failed for %s", i + 2, len(slices) + 1, symbol)
 
     def execute_sell(
         self,

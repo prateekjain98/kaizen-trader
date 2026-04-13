@@ -1,5 +1,6 @@
 """Declarative, stackable protection rules — inspired by Freqtrade."""
 
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -102,6 +103,8 @@ class StoplossGuard(ProtectionRule):
         cutoff = ctx.timestamp_ms - self.lookback_ms
         while self._recent_stops and self._recent_stops[0] < cutoff:
             self._recent_stops.popleft()
+        # Sync consecutive counter with remaining entries after pruning
+        self._consecutive = min(self._consecutive, len(self._recent_stops))
 
         if self._consecutive >= self.max_consecutive_stops:
             return ProtectionVerdict(
@@ -263,21 +266,25 @@ class ProtectionChain:
 
     def __init__(self, rules: list[ProtectionRule]):
         self.rules = rules
+        self._lock = threading.Lock()
 
     def can_open(self, ctx: ProtectionContext) -> ProtectionVerdict:
-        for rule in self.rules:
-            verdict = rule.check(ctx)
-            if not verdict.allowed:
-                return verdict
-        return ProtectionVerdict(allowed=True)
+        with self._lock:
+            for rule in self.rules:
+                verdict = rule.check(ctx)
+                if not verdict.allowed:
+                    return verdict
+            return ProtectionVerdict(allowed=True)
 
     def notify_close(self, position: Position, pnl_usd: float) -> None:
-        for rule in self.rules:
-            rule.on_trade_closed(position, pnl_usd)
+        with self._lock:
+            for rule in self.rules:
+                rule.on_trade_closed(position, pnl_usd)
 
     def reset_day(self) -> None:
-        for rule in self.rules:
-            rule.on_day_reset()
+        with self._lock:
+            for rule in self.rules:
+                rule.on_day_reset()
 
     @classmethod
     def from_config(cls, config_list: list[dict]) -> "ProtectionChain":

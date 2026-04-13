@@ -297,7 +297,8 @@ def get_atr(symbol: str, period: int = 14) -> Optional[float]:
     """Get ATR for a symbol from the candle buffer, excluding the incomplete current candle."""
     now = time.time() * 1000
     with _lock:
-        buf = _candle_buffers.get(symbol)
+        raw = _candle_buffers.get(symbol)
+        buf = list(raw) if raw else None
     if not buf:
         return None
     # Exclude the last candle if it is still forming (within the current candle interval)

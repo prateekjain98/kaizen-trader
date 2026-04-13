@@ -160,7 +160,7 @@ _MIN_CORRELATION_MULTIPLIER = 0.25    # never reduce below 25% of original size
 
 def _normalize_symbol(symbol: str) -> str:
     """Strip exchange suffixes to get base symbol (e.g. 'SOL-USD' -> 'SOL')."""
-    return symbol.replace("-USD", "").replace("-USDT", "").replace("USDT", "").replace("USD", "")
+    return symbol.removesuffix("-USD").removesuffix("-USDT").removesuffix("USDT").removesuffix("USD")
 
 
 def _sector_exposure(group: str, open_positions: list[Position]) -> float:

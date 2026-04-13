@@ -96,7 +96,7 @@ def paper_buy(symbol: str, product_id: str, size_usd: float,
 def paper_sell(symbol: str, product_id: str, quantity: float,
                position_id: str, market_price: float) -> Trade:
     global _balance
-    _simulate_delay()
+    # Skip simulated delay on exit path — exits should be fast
 
     # Price sanity check — division by zero guard
     if market_price <= 0:

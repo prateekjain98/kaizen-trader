@@ -20,8 +20,10 @@ def _clamp(value: float, key: str) -> float:
 
 
 def _adjust(config: ScannerConfig, key: str, delta: float) -> None:
-    current = getattr(config, key)
-    setattr(config, key, _clamp(current + delta, key))
+    from src.main import _config_lock
+    with _config_lock:
+        current = getattr(config, key)
+        setattr(config, key, _clamp(current + delta, key))
 
 
 def _classify_loss_reason(p: Position, config: ScannerConfig) -> LossReason:
