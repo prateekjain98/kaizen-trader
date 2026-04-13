@@ -193,6 +193,36 @@ def fetch_coinbase_new_listings(known_products: set[str]) -> list[dict]:
     return new
 
 
+def fetch_lunarcrush_trending() -> list[dict]:
+    """Get trending coins from LunarCrush. Requires API key in env."""
+    import os
+    key = os.environ.get("LUNARCRUSH_API_KEY", "")
+    if not key:
+        return []
+    try:
+        req = Request(
+            "https://lunarcrush.com/api4/public/coins/list/v2",
+            headers={"User-Agent": "kaizen-trader/2.0", "Authorization": f"Bearer {key}"},
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        coins = data.get("data", [])
+        # Return top coins by social activity
+        return [
+            {
+                "symbol": c.get("symbol", ""),
+                "name": c.get("name", ""),
+                "galaxy_score": c.get("galaxy_score", 0),
+                "alt_rank": c.get("alt_rank", 0),
+                "social_volume": c.get("social_volume", 0),
+                "social_score": c.get("social_score", 0),
+            }
+            for c in sorted(coins, key=lambda x: x.get("galaxy_score", 0), reverse=True)[:20]
+        ]
+    except Exception:
+        return []
+
+
 def fetch_binance_prices(symbols: list[str]) -> dict[str, float]:
     """Fetch current prices for multiple symbols from Binance."""
     data = _fetch_json("https://api.binance.com/api/v3/ticker/price")
@@ -227,10 +257,48 @@ class DataStreams:
         self._known_binance_listings: set[str] = set()
         self._prev_trending: set[str] = set()
         self._lock = threading.Lock()
+        self._binance_ws = None
+        self._ws_tick_count = 0
+
+    def _on_ws_tick(self, symbol: str, price: float, volume_24h: float, change_pct: float):
+        """Called by BinanceWebSocket on every tick (~1s for all symbols)."""
+        with self._lock:
+            self.snapshot.prices[symbol] = price
+            self.snapshot.volumes_24h[symbol] = volume_24h
+        self._ws_tick_count += 1
+
+        # Detect large sudden moves (>10% in 24h) as potential signals
+        if abs(change_pct) > 10:
+            self.on_signal(TokenSignal(
+                source="binance_ws",
+                symbol=symbol,
+                event_type="large_move",
+                data={"price": price, "volume_24h": volume_24h, "change_pct": change_pct},
+                timestamp=time.time() * 1000,
+                priority=2 if abs(change_pct) > 20 else 1,
+            ))
+
+    def _on_ws_funding(self, symbol: str, funding_rate: float, mark_price: float):
+        """Called by BinanceWebSocket with real-time funding rates."""
+        with self._lock:
+            self.snapshot.funding_rates[symbol] = funding_rate
+            self.snapshot.prices[symbol] = mark_price
 
     def start(self):
-        """Start all data stream polling threads."""
+        """Start all data stream polling threads + Binance WebSocket."""
         log("info", "Starting data streams...")
+
+        # Start Binance WebSocket for real-time prices + funding
+        try:
+            from src.engine.binance_ws import BinanceWebSocket
+            self._binance_ws = BinanceWebSocket(
+                on_tick=self._on_ws_tick,
+                on_funding=self._on_ws_funding,
+            )
+            self._binance_ws.connect()
+            log("info", "Binance Futures WS starting — real-time prices for 700+ symbols")
+        except Exception as e:
+            log("warn", f"Binance WS failed to start: {e} — using REST polling fallback")
 
         # Initialize known Coinbase products
         products = _fetch_json("https://api.exchange.coinbase.com/products")
@@ -249,6 +317,7 @@ class DataStreams:
             ("binance_funding", self._poll_funding, 60),            # 1 min
             ("binance_listings", self._poll_binance_listings, 60),  # 1 min
             ("coinbase_listings", self._poll_coinbase_listings, 30),# 30 sec
+            ("lunarcrush", self._poll_lunarcrush, 120),             # 2 min (rate limited)
         ]
 
         for name, fn, interval_s in streams:
@@ -392,3 +461,20 @@ class DataStreams:
                 priority=3,  # URGENT — Coinbase listings are 77% WR
             ))
             log("info", f"NEW COINBASE LISTING: {l['symbol']}")
+
+    def _poll_lunarcrush(self):
+        lc = fetch_lunarcrush_trending()
+        if not lc:
+            return
+        now = time.time() * 1000
+
+        for coin in lc[:5]:
+            if coin.get("galaxy_score", 0) > 70:
+                self.on_signal(TokenSignal(
+                    source="lunarcrush",
+                    symbol=coin["symbol"],
+                    event_type="social_buzz",
+                    data=coin,
+                    timestamp=now,
+                    priority=2 if coin.get("galaxy_score", 0) > 80 else 1,
+                ))
