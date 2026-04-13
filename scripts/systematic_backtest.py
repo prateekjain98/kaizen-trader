@@ -1996,7 +1996,7 @@ ALL_SIMULATORS: dict[str, type] = {
     # === Proven profitable ===
     "correlation_break": CorrelationBreakSimulator,
     "cross_exchange_divergence": CrossExchangeSimulator,
-    "listing_pump": ListingPumpSimulator,
+    # "listing_pump": ListingPumpSimulator,  # run separately with 5m data
     # === Re-engineered with research-backed fixes ===
     "momentum_swing": MomentumSimulator,               # FIXED: pullback entry, EMA50 rising
     "fear_greed_contrarian": FearGreedSimulator,        # FIXED: real FGI data from Alternative.me

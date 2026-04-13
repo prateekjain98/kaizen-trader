@@ -1,5 +1,6 @@
 """Self-Healing AI Crypto Trader — Main Entry Point."""
 
+import hmac as _hmac_mod
 import http.server
 import json
 import os
@@ -72,6 +73,7 @@ from src.risk.loss_cooldown import is_on_cooldown, record_trade_result
 from src.risk.regime_gate import is_regime_blocked
 from src.risk.scaling import get_initial_fraction, get_max_tranches, should_add_tranche, compute_tranche_size_usd
 from src.risk.adaptive_stops import compute_adaptive_stop
+from src.risk.signal_aggregator import SignalAggregator
 from src.storage.database import insert_trade_journal
 from src.evaluation.metrics import monte_carlo_significance
 
@@ -108,6 +110,8 @@ _market_ctx: MarketContext = MarketContext(
     total_market_cap_change_d1=0, timestamp=0,
 )
 
+_config_lock = threading.Lock()
+
 _price_lock = threading.Lock()
 _latest_prices: dict[str, float] = {}  # symbol -> latest price
 _prev_prices: dict[str, float] = {}    # symbol -> previous tick price (for CVD side inference)
@@ -141,6 +145,9 @@ _last_scan_time: dict[str, float] = {}
 _MIN_SCAN_INTERVAL_S = 2.0  # at most one full scan per symbol every 2s
 _last_htf_aggregate: dict[str, float] = {}  # symbol -> last HTF aggregation time
 _HTF_AGGREGATE_INTERVAL_S = 60.0  # aggregate to higher timeframes every 60 seconds
+
+# Cross-strategy signal aggregation — deduplicates and boosts agreeing signals
+_signal_aggregator = SignalAggregator(window_ms=3000)
 
 
 # ─── Market context ──────────────────────────────────────────────────────────
@@ -313,7 +320,9 @@ def _scan_protocol_revenue_signals() -> None:
         )
         sig = scan_protocol_revenue(metric, current_price)
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
 
 
 # ─── Signal processing (qualify -> risk -> size -> execute) ───────────────────
@@ -421,7 +430,8 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         data={"qual_score": qual.score, "breakdown": qual.breakdown})
 
     # Block duplicate: don't open same symbol+strategy if already open
-    for pos in get_open_positions():
+    open_pos = get_open_positions()
+    for pos in open_pos:
         if pos.symbol == signal.symbol and pos.strategy == signal.strategy:
             return
 
@@ -438,7 +448,6 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         return
 
     # Correlation-aware discount: reduce size when stacking correlated assets
-    open_pos = get_open_positions()
     size_usd = apply_correlation_discount(size_usd, signal.symbol, signal.side, open_pos)
 
     # Sector exposure cap: don't exceed 30% portfolio in one group
@@ -446,6 +455,11 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     if size_usd <= 0:
         log("info", f"Sector exposure cap reached for {signal.symbol}", symbol=signal.symbol)
         return
+
+    # Proactive regime scaling: adjust size based on current volatility
+    from src.risk.regime_scaler import get_regime_scaling
+    regime_scaling = get_regime_scaling(signal.symbol)
+    size_usd *= regime_scaling.size_multiplier
 
     # DCA: swing positions enter with initial tranche fraction only
     initial_fraction = get_initial_fraction(signal.tier)
@@ -504,6 +518,14 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
             stop_price = entry_price * (1 - trail_pct)
         else:
             stop_price = entry_price * (1 + trail_pct)
+
+    # Proactive regime scaling: adjust stop distance based on current volatility
+    trail_pct *= regime_scaling.stop_multiplier
+    trail_pct = min(trail_pct, config.max_trail_pct)
+    if signal.side == "long":
+        stop_price = entry_price * (1 - trail_pct)
+    else:
+        stop_price = entry_price * (1 + trail_pct)
 
     # Capture momentum at entry for self-healing diagnosis
     from src.strategies.momentum import get_swing_buffer
@@ -662,6 +684,8 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
         should_sync = now_sync - _last_convex_sync_time >= _CONVEX_SYNC_INTERVAL_S
         if should_sync:
             _last_convex_sync_time = now_sync
+    # Sync outside _price_lock to avoid lock-ordering deadlock with portfolio._lock
+    if should_sync:
         for pos in get_open_positions():
             db_update_position_price(
                 pos.id, pos.current_price,
@@ -739,7 +763,9 @@ def _try_scan(scan_fn, ctx: MarketContext) -> None:
     try:
         sig = scan_fn()
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
     except Exception as err:
         import traceback
         log("error", f"Strategy scan error: {err}", data={"traceback": traceback.format_exc()[-500:]})
@@ -770,7 +796,9 @@ def _try_scan_correlation(symbol: str, product_id: str, price: float, ctx: Marke
             config=config, ctx=ctx,
         )
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
     except Exception as err:
         log("error", f"Correlation break scan error for {symbol}: {err}")
 
@@ -785,7 +813,9 @@ def _scan_narrative_momentum(ctx: MarketContext) -> None:
     try:
         sig = scan_narrative_momentum(product_id_map, config, current_prices, ctx=ctx)
         if sig:
-            _process_signal(sig, ctx)
+            aggregated = _signal_aggregator.submit(sig)
+            for agg_signal in aggregated:
+                _process_signal(agg_signal, ctx)
     except Exception as err:
         log("error", f"Narrative momentum scan error: {err}")
 
@@ -1342,10 +1372,17 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
             # Require auth token if configured
             if _HEALTH_TOKEN:
                 auth = self.headers.get("Authorization", "")
-                if auth != f"Bearer {_HEALTH_TOKEN}":
+                if not _hmac_mod.compare_digest(auth, f"Bearer {_HEALTH_TOKEN}"):
                     self.send_response(401)
                     self.end_headers()
                     return
+            else:
+                # No token configured — return minimal response to avoid leaking state
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "healthy"}).encode())
+                return
 
             open_positions = get_open_positions()
             registry = get_registry()

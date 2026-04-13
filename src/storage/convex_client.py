@@ -36,7 +36,9 @@ class ConvexStorage:
         self._flush_thread: Optional[threading.Thread] = None
         self._running = False
         self._flush_interval = 1.0
-        self._paper_trading = os.environ.get("PAPER_TRADING", "true").lower() == "true"
+        # Source paper_trading from the canonical config.env to avoid divergence
+        from src.config import env as _env
+        self._paper_trading = _env.paper_trading
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -113,13 +115,17 @@ class ConvexStorage:
         try:
             from pathlib import Path
             dead_letter_path = Path(__file__).resolve().parents[2] / ".dead_letters.jsonl"
+            # Size cap: skip writes if file exceeds 50 MB to prevent disk exhaustion
+            if dead_letter_path.exists() and dead_letter_path.stat().st_size > 50 * 1024 * 1024:
+                logger.warning("Dead letter file exceeds 50MB, skipping write")
+                return
             entry = {
                 "mutation": mutation_name,
                 "args": args,
                 "error": error,
                 "timestamp": time.time(),
             }
-            with open(dead_letter_path, "a") as f:
+            with open(dead_letter_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception as write_err:
             logger.error(f"Dead letter write also failed: {write_err}")
@@ -234,7 +240,7 @@ class ConvexStorage:
 
         ts_str = datetime.fromtimestamp(now / 1000, tz=timezone.utc).isoformat()
         sym_tag = f" [{symbol}]" if symbol else ""
-        print(f"[{ts_str}] [{level.upper()}]{sym_tag} {message}")
+        logger.info("[%s] [%s]%s %s", ts_str, level.upper(), sym_tag, message)
 
     def insert_diagnosis(self, d: TradeDiagnosis) -> None:
         self._enqueue("mutations:insertDiagnosis", {

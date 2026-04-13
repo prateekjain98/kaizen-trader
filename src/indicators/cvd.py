@@ -6,6 +6,7 @@ Built from the Coinbase WS trade tape (ticker messages include side).
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,7 +37,7 @@ class _VolumeTick:
 _MAX_SYMBOLS = 500
 _MAX_TICKS = 1000  # ~15 minutes at high activity
 _lock = threading.Lock()
-_tick_buffers: dict[str, list[_VolumeTick]] = {}
+_tick_buffers: dict[str, deque[_VolumeTick]] = {}
 _snapshot_cache: dict[str, tuple[CVDSnapshot, float]] = {}
 _SNAPSHOT_TTL_MS = 2_000
 
@@ -59,10 +60,8 @@ def push_trade(symbol: str, price: float, size: float, side: str) -> None:
             del _tick_buffers[oldest]
             _snapshot_cache.pop(oldest, None)
 
-        buf = _tick_buffers.setdefault(symbol, [])
+        buf = _tick_buffers.setdefault(symbol, deque(maxlen=_MAX_TICKS))
         buf.append(_VolumeTick(ts=now, delta=delta, price=price))
-        if len(buf) > _MAX_TICKS:
-            buf.pop(0)
 
 
 def get_cvd_snapshot(symbol: str) -> Optional[CVDSnapshot]:

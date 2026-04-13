@@ -218,9 +218,9 @@ class TestQualify:
         assert result.score < config.min_qual_score_swing
 
     def test_scalp_uses_scalp_threshold(self, neutral_ctx, config):
-        signal = make_signal(score=50, tier="scalp")
+        signal = make_signal(score=60, tier="scalp")
         result = qualify(signal, neutral_ctx, config)
-        assert result.passed is True  # 50 >= 45 (min_qual_score_scalp)
+        assert result.passed is True  # 60 + adjustments >= 55 (min_qual_score_scalp)
 
     def test_score_clamped_to_0_100(self, neutral_ctx, config):
         # Very high base score + positive adjustments shouldn't exceed 100

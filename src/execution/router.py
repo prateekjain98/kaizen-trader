@@ -12,8 +12,11 @@ from typing import Optional
 from src.config import env
 from src.execution.protocol import ExecutionProvider
 from src.execution.providers import CoinbaseProvider, PaperProvider, BinanceProvider
+from src.execution.twap import TWAPExecutor, TWAPConfig
 from src.storage.database import log
 from src.types import Trade
+
+_twap_config = TWAPConfig(threshold_usd=500, num_slices=3, interval_s=30)
 
 # Symbols that should route to Binance (futures-only assets or better liquidity)
 # These don't have Coinbase Advanced Trade pairs
@@ -91,7 +94,8 @@ def execute_buy(symbol: str, product_id: str, size_usd: float,
     provider = get_provider(symbol)
     log("info", f"Routing BUY {symbol} ${size_usd:.2f} via {provider.name}",
         symbol=symbol, data={"exchange": provider.name, "size_usd": size_usd})
-    return provider.buy(symbol, product_id, size_usd, position_id, market_price)
+    executor = TWAPExecutor(provider=provider, config=_twap_config)
+    return executor.execute_buy(symbol, product_id, size_usd, position_id, market_price)
 
 
 def execute_sell(symbol: str, product_id: str, quantity: float,

@@ -1,7 +1,9 @@
 """LunarCrush social signal fetcher."""
 
+import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -29,7 +31,8 @@ class SocialSentiment:
     alt_rank_change_24h: int = 0  # rank change (negative = improving)
 
 
-_volume_history: dict[str, list[float]] = {}
+_SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9]{1,20}$")
+_volume_history: dict[str, deque[float]] = {}
 _last_fetch_at: float = 0
 _cached: list[SocialSentiment] = []
 _CACHE_TTL_MS = 600_000  # 10 min — LunarCrush free tier rate-limits aggressively
@@ -71,12 +74,10 @@ def _record_topic_call() -> None:
 
 def _compute_velocity(symbol: str, current_volume: float) -> float:
     if symbol not in _volume_history:
-        _volume_history[symbol] = []
+        _volume_history[symbol] = deque(maxlen=24)
     hist = _volume_history[symbol]
     avg = sum(hist) / len(hist) if hist else current_volume
     hist.append(current_volume)
-    if len(hist) > 24:
-        hist.pop(0)
     return current_volume / avg if avg > 0 else 1.0
 
 
@@ -108,6 +109,8 @@ def fetch_social_sentiment(symbols: list[str]) -> list[SocialSentiment]:
         log("warn", "Social circuit breaker OPEN — returning cached data")
         return _cached
 
+    # Validate symbols before constructing URLs
+    symbols = [s for s in symbols if _SYMBOL_PATTERN.fullmatch(s)]
     results: list[SocialSentiment] = []
     chunks = [symbols[i:i+10] for i in range(0, len(symbols), 10)]
     any_success = False
@@ -160,6 +163,8 @@ def fetch_topic_sentiment(symbol: str) -> Optional[SocialSentiment]:
     Budget: 3 req/min for top-3 active symbols.
     """
     if not env.lunarcrush_api_key:
+        return None
+    if not _SYMBOL_PATTERN.fullmatch(symbol):
         return None
 
     now = time.time() * 1000
@@ -226,6 +231,8 @@ def fetch_social_time_series(symbol: str, interval: str = "1d",
     Budget: 2 req/min.
     """
     if not env.lunarcrush_api_key:
+        return []
+    if not _SYMBOL_PATTERN.fullmatch(symbol):
         return []
 
     if not _breaker.can_call():

@@ -71,7 +71,7 @@ def on_liquidation_event(event: LiquidationEvent, current_oi: float) -> None:
 
 STRATEGY_META = {
     "strategies": [
-        {"id": "liquidation_event", "function": "scan_liquidation_cascade",
+        {"id": "liquidation_cascade", "function": "scan_liquidation_cascade",
          "description": "Detects liquidation cascades and trades the post-cascade bounce",
          "tier": "swing"},
     ],

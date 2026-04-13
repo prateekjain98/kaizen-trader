@@ -3,6 +3,7 @@
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -24,10 +25,10 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-_lock = threading.RLock()  # RLock: _get_chain() may re-enter from can_open/register_close
+_lock = threading.RLock()  # RLock: _get_chain() may re-enter from register_close
 _daily_stats = DailyStats(date=_today_utc())
 _open_positions: dict[str, Position] = {}
-_daily_returns: list[float] = []
+_daily_returns: deque[float] = deque(maxlen=365)
 _protection_chain: Optional[ProtectionChain] = None
 
 
@@ -57,8 +58,6 @@ def _maybe_reset_day() -> None:
         if _daily_stats.date != today:
             if _daily_stats.realized_pnl != 0:
                 _daily_returns.append(_daily_stats.realized_pnl)
-                if len(_daily_returns) > 365:
-                    _daily_returns.pop(0)
             _daily_stats = DailyStats(date=today)
             reset_needed = True
     if reset_needed:
@@ -78,10 +77,14 @@ def can_open_position() -> bool:
             log("warn", f"Trading halted — paper balance ${balance:.2f} below $50 minimum")
             return False
 
+    unrealized = compute_unrealized_pnl()  # acquires + releases _lock cleanly
     with _lock:
         chain = _get_chain()
+        # Include negative unrealized P&L in drawdown check;
+        # don't let paper profits offset realized losses.
+        total_pnl = _daily_stats.realized_pnl + min(0.0, unrealized)
         ctx = ProtectionContext(
-            realized_pnl_today=_daily_stats.realized_pnl,
+            realized_pnl_today=total_pnl,
             open_position_count=len(_open_positions),
             timestamp_ms=time.time() * 1000,
         )
@@ -124,6 +127,18 @@ def get_daily_stats() -> DailyStats:
     _maybe_reset_day()
     with _lock:
         return DailyStats(date=_daily_stats.date, realized_pnl=_daily_stats.realized_pnl, trade_count=_daily_stats.trade_count)
+
+
+def compute_unrealized_pnl() -> float:
+    """Sum of unrealized P&L across all open positions (mark-to-market)."""
+    with _lock:
+        total = 0.0
+        for pos in _open_positions.values():
+            if pos.side == "long":
+                total += (pos.current_price - pos.entry_price) * pos.quantity
+            else:
+                total += (pos.entry_price - pos.current_price) * pos.quantity
+        return total
 
 
 def is_circuit_breaker_open() -> bool:

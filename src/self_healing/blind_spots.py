@@ -5,15 +5,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from src.types import TradeDiagnosis
+from src.types import TradeDiagnosis, SCALP_STRATEGY_IDS
 from src.automation.github_issues import create_blind_spot_issue
 
 
-_SCALP_STRATEGIES = {"momentum_scalp", "orderbook_imbalance"}
-
-
 def _infer_tier(strategy: str) -> str:
-    return "scalp" if strategy in _SCALP_STRATEGIES else "swing"
+    return "scalp" if strategy in SCALP_STRATEGY_IDS else "swing"
 
 
 def _hold_bucket(hold_ms: float) -> str:
@@ -112,16 +109,19 @@ class BlindSpotDetector:
                 / fp.occurrences
             )
 
-            if fp.occurrences == self.config.min_occurrences_to_flag:
-                # Auto-create GitHub issue for newly flagged blind spot
-                create_blind_spot_issue(
-                    fingerprint_key=fp.key,
-                    occurrences=fp.occurrences,
-                    avg_loss_pct=fp.avg_pnl_pct * 100,
-                    affected_strategies=[fp.strategy],
-                )
-                return fp
-            return None
+            just_crossed = fp.occurrences == self.config.min_occurrences_to_flag
+            crossed_fp = fp if just_crossed else None
+
+        # Create GitHub issue OUTSIDE the lock to avoid blocking for up to 30s
+        if crossed_fp is not None:
+            create_blind_spot_issue(
+                fingerprint_key=crossed_fp.key,
+                occurrences=crossed_fp.occurrences,
+                avg_loss_pct=crossed_fp.avg_pnl_pct * 100,
+                affected_strategies=[crossed_fp.strategy],
+            )
+            return crossed_fp
+        return None
 
     def get_flagged_blind_spots(self) -> list[UnknownFingerprint]:
         """Return all fingerprints that have crossed the threshold."""

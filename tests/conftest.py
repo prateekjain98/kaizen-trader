@@ -85,17 +85,18 @@ def make_position(
     entry_price=2000.0, quantity=0.5, pnl_pct=None, pnl_usd=None,
     exit_reason=None, qual_score=70.0, opened_at=None, closed_at=None,
     high_watermark=None, low_watermark=None, status="open",
+    current_price=None, size_usd=None, id=None,
 ) -> Position:
     now = _now_ms()
     return Position(
-        id="test-pos-1", symbol=symbol, product_id=f"{symbol}-USD",
+        id=id or "test-pos-1", symbol=symbol, product_id=f"{symbol}-USD",
         strategy=strategy, side=side, tier=tier,
         entry_price=entry_price, quantity=quantity,
-        size_usd=entry_price * quantity,
+        size_usd=size_usd if size_usd is not None else entry_price * quantity,
         opened_at=opened_at or now,
         high_watermark=high_watermark or entry_price * 1.05,
         low_watermark=low_watermark or entry_price * 0.95,
-        current_price=entry_price,
+        current_price=current_price if current_price is not None else entry_price,
         trail_pct=0.07, stop_price=entry_price * 0.93,
         max_hold_ms=43_200_000, qual_score=qual_score,
         signal_id="test-sig-1", status=status,

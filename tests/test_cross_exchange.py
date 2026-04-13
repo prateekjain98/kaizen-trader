@@ -1,6 +1,7 @@
 """Tests for the cross-exchange divergence strategy."""
 
 import time
+from collections import deque
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -48,10 +49,10 @@ class TestPriceSnapshot:
         with _lock:
             _divergence_history.clear()
             # Insert old entries manually
-            old = [
+            old = deque(
                 PriceSnapshot("BTC", 95000, 95000, 0.0, time.time() * 1000 - 7_200_000)
                 for _ in range(50)
-            ]
+            )
             _divergence_history["BTC"] = old
 
         with patch("src.strategies.cross_exchange_divergence._fetch_binance_price", return_value=95000.0):
@@ -69,10 +70,10 @@ class TestDivergenceStats:
         )
         now = time.time() * 1000
         with _lock:
-            _divergence_history[symbol] = [
+            _divergence_history[symbol] = deque(
                 PriceSnapshot(symbol, 95000 + d * 950, 95000, d, now - (len(divergences) - i) * 1000)
                 for i, d in enumerate(divergences)
-            ]
+            )
 
     def test_insufficient_data_returns_none(self):
         from src.strategies.cross_exchange_divergence import (
@@ -109,10 +110,10 @@ class TestScanCrossExchange:
         )
         now = time.time() * 1000
         with _lock:
-            _divergence_history[symbol] = [
+            _divergence_history[symbol] = deque(
                 PriceSnapshot(symbol, 95000 + d * 950, 95000, d, now - (len(divergences) - i) * 1000)
                 for i, d in enumerate(divergences)
-            ]
+            )
 
     def test_no_signal_for_unmapped_symbol(self):
         from src.strategies.cross_exchange_divergence import scan_cross_exchange_divergence

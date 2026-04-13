@@ -4,6 +4,7 @@ Upcoming large unlocks (>2% of supply within 7 days) are bearish signals.
 Data from TokenUnlocks.app public API.
 """
 
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -38,6 +39,8 @@ class TokenUnlock:
 def fetch_token_unlocks(symbol: str) -> list[TokenUnlock]:
     """Fetch upcoming token unlock events for a symbol."""
     if symbol.upper() in _SKIP_SYMBOLS:
+        return []
+    if not re.fullmatch(r"[A-Za-z0-9]{1,20}", symbol):
         return []
     now = time.time() * 1000
 

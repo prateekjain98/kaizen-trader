@@ -7,6 +7,7 @@ from typing import Optional
 
 from src.config import env
 from src.storage.database import get_closed_trades
+from src.types import Position
 from src.utils.safe_math import safe_score
 
 _MIN_SIZE_USD = 10
@@ -162,7 +163,7 @@ def _normalize_symbol(symbol: str) -> str:
     return symbol.replace("-USD", "").replace("-USDT", "").replace("USDT", "").replace("USD", "")
 
 
-def _sector_exposure(group: str, open_positions: list) -> float:
+def _sector_exposure(group: str, open_positions: list[Position]) -> float:
     """Sum current USD exposure in a correlation group across open positions."""
     return sum(
         pos.size_usd for pos in open_positions
@@ -171,7 +172,7 @@ def _sector_exposure(group: str, open_positions: list) -> float:
 
 
 def apply_correlation_discount(base_size_usd: float, symbol: str, side: str,
-                               open_positions: list) -> float:
+                               open_positions: list[Position]) -> float:
     """Reduce position size when entering a correlated asset on the same side."""
     base_sym = _normalize_symbol(symbol)
     group = _CORRELATION_GROUPS.get(base_sym)
@@ -199,7 +200,7 @@ _MAX_SECTOR_EXPOSURE_PCT = 0.30  # max 30% of portfolio in one correlation group
 
 
 def check_sector_exposure(symbol: str, side: str, proposed_size_usd: float,
-                          portfolio_usd: float, open_positions: list) -> float:
+                          portfolio_usd: float, open_positions: list[Position]) -> float:
     """Cap position size so total sector exposure doesn't exceed 30% of portfolio."""
     base_sym = _normalize_symbol(symbol)
     group = _CORRELATION_GROUPS.get(base_sym)

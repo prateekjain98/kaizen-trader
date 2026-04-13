@@ -11,6 +11,7 @@ Instead, we detect when one exchange leads the other and trade the lagging one.
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -39,7 +40,18 @@ class PriceSnapshot:
     timestamp: float
 
 
-_divergence_history: dict[str, list[PriceSnapshot]] = {}
+STRATEGY_META = {
+    "strategies": [
+        {"id": "cross_exchange_divergence", "function": "scan_cross_exchange_divergence",
+         "description": "Detects cross-exchange price divergences and trades mean reversion",
+         "tier": "swing"},
+    ],
+    "signal_sources": ["price_action", "correlation"],
+}
+
+_MIN_DIVERGENCE_PCT = 1.0  # Must exceed round-trip fees (~1.0-1.5%)
+
+_divergence_history: dict[str, deque[PriceSnapshot]] = {}
 _HISTORY_WINDOW_MS = 3_600_000
 _MAX_HISTORY_PER_SYMBOL = 120
 _cooldowns: dict[str, float] = {}
@@ -100,12 +112,12 @@ def record_price_snapshot(symbol: str, coinbase_price: float) -> Optional[PriceS
     )
 
     with _lock:
-        history = _divergence_history.setdefault(symbol, [])
-        history.append(snap)
+        history = _divergence_history.setdefault(symbol, deque(maxlen=_MAX_HISTORY_PER_SYMBOL))
+        # Evict stale entries from the front
         cutoff = now - _HISTORY_WINDOW_MS
-        _divergence_history[symbol] = [
-            s for s in history if s.timestamp >= cutoff
-        ][-_MAX_HISTORY_PER_SYMBOL:]
+        while history and history[0].timestamp < cutoff:
+            history.popleft()
+        history.append(snap)
 
     return snap
 
@@ -175,9 +187,6 @@ def scan_cross_exchange_divergence(
     current_div = stats["current_div_pct"]
     now = time.time() * 1000
 
-    # Divergence must exceed round-trip fees (~1.0-1.5% across exchanges) to have positive expected value.
-    # Require at least 1.0% absolute divergence as minimum edge.
-    _MIN_DIVERGENCE_PCT = 1.0
     if abs(current_div) < _MIN_DIVERGENCE_PCT:
         return None
 
