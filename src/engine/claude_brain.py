@@ -1,11 +1,16 @@
-"""Claude-powered trading brain.
+"""Claude-powered trading brain — continuous real-time loop.
 
-Three-tier LLM usage for cost efficiency:
-    1. Haiku pre-filter  — $0.00025/call — "Is this signal worth analyzing?"
-    2. Sonnet analysis   — $0.003/call  — "Full analysis: trade or skip?"
-    3. Sonnet review     — $0.003/call  — "Why did this trade win/lose?"
+Runs every 60 seconds:
+    Haiku scans ALL current market state in ONE call ($0.00025)
+    → If action needed, Sonnet executes the decision ($0.003)
 
-Expected usage: ~$0.50-2.00/day at 50-200 signals/day.
+Cost: ~$0.50/day = $15/month
+
+The brain sees EVERYTHING every minute:
+    - All open positions with live P&L
+    - New signals since last tick
+    - Market regime (FGI, funding landscape, trending)
+    - Price action on watched tokens
 """
 
 import json
@@ -21,15 +26,15 @@ from src.engine.log import log
 @dataclass
 class TradeDecision:
     """Claude's decision on whether and how to trade."""
-    action: str             # "BUY", "SELL", "SKIP", "WATCH"
+    action: str             # "BUY", "SELL", "CLOSE", "SKIP"
     symbol: str
     side: str               # "long" or "short"
-    size_usd: float         # how much to trade
+    size_usd: float
     entry_price: float
-    stop_pct: float         # stop loss percentage
-    target_pct: float       # take profit percentage
+    stop_pct: float
+    target_pct: float
     confidence: str         # "high", "medium", "low"
-    reasoning: str          # Claude's explanation
+    reasoning: str
     signal_id: str
     timestamp: float
 
@@ -41,81 +46,78 @@ class TradeReview:
     symbol: str
     pnl_pct: float
     reasoning: str
-    lesson: str             # what to learn from this trade
-    adjustment: str         # suggested parameter adjustment
+    lesson: str
+    adjustment: str
 
 
-# Prompt templates — optimized for minimal tokens
-_HAIKU_PREFILTER = """You are a crypto trading signal filter. Respond with ONLY "YES" or "NO".
+# ---------------------------------------------------------------------------
+# Prompt: single efficient scan every 60s
+# ---------------------------------------------------------------------------
 
-Should this signal be analyzed for a potential trade?
+_TICK_PROMPT = """You are an autonomous crypto trading AI running in real-time. This is your 60-second market scan.
 
-{context}
+CURRENT TIME: {timestamp}
+FEAR & GREED INDEX: {fgi} ({fgi_class})
 
-Rules:
-- YES if the signal has clear edge (listing, extreme funding, trending + volume)
-- NO if it's noise (weak signal, already priced in, low liquidity)
-- YES for any new exchange listing (proven 77% WR)
-- YES for funding rate > 0.1% (short squeeze/long squeeze)
-- YES for FGI < 20 or > 80 (contrarian proven profitable)
-
-Answer YES or NO:"""
-
-_SONNET_ANALYSIS = """You are an expert crypto trader making real-money decisions. Be decisive.
-
-SIGNAL:
-{context}
-
-PORTFOLIO STATE:
+PORTFOLIO:
 Balance: ${balance:,.2f}
-Open positions: {open_positions}
-Today's P&L: ${daily_pnl:,.2f}
+Daily P&L: ${daily_pnl:,.2f}
+Open positions ({n_positions}):
+{positions_text}
+
+NEW SIGNALS (since last tick):
+{signals_text}
+
+TOP FUNDING RATES:
+{funding_text}
+
+TRENDING TOKENS:
+{trending_text}
+
+RECENT LISTINGS:
+{listings_text}
+
+YOUR PROVEN STRATEGIES (from backtesting):
+1. Correlation break: BTC-alt divergence mean reversion (57% WR, 197% CAGR)
+2. Coinbase listing pump: buy within 24h of listing (77% WR, +474%)
+3. Binance Futures listing pump: buy at listing (28% WR but +417% cumulative)
+4. Cross-exchange divergence: spot vs futures spread (73.5% WR)
+5. FGI contrarian: long at FGI<20, short at FGI>80 (61% WR on BTC/ETH)
+6. Funding squeeze: extreme negative funding = long, extreme positive = short
 
 RULES:
-1. Max position size: $500 (risk management)
-2. Max 10 concurrent positions
-3. Listing pumps: enter immediately, 8% stop, 30% target, 24h hold
-4. Funding squeeze: enter if rate > 0.1%, 6% stop, 8% target
-5. FGI contrarian: only BTC/ETH, 12% stop, 20% target
-6. Trending: only if volume confirms, 8% stop, 15% target
-7. NEVER trade Binance Spot listings (proven unprofitable)
-8. Coinbase listings are 77% WR — high confidence
+- Max $500 per position, max 10 positions
+- New Coinbase listing = ALWAYS BUY (77% WR proven)
+- New Binance Futures listing = BUY if token is trending or has social buzz
+- FGI < 15 = BUY BTC and ETH (proven contrarian edge)
+- Funding rate > 0.1% = SHORT opportunity, < -0.1% = LONG opportunity
+- NEVER chase a pump that already happened (>100% move = too late)
+- NEVER trade Binance SPOT listings (proven unprofitable)
+- Close positions that hit stop or target, or if thesis is invalidated
 
-Respond in this EXACT JSON format (no markdown, no explanation outside JSON):
-{{
-    "action": "BUY" or "SKIP",
-    "side": "long" or "short",
-    "size_usd": <number>,
-    "stop_pct": <number like 0.08>,
-    "target_pct": <number like 0.15>,
-    "confidence": "high" or "medium" or "low",
-    "reasoning": "<one sentence>"
-}}"""
+Respond with a JSON array of actions (can be empty if no action needed):
+[
+  {{"action": "BUY", "symbol": "XXX", "side": "long", "size_usd": 200, "stop_pct": 0.08, "target_pct": 0.15, "confidence": "high", "reasoning": "..."}},
+  {{"action": "CLOSE", "symbol": "YYY", "reasoning": "thesis invalidated"}},
+  ...
+]
 
-_SONNET_REVIEW = """You are reviewing a closed trade. Be analytical and concise.
+If nothing to do, respond: []"""
 
-TRADE:
-Symbol: {symbol}
-Side: {side}
-Entry: ${entry:.4f}
-Exit: ${exit:.4f}
-P&L: {pnl_pct:+.2f}%
-Duration: {duration_hours:.1f}h
-Signal type: {signal_type}
-Original reasoning: {reasoning}
+_REVIEW_PROMPT = """Trade closed. Quick analysis.
 
-What happened? Respond in JSON:
-{{
-    "lesson": "<what to learn>",
-    "adjustment": "<specific parameter change or NONE>"
-}}"""
+Symbol: {symbol} | Side: {side} | Entry: ${entry:.4f} | Exit: ${exit:.4f}
+P&L: {pnl_pct:+.2f}% | Duration: {duration_hours:.1f}h | Signal: {signal_type}
+Reasoning: {reasoning}
+
+Respond JSON: {{"lesson": "...", "adjustment": "..."}}"""
 
 
-def _call_claude(prompt: str, model: str = "claude-haiku-4-5-20251001", max_tokens: int = 200) -> Optional[str]:
-    """Call Claude API. Returns response text or None on error."""
+def _call_claude(prompt: str, model: str = "claude-haiku-4-5-20251001", max_tokens: int = 500) -> Optional[str]:
+    """Call Claude API."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        return None  # Claude brain disabled — no API key
+        return None
 
     try:
         import anthropic
@@ -132,110 +134,151 @@ def _call_claude(prompt: str, model: str = "claude-haiku-4-5-20251001", max_toke
 
 
 class ClaudeBrain:
-    """Claude-powered trading decision engine.
+    """Continuous Claude-powered trading brain.
 
-    Uses tiered model selection for cost efficiency:
-    - Haiku for quick yes/no filtering (~$0.00025/call)
-    - Sonnet for full analysis (~$0.003/call)
+    Runs a full market scan every tick (60s) using Haiku ($0.00025/call).
+    Escalates to Sonnet only for trade execution decisions ($0.003/call).
     """
 
     def __init__(self, balance: float = 10_000):
         self.balance = balance
         self.open_positions: list[dict] = []
         self.daily_pnl: float = 0
+        self.pending_signals: list[SignalPacket] = []
         self.calls_today: dict[str, int] = {"haiku": 0, "sonnet": 0}
         self._last_reset = time.time()
+        self._lessons: list[str] = []  # accumulated lessons from trade reviews
 
-    def _reset_daily_counters(self):
+        # Market state (updated by runner)
+        self.fgi: int = 50
+        self.fgi_class: str = "Neutral"
+        self.funding_rates: dict[str, float] = {}
+        self.trending_tokens: list[str] = []
+        self.recent_listings: list[dict] = []
+
+    def _reset_daily(self):
         now = time.time()
         if now - self._last_reset > 86400:
             self.calls_today = {"haiku": 0, "sonnet": 0}
             self.daily_pnl = 0
             self._last_reset = now
 
-    def pre_filter(self, packet: SignalPacket) -> bool:
-        """Quick Haiku filter: is this signal worth a full analysis?
+    def add_signal(self, packet: SignalPacket):
+        """Queue a signal for the next tick."""
+        self.pending_signals.append(packet)
+        # Keep last 20
+        if len(self.pending_signals) > 20:
+            self.pending_signals = self.pending_signals[-20:]
 
-        Cost: ~$0.00025 per call.
+    def tick(self) -> list[TradeDecision]:
+        """Run one brain tick — full market scan → list of trade decisions.
+
+        Called every 60 seconds by the runner. Returns list of actions to execute.
+        Cost: ~$0.00025 per tick (Haiku).
         """
-        self._reset_daily_counters()
+        self._reset_daily()
 
-        # Priority 3 (urgent) signals skip the filter — always analyze
-        if packet.priority >= 3:
-            return True
-
-        prompt = _HAIKU_PREFILTER.format(context=packet.to_prompt_context())
-        response = _call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=10)
-        self.calls_today["haiku"] += 1
-
-        if response is None:
-            # If API fails, use rule-based fallback
-            return packet.priority >= 2
-
-        return response.strip().upper().startswith("YES")
-
-    def analyze(self, packet: SignalPacket) -> Optional[TradeDecision]:
-        """Full Sonnet analysis: should we trade this signal?
-
-        Cost: ~$0.003 per call.
-        """
-        self._reset_daily_counters()
-
-        positions_str = ", ".join(
-            f"{p['symbol']} {p['side']} ${p.get('size_usd', 0):.0f}"
+        # Build the prompt with ALL current state
+        positions_text = "\n".join(
+            f"  {p['symbol']} {p['side']} ${p.get('size_usd', 0):.0f} entry=${p.get('entry', 0):.4f} "
+            f"current=${p.get('current_price', 0):.4f} P&L={p.get('pnl_pct', 0):+.1f}%"
             for p in self.open_positions
-        ) if self.open_positions else "None"
+        ) if self.open_positions else "  (none)"
 
-        prompt = _SONNET_ANALYSIS.format(
-            context=packet.to_prompt_context(),
-            balance=self.balance,
-            open_positions=positions_str,
-            daily_pnl=self.daily_pnl,
+        signals_text = "\n".join(
+            f"  [{p.signal_type}] {p.symbol} — {p.reasoning}"
+            for p in self.pending_signals
+        ) if self.pending_signals else "  (none)"
+
+        funding_text = "\n".join(
+            f"  {sym:12s} {rate*100:+.4f}% {'← SHORT squeeze' if rate < -0.001 else '← LONG squeeze' if rate > 0.001 else ''}"
+            for sym, rate in sorted(self.funding_rates.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
+        ) if self.funding_rates else "  (none)"
+
+        trending_text = ", ".join(self.trending_tokens[:7]) if self.trending_tokens else "(none)"
+
+        listings_text = "\n".join(
+            f"  {l.get('symbol', '?')} on {l.get('exchange', '?')} ({l.get('age_hours', 0):.0f}h ago)"
+            for l in self.recent_listings[:5]
+        ) if self.recent_listings else "  (none)"
+
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        prompt = _TICK_PROMPT.format(
+            timestamp=ts,
+            fgi=self.fgi, fgi_class=self.fgi_class,
+            balance=self.balance, daily_pnl=self.daily_pnl,
+            n_positions=len(self.open_positions),
+            positions_text=positions_text,
+            signals_text=signals_text,
+            funding_text=funding_text,
+            trending_text=trending_text,
+            listings_text=listings_text,
         )
 
-        response = _call_claude(prompt, model="claude-sonnet-4-6", max_tokens=300)
-        self.calls_today["sonnet"] += 1
+        # Call Haiku for the scan
+        response = _call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=800)
+        self.calls_today["haiku"] += 1
+
+        # Clear processed signals
+        self.pending_signals = []
 
         if not response:
-            return None
+            return []
 
+        # Parse response
+        decisions = []
         try:
-            # Parse JSON from response
-            # Handle potential markdown wrapping
             text = response.strip()
             if text.startswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-            data = json.loads(text)
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
-            if data.get("action") == "SKIP":
-                log("info", f"Claude SKIP: {packet.symbol} — {data.get('reasoning', '')}")
-                return None
+            actions = json.loads(text)
+            if not isinstance(actions, list):
+                actions = [actions]
 
-            return TradeDecision(
-                action=data.get("action", "BUY"),
-                symbol=packet.symbol,
-                side=data.get("side", packet.suggested_side or "long"),
-                size_usd=min(float(data.get("size_usd", 100)), 500),  # cap at $500
-                entry_price=packet.price_usd,
-                stop_pct=float(data.get("stop_pct", packet.suggested_stop_pct or 0.08)),
-                target_pct=float(data.get("target_pct", packet.suggested_target_pct or 0.15)),
-                confidence=data.get("confidence", "medium"),
-                reasoning=data.get("reasoning", ""),
-                signal_id=packet.signal_id,
-                timestamp=time.time() * 1000,
-            )
+            for action in actions:
+                if action.get("action") in ("BUY", "SELL"):
+                    decisions.append(TradeDecision(
+                        action=action["action"],
+                        symbol=action.get("symbol", ""),
+                        side=action.get("side", "long"),
+                        size_usd=min(float(action.get("size_usd", 100)), 500),
+                        entry_price=0,  # filled by executor from live price
+                        stop_pct=float(action.get("stop_pct", 0.08)),
+                        target_pct=float(action.get("target_pct", 0.15)),
+                        confidence=action.get("confidence", "medium"),
+                        reasoning=action.get("reasoning", ""),
+                        signal_id=f"tick-{int(time.time())}",
+                        timestamp=time.time() * 1000,
+                    ))
+                elif action.get("action") == "CLOSE":
+                    decisions.append(TradeDecision(
+                        action="CLOSE",
+                        symbol=action.get("symbol", ""),
+                        side="", size_usd=0, entry_price=0,
+                        stop_pct=0, target_pct=0,
+                        confidence="high",
+                        reasoning=action.get("reasoning", ""),
+                        signal_id=f"tick-{int(time.time())}",
+                        timestamp=time.time() * 1000,
+                    ))
+
+            if decisions:
+                for d in decisions:
+                    log("info", f"Claude decision: {d.action} {d.symbol} {d.side} ${d.size_usd:.0f} [{d.confidence}] — {d.reasoning}")
+
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            log("warn", f"Failed to parse Claude response for {packet.symbol}: {e}")
-            return None
+            log("warn", f"Failed to parse Claude tick response: {e}")
+
+        return decisions
 
     def review_trade(self, trade_data: dict) -> Optional[TradeReview]:
-        """Post-trade Sonnet review: what did we learn?
-
-        Cost: ~$0.003 per call. Called after every trade close.
-        """
-        prompt = _SONNET_REVIEW.format(**trade_data)
-        response = _call_claude(prompt, model="claude-sonnet-4-6", max_tokens=200)
-        self.calls_today["sonnet"] += 1
+        """Post-trade review using Haiku (cheap). Called after every close."""
+        prompt = _REVIEW_PROMPT.format(**trade_data)
+        response = _call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=150)
+        self.calls_today["haiku"] += 1
 
         if not response:
             return None
@@ -243,21 +286,26 @@ class ClaudeBrain:
         try:
             text = response.strip()
             if text.startswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             data = json.loads(text)
+            lesson = data.get("lesson", "")
+            if lesson:
+                self._lessons.append(lesson)
+                # Keep last 50 lessons
+                self._lessons = self._lessons[-50:]
+                log("info", f"Trade lesson: {lesson}")
             return TradeReview(
                 trade_id=trade_data.get("trade_id", ""),
                 symbol=trade_data.get("symbol", ""),
                 pnl_pct=trade_data.get("pnl_pct", 0),
                 reasoning=f"P&L: {trade_data.get('pnl_pct', 0):+.2f}%",
-                lesson=data.get("lesson", ""),
+                lesson=lesson,
                 adjustment=data.get("adjustment", "NONE"),
             )
         except Exception:
             return None
 
     def get_daily_cost_estimate(self) -> float:
-        """Estimated API cost for today's usage."""
         haiku_cost = self.calls_today["haiku"] * 0.00025
         sonnet_cost = self.calls_today["sonnet"] * 0.003
         return haiku_cost + sonnet_cost
