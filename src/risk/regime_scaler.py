@@ -51,8 +51,10 @@ def compute_atr_percentile(
 
     recent = atr_values[-lookback:]
     current_atr = recent[-1]
-    count_below = sum(1 for v in recent if v <= current_atr)
-    return count_below / len(recent)
+    history = recent[:-1]
+    rank_below = sum(1 for v in history if v < current_atr)
+    rank_equal = sum(1 for v in history if v == current_atr)
+    return (rank_below + 0.5 * rank_equal) / (len(recent) - 1)
 
 
 def scale_for_regime(atr_percentile: float) -> RegimeScaling:
