@@ -80,8 +80,12 @@ def can_open_position() -> bool:
 
     with _lock:
         chain = _get_chain()
+        unrealized = compute_unrealized_pnl()
+        # Include negative unrealized P&L in drawdown check;
+        # don't let paper profits offset realized losses.
+        total_pnl = _daily_stats.realized_pnl + min(0.0, unrealized)
         ctx = ProtectionContext(
-            realized_pnl_today=_daily_stats.realized_pnl,
+            realized_pnl_today=total_pnl,
             open_position_count=len(_open_positions),
             timestamp_ms=time.time() * 1000,
         )
@@ -124,6 +128,18 @@ def get_daily_stats() -> DailyStats:
     _maybe_reset_day()
     with _lock:
         return DailyStats(date=_daily_stats.date, realized_pnl=_daily_stats.realized_pnl, trade_count=_daily_stats.trade_count)
+
+
+def compute_unrealized_pnl() -> float:
+    """Sum of unrealized P&L across all open positions (mark-to-market)."""
+    with _lock:
+        total = 0.0
+        for pos in _open_positions.values():
+            if pos.side == "long":
+                total += (pos.current_price - pos.entry_price) * pos.quantity
+            else:
+                total += (pos.entry_price - pos.current_price) * pos.quantity
+        return total
 
 
 def is_circuit_breaker_open() -> bool:
