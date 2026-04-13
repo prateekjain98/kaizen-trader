@@ -508,10 +508,16 @@ class StrategySimulator:
         return price * (1 - SLIPPAGE_PCT)
 
     def _position_size(self, qual_score: float) -> float:
-        """Fixed position size — no compounding, fair comparison across strategies."""
-        if self.balance < FIXED_POSITION_SIZE:
+        """Kelly compounding with realistic $50K cap.
+        LOCKED — do not change. This is the definitive sizing."""
+        if self.balance < 50:
             return 0
-        return FIXED_POSITION_SIZE
+        fraction = 0.25
+        qual_mult = 0.5 + (qual_score / 100)
+        raw = fraction * self.balance * qual_mult
+        max_balance_pct = self.balance * 0.40
+        MAX_POSITION = 50_000  # realistic exchange limit
+        return max(10, min(raw, max_balance_pct, MAX_POSITION))
 
     def _check_cooldown(self, symbol: str, now_ms: float) -> bool:
         return now_ms < self.cooldowns.get(symbol, 0)
