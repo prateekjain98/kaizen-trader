@@ -107,6 +107,9 @@ class BinanceProvider:
             resp.raise_for_status()
             self._leverage_set.add(binance_symbol)
             log("info", f"Binance leverage set to 1x for {binance_symbol}")
+        except requests.exceptions.HTTPError as exc:
+            body = exc.response.text if exc.response is not None else ""
+            log("warn", f"Failed to set leverage for {binance_symbol}: {exc} — {body}")
         except Exception as exc:
             log("warn", f"Failed to set leverage for {binance_symbol}: {exc}")
 
@@ -162,8 +165,12 @@ class BinanceProvider:
                 status="filled", paper_trading=False,
                 placed_at=time.time() * 1000,
             )
+        except requests.exceptions.HTTPError as exc:
+            body = exc.response.text if exc.response is not None else "no response"
+            safe_msg = f"Binance {side} order failed: {exc.response.status_code if exc.response else '?'} {body}"
+            log("error", safe_msg, symbol=symbol)
         except Exception as exc:
-            safe_msg = f"Binance {side} order failed ({type(exc).__name__})"
+            safe_msg = f"Binance {side} order failed ({type(exc).__name__}: {exc})"
             log("error", safe_msg, symbol=symbol)
             return _failed_trade(position_id, symbol, side.lower(), safe_msg)
 

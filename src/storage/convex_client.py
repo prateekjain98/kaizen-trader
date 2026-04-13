@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 import os
 import queue
 import threading
@@ -110,11 +111,19 @@ class ConvexStorage:
                         if mutation_name in self._CRITICAL_MUTATIONS:
                             self._write_dead_letter(mutation_name, args, str(exc))
 
+    _dead_letter_path = None
+
+    @classmethod
+    def _get_dead_letter_path(cls):
+        if cls._dead_letter_path is None:
+            from pathlib import Path
+            cls._dead_letter_path = Path(__file__).resolve().parents[2] / ".dead_letters.jsonl"
+        return cls._dead_letter_path
+
     def _write_dead_letter(self, mutation_name: str, args: dict, error: str) -> None:
         """Persist failed critical mutations to a local file for recovery."""
         try:
-            from pathlib import Path
-            dead_letter_path = Path(__file__).resolve().parents[2] / ".dead_letters.jsonl"
+            dead_letter_path = self._get_dead_letter_path()
             # Size cap: skip writes if file exceeds 50 MB to prevent disk exhaustion
             if dead_letter_path.exists() and dead_letter_path.stat().st_size > 50 * 1024 * 1024:
                 logger.warning("Dead letter file exceeds 50MB, skipping write")

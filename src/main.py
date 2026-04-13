@@ -1459,6 +1459,7 @@ def _start_health_server() -> None:
 # ─── Main entry point ────────────────────────────────────────────────────────
 
 def main() -> None:
+    print(f"[STARTUP] paper_trading={env.paper_trading} convex_url={env.convex_url} portfolio={env.portfolio_usd}", flush=True)
     # ── Initialize Convex database (must be first — everything else calls log()) ──
     if not env.convex_url:
         print("[FATAL] CONVEX_URL not set. Set it in your .env file.")
