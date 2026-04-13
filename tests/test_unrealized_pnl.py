@@ -8,6 +8,7 @@ from tests.conftest import make_position
 class TestUnrealizedPnL:
     def setup_method(self):
         """Reset portfolio state before each test."""
+        portfolio._protection_chain = None
         with portfolio._lock:
             portfolio._open_positions.clear()
             portfolio._daily_stats = portfolio.DailyStats(date=portfolio._today_utc())

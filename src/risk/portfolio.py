@@ -24,7 +24,7 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-_lock = threading.RLock()  # RLock: _get_chain() may re-enter from can_open/register_close
+_lock = threading.RLock()  # RLock: _get_chain() may re-enter from register_close
 _daily_stats = DailyStats(date=_today_utc())
 _open_positions: dict[str, Position] = {}
 _daily_returns: list[float] = []
@@ -78,9 +78,9 @@ def can_open_position() -> bool:
             log("warn", f"Trading halted — paper balance ${balance:.2f} below $50 minimum")
             return False
 
+    unrealized = compute_unrealized_pnl()  # acquires + releases _lock cleanly
     with _lock:
         chain = _get_chain()
-        unrealized = compute_unrealized_pnl()
         # Include negative unrealized P&L in drawdown check;
         # don't let paper profits offset realized losses.
         total_pnl = _daily_stats.realized_pnl + min(0.0, unrealized)
