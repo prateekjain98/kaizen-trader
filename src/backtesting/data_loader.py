@@ -119,22 +119,20 @@ def load_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[
     all_klines: list[dict] = []
     cursor = start_ms
 
-    # If first chunk returns empty, the symbol may not have existed at start_ms.
-    # Try progressively later start dates (6-month jumps) to find when data begins.
+    # If first chunk returns empty, find when data begins using startTime=0 (single call)
     first_chunk = _fetch_klines_chunk(symbol, interval, cursor, min(cursor + _MAX_CANDLES_PER_REQUEST * interval_ms, end_ms))
     if not first_chunk:
-        _SIX_MONTHS_MS = 180 * 86_400_000
-        probe_cursor = start_ms + _SIX_MONTHS_MS
-        while probe_cursor < end_ms:
-            time.sleep(0.2)
-            probe_chunk = _fetch_klines_chunk(symbol, interval, probe_cursor, min(probe_cursor + _MAX_CANDLES_PER_REQUEST * interval_ms, end_ms))
-            if probe_chunk:
-                cursor = probe_chunk[0]["open_time"]
-                all_klines.extend(probe_chunk)
-                last_close_time = probe_chunk[-1]["close_time"]
-                cursor = last_close_time + 1
-                break
-            probe_cursor += _SIX_MONTHS_MS
+        # Fast probe: fetch with startTime=0 and large endTime to find first available candle
+        probe_chunk = _fetch_klines_chunk(symbol, interval, 0, end_ms)
+        if probe_chunk:
+            actual_start = probe_chunk[0]["open_time"]
+            if actual_start <= end_ms:
+                cursor = max(actual_start, start_ms)
+                # Keep any candles from probe that are in our range
+                in_range = [c for c in probe_chunk if c["open_time"] >= start_ms and c["open_time"] <= end_ms]
+                if in_range:
+                    all_klines.extend(in_range)
+                    cursor = in_range[-1]["close_time"] + 1
     else:
         all_klines.extend(first_chunk)
         cursor = first_chunk[-1]["close_time"] + 1
