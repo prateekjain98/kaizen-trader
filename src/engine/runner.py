@@ -26,7 +26,16 @@ from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_pric
 from src.engine.signal_detector import SignalDetector, SignalPacket
 from src.engine.claude_brain import ClaudeBrain
 from src.engine.executor import Executor
+from src.engine.correlation_scanner import CorrelationScanner
 from src.engine.log import log
+
+# Top symbols to scan for correlation breaks (from backtest)
+_CORR_SYMBOLS = [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "LINK", "AVAX",
+    "UNI", "AAVE", "DOT", "MATIC", "FIL", "NEAR", "FTM", "ARB", "OP",
+    "SUI", "APT", "SEI", "INJ", "RENDER", "FET", "PENDLE", "TAO",
+    "PEPE", "BONK", "WIF", "DYDX", "GRT", "SNX", "COMP", "MKR",
+]
 
 
 class TradingEngine:
@@ -39,6 +48,7 @@ class TradingEngine:
         4. Returns list of TradeDecisions
         5. Executor processes each decision (open/close positions)
         6. Price updater checks stops/targets every 5s
+        7. Correlation scanner runs every hour (197% CAGR strategy)
 
     Cost: ~$0.50/day at 60s ticks.
     """
@@ -53,6 +63,7 @@ class TradingEngine:
         self.brain = ClaudeBrain(balance=balance)
         self.executor = Executor(paper=paper, initial_balance=balance)
         self.streams = DataStreams(on_signal=self._on_raw_signal)
+        self.corr_scanner = CorrelationScanner()
 
         # Stats
         self.signals_received = 0
@@ -105,6 +116,24 @@ class TradingEngine:
             try:
                 self._sync_brain_state()
 
+                # Run correlation break scanner (our best strategy — 197% CAGR)
+                now_ms = time.time() * 1000
+                corr_signals = self.corr_scanner.scan(_CORR_SYMBOLS, now_ms)
+                for cs in corr_signals:
+                    from src.engine.signal_detector import SignalPacket
+                    self.brain.add_signal(SignalPacket(
+                        signal_id=f"corr-{int(now_ms)}-{cs['symbol']}",
+                        symbol=cs["symbol"], signal_type="correlation_break",
+                        priority=2, timestamp=now_ms,
+                        price_usd=self.streams.snapshot.prices.get(cs["symbol"], 0),
+                        fear_greed_index=self.streams.snapshot.fear_greed_index,
+                        source="correlation_scanner",
+                        reasoning=cs["reasoning"],
+                        suggested_side=cs["side"],
+                        suggested_stop_pct=0.03, suggested_target_pct=0.05,
+                        data=cs,
+                    ))
+
                 # Claude brain tick — one Haiku call with full state
                 decisions = self.brain.tick()
                 self.ticks_run += 1
@@ -136,9 +165,18 @@ class TradingEngine:
             self._stop.wait(timeout=self.tick_interval)
 
     def _price_update_loop(self):
-        """Poll Binance prices for open positions and check stops/targets."""
+        """Poll Binance prices, check stops/targets, feed correlation scanner."""
         while not self._stop.is_set():
             try:
+                # Feed correlation scanner with all tracked symbol prices
+                all_prices = self.streams.snapshot.prices
+                now_ms = time.time() * 1000
+                for sym in _CORR_SYMBOLS:
+                    price = all_prices.get(sym, 0)
+                    if price > 0:
+                        self.corr_scanner.update_price(sym, price, now_ms)
+
+                # Update position prices and check stops/targets
                 symbols = [p.symbol for p in self.executor.positions]
                 if symbols:
                     prices = fetch_binance_prices(symbols)

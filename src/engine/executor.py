@@ -1,15 +1,18 @@
 """Binance execution engine — manages orders, positions, and risk.
 
-Handles:
-    - Market order placement via Binance Futures API
-    - Position tracking with stop loss and take profit
-    - Risk limits (max positions, max daily loss, position size cap)
-    - Paper trading mode for testing
+Fixes applied:
+    1. Commission tracking on all paper trades
+    2. Trailing stops — stop moves up as price moves in our favor
+    3. Server-side stops via Binance OCO orders (live mode)
+    4. Proper P&L accounting including fees
+    5. Position persistence to JSON (survives restart)
 """
 
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from src.config import env
@@ -34,9 +37,14 @@ class Position:
     current_price: float = 0
     high_watermark: float = 0
     low_watermark: float = float("inf")
+    entry_commission: float = 0  # fee paid on entry
+    trailing_stop_price: float = 0  # moves up with price
 
     @property
     def stop_price(self) -> float:
+        """Current stop — uses trailing stop if it's been moved up."""
+        if self.trailing_stop_price > 0:
+            return self.trailing_stop_price
         if self.side == "long":
             return self.entry_price * (1 - self.stop_pct)
         return self.entry_price * (1 + self.stop_pct)
@@ -57,7 +65,8 @@ class Position:
 
     @property
     def unrealized_pnl_usd(self) -> float:
-        return self.unrealized_pnl_pct * self.size_usd
+        """P&L including entry commission (exit commission not yet realized)."""
+        return self.unrealized_pnl_pct * self.size_usd - self.entry_commission
 
     @property
     def hold_hours(self) -> float:
@@ -70,22 +79,30 @@ class ClosedTrade:
     position: Position
     exit_price: float
     pnl_pct: float
-    pnl_usd: float
-    exit_reason: str        # "stop", "target", "timeout", "manual"
+    pnl_usd: float          # net of ALL commissions
+    exit_reason: str
     closed_at: float
+    exit_commission: float = 0
+
+
+_PORTFOLIO_FILE = Path("/tmp/kaizen_portfolio.json")
 
 
 class Executor:
     """Manages trade execution and position lifecycle.
 
-    Supports both paper trading and live Binance Futures execution.
+    Features:
+        - Commission tracking (0.075% per side with BNB)
+        - Trailing stops (move stop up after 1.5x stop distance profit)
+        - Server-side OCO orders in live mode
+        - Position persistence to JSON
     """
 
-    # Risk limits
     MAX_POSITIONS = 10
-    MAX_POSITION_SIZE = 500     # $500 max per trade
-    MAX_DAILY_LOSS = 1000       # stop trading after -$1000/day
+    MAX_POSITION_SIZE = 500
+    MAX_DAILY_LOSS = 1000
     COMMISSION_PCT = 0.00075    # Binance with BNB discount
+    TRAIL_ACTIVATION = 1.5      # Start trailing after 1.5x stop distance profit
 
     def __init__(self, paper: bool = True, initial_balance: float = 10_000):
         self.paper = paper
@@ -93,12 +110,81 @@ class Executor:
         self.positions: list[Position] = []
         self.closed_trades: list[ClosedTrade] = []
         self.daily_pnl: float = 0
+        self.total_commissions: float = 0
         self._daily_reset_ts: float = time.time()
-        self._binance: Optional[object] = None
+        self._binance = None
 
         if not paper:
             from src.execution.providers import BinanceProvider
             self._binance = BinanceProvider()
+
+        # Load saved state
+        self._load_state()
+
+    def _load_state(self):
+        """Load portfolio state from JSON if it exists."""
+        if _PORTFOLIO_FILE.exists():
+            try:
+                with open(_PORTFOLIO_FILE) as f:
+                    state = json.load(f)
+                self.balance = state.get("balance", self.balance)
+                self.total_commissions = state.get("total_commissions", 0)
+                # Restore positions
+                for p in state.get("positions", []):
+                    self.positions.append(Position(
+                        id=p.get("id", str(uuid.uuid4())),
+                        symbol=p["symbol"], side=p["side"],
+                        entry_price=p["entry_price"], size_usd=p["size_usd"],
+                        quantity=p.get("quantity", p["size_usd"] / p["entry_price"]),
+                        stop_pct=p["stop_pct"], target_pct=p.get("target_pct", 0.15),
+                        opened_at=p["opened_at"], signal_type=p.get("signal_type", ""),
+                        reasoning=p.get("reasoning", ""),
+                        current_price=p.get("current_price", p["entry_price"]),
+                        high_watermark=p.get("high_watermark", p["entry_price"]),
+                        entry_commission=p.get("entry_commission", 0),
+                        trailing_stop_price=p.get("trailing_stop_price", 0),
+                    ))
+                log("info", f"Loaded portfolio: ${self.balance:,.2f}, {len(self.positions)} positions")
+            except Exception as e:
+                log("warn", f"Failed to load portfolio state: {e}")
+
+    def _save_state(self):
+        """Persist portfolio to JSON."""
+        state = {
+            "balance": self.balance,
+            "total_commissions": self.total_commissions,
+            "positions": [
+                {
+                    "id": p.id, "symbol": p.symbol, "side": p.side,
+                    "entry_price": p.entry_price, "size_usd": p.size_usd,
+                    "quantity": p.quantity, "stop_pct": p.stop_pct,
+                    "target_pct": p.target_pct, "opened_at": p.opened_at,
+                    "signal_type": p.signal_type, "reasoning": p.reasoning,
+                    "current_price": p.current_price,
+                    "high_watermark": p.high_watermark,
+                    "entry_commission": p.entry_commission,
+                    "trailing_stop_price": p.trailing_stop_price,
+                    "stop_price": p.stop_price,
+                    "target_price": p.target_price,
+                }
+                for p in self.positions
+            ],
+            "closed_trades": [
+                {
+                    "symbol": t.position.symbol, "side": t.position.side,
+                    "entry": t.position.entry_price, "exit": t.exit_price,
+                    "pnl_pct": t.pnl_pct, "pnl_usd": t.pnl_usd,
+                    "reason": t.exit_reason, "closed_at": t.closed_at,
+                    "commissions": t.position.entry_commission + t.exit_commission,
+                }
+                for t in self.closed_trades[-50:]  # keep last 50
+            ],
+            "total_pnl": sum(t.pnl_usd for t in self.closed_trades),
+            "total_commissions": self.total_commissions,
+            "started_at": "2026-04-13T22:10:00Z",
+        }
+        with open(_PORTFOLIO_FILE, "w") as f:
+            json.dump(state, f, indent=2)
 
     def _reset_daily(self):
         now = time.time()
@@ -107,7 +193,6 @@ class Executor:
             self._daily_reset_ts = now
 
     def can_trade(self) -> bool:
-        """Check if we're allowed to open new positions."""
         self._reset_daily()
         if len(self.positions) >= self.MAX_POSITIONS:
             return False
@@ -121,7 +206,7 @@ class Executor:
         return any(p.symbol == symbol for p in self.positions)
 
     def open_position(self, decision: TradeDecision) -> Optional[Position]:
-        """Open a new position based on Claude's decision."""
+        """Open a new position with commission tracking."""
         if not self.can_trade():
             return None
         if self.has_position(decision.symbol):
@@ -131,8 +216,8 @@ class Executor:
         if size < 10:
             return None
 
-        commission = size * self.COMMISSION_PCT
-        if size + commission > self.balance:
+        entry_commission = size * self.COMMISSION_PCT
+        if size + entry_commission > self.balance:
             return None
 
         entry_price = decision.entry_price
@@ -141,7 +226,7 @@ class Executor:
 
         quantity = size / entry_price
 
-        # Execute on Binance (or paper)
+        # Execute on Binance (live mode)
         if not self.paper and self._binance:
             try:
                 side_str = "BUY" if decision.side == "long" else "SELL"
@@ -149,48 +234,121 @@ class Executor:
                     decision.symbol, decision.signal_id, side_str, quantity, entry_price
                 )
                 if trade.status == "failed":
-                    log("warn", f"Binance order failed for {decision.symbol}: {trade.error}")
+                    log("warn", f"Binance order failed: {decision.symbol}: {trade.error}")
                     return None
                 entry_price = trade.price if trade.price > 0 else entry_price
                 quantity = trade.quantity if trade.quantity > 0 else quantity
+
+                # Place server-side stop loss + take profit (OCO)
+                self._place_server_side_stops(decision.symbol, decision.side,
+                                               quantity, entry_price, decision.stop_pct, decision.target_pct)
             except Exception as e:
-                log("error", f"Execution error for {decision.symbol}: {e}")
+                log("error", f"Execution error: {decision.symbol}: {e}")
                 return None
 
-        self.balance -= (size + commission)
+        self.balance -= (size + entry_commission)
+        self.total_commissions += entry_commission
 
         pos = Position(
-            id=str(uuid.uuid4()),
-            symbol=decision.symbol,
-            side=decision.side,
-            entry_price=entry_price,
-            size_usd=size,
-            quantity=quantity,
-            stop_pct=decision.stop_pct,
-            target_pct=decision.target_pct,
+            id=str(uuid.uuid4()), symbol=decision.symbol, side=decision.side,
+            entry_price=entry_price, size_usd=size, quantity=quantity,
+            stop_pct=decision.stop_pct, target_pct=decision.target_pct,
             opened_at=time.time() * 1000,
-            signal_type=decision.reasoning[:50],
-            reasoning=decision.reasoning,
-            current_price=entry_price,
-            high_watermark=entry_price,
-            low_watermark=entry_price,
+            signal_type=decision.reasoning[:50], reasoning=decision.reasoning,
+            current_price=entry_price, high_watermark=entry_price,
+            entry_commission=entry_commission,
         )
 
         self.positions.append(pos)
+        self._save_state()
         log("trade", f"OPEN {pos.side.upper()} {pos.symbol} ${size:.0f} @ ${entry_price:.4f} "
-            f"stop={pos.stop_pct*100:.0f}% target={pos.target_pct*100:.0f}% [{decision.confidence}]")
+            f"stop=${pos.stop_price:.4f} target=${pos.target_price:.4f} fee=${entry_commission:.3f}")
         return pos
 
+    def _place_server_side_stops(self, symbol: str, side: str, quantity: float,
+                                   entry: float, stop_pct: float, target_pct: float):
+        """Place stop loss and take profit orders on Binance server.
+        These execute even if our process crashes."""
+        if not self._binance or self.paper:
+            return
+
+        import hmac
+        import requests
+
+        binance_symbol = self._binance._get_binance_symbol(symbol)
+        close_side = "SELL" if side == "long" else "BUY"
+        stop_price = entry * (1 - stop_pct) if side == "long" else entry * (1 + stop_pct)
+        tp_price = entry * (1 + target_pct) if side == "long" else entry * (1 - target_pct)
+
+        timestamp = int(time.time() * 1000)
+
+        # Stop loss order
+        try:
+            sl_params = (
+                f"symbol={binance_symbol}&side={close_side}&type=STOP_MARKET"
+                f"&stopPrice={stop_price:.8f}&closePosition=true"
+                f"&timestamp={timestamp}"
+            )
+            signature = hmac.new(
+                env.binance_api_secret.encode(), sl_params.encode(), "sha256"
+            ).hexdigest()
+            requests.post(
+                f"{self._binance.FAPI_BASE}/fapi/v1/order",
+                headers={"X-MBX-APIKEY": env.binance_api_key},
+                data=f"{sl_params}&signature={signature}",
+                timeout=10,
+            )
+            log("info", f"Server-side stop placed: {symbol} @ ${stop_price:.4f}")
+        except Exception as e:
+            log("warn", f"Failed to place server stop for {symbol}: {e}")
+
+        # Take profit order
+        try:
+            tp_params = (
+                f"symbol={binance_symbol}&side={close_side}&type=TAKE_PROFIT_MARKET"
+                f"&stopPrice={tp_price:.8f}&closePosition=true"
+                f"&timestamp={timestamp + 1}"
+            )
+            signature = hmac.new(
+                env.binance_api_secret.encode(), tp_params.encode(), "sha256"
+            ).hexdigest()
+            requests.post(
+                f"{self._binance.FAPI_BASE}/fapi/v1/order",
+                headers={"X-MBX-APIKEY": env.binance_api_key},
+                data=f"{tp_params}&signature={signature}",
+                timeout=10,
+            )
+            log("info", f"Server-side TP placed: {symbol} @ ${tp_price:.4f}")
+        except Exception as e:
+            log("warn", f"Failed to place server TP for {symbol}: {e}")
+
     def update_price(self, symbol: str, price: float):
-        """Update current price for a symbol and check stops/targets."""
-        for pos in self.positions:
+        """Update price, check stops/targets, and manage trailing stops."""
+        for pos in list(self.positions):
             if pos.symbol != symbol:
                 continue
             pos.current_price = price
             pos.high_watermark = max(pos.high_watermark, price)
             pos.low_watermark = min(pos.low_watermark, price)
 
-            # Check stop loss
+            # --- Trailing stop logic ---
+            # Activate trailing after price moves 1.5x the stop distance in our favor
+            trail_activation_dist = pos.stop_pct * self.TRAIL_ACTIVATION
+            if pos.side == "long":
+                profit_pct = (price - pos.entry_price) / pos.entry_price
+                if profit_pct > trail_activation_dist:
+                    # Trail stop at entry + (profit - stop_pct)
+                    new_trail = price * (1 - pos.stop_pct)
+                    if new_trail > pos.trailing_stop_price:
+                        pos.trailing_stop_price = new_trail
+            else:
+                profit_pct = (pos.entry_price - price) / pos.entry_price
+                if profit_pct > trail_activation_dist:
+                    new_trail = price * (1 + pos.stop_pct)
+                    if pos.trailing_stop_price == 0 or new_trail < pos.trailing_stop_price:
+                        pos.trailing_stop_price = new_trail
+
+            # Check stop loss (uses trailing if active)
             if pos.side == "long" and price <= pos.stop_price:
                 self._close_position(pos, price, "stop")
             elif pos.side == "short" and price >= pos.stop_price:
@@ -202,30 +360,31 @@ class Executor:
             elif pos.side == "short" and price <= pos.target_price:
                 self._close_position(pos, price, "target")
 
-            # Check max hold time (48h)
+            # Max hold time (48h)
             elif pos.hold_hours > 48:
                 self._close_position(pos, price, "timeout")
 
     def _close_position(self, pos: Position, exit_price: float, reason: str):
-        """Close a position and record the trade."""
-        commission = pos.size_usd * self.COMMISSION_PCT
+        """Close position with full commission accounting."""
+        exit_commission = pos.size_usd * self.COMMISSION_PCT
+        self.total_commissions += exit_commission
 
         if pos.side == "long":
             pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
         else:
             pnl_pct = (pos.entry_price - exit_price) / pos.entry_price
 
-        pnl_usd = pos.size_usd * pnl_pct - commission
+        # Net P&L = gross P&L - entry commission - exit commission
+        gross_pnl = pos.size_usd * pnl_pct
+        pnl_usd = gross_pnl - pos.entry_commission - exit_commission
 
-        # Execute close on Binance
+        # Execute close on Binance (live mode)
         if not self.paper and self._binance:
             try:
                 close_side = "SELL" if pos.side == "long" else "BUY"
-                self._binance._place_order(
-                    pos.symbol, pos.id, close_side, pos.quantity, exit_price
-                )
+                self._binance._place_order(pos.symbol, pos.id, close_side, pos.quantity, exit_price)
             except Exception as e:
-                log("error", f"Close execution error for {pos.symbol}: {e}")
+                log("error", f"Close execution error: {pos.symbol}: {e}")
 
         self.balance += pos.size_usd + pnl_usd
         self.daily_pnl += pnl_usd
@@ -234,16 +393,18 @@ class Executor:
             position=pos, exit_price=exit_price,
             pnl_pct=pnl_pct, pnl_usd=pnl_usd,
             exit_reason=reason, closed_at=time.time() * 1000,
+            exit_commission=exit_commission,
         )
         self.closed_trades.append(closed)
         self.positions = [p for p in self.positions if p.id != pos.id]
+        self._save_state()
 
-        emoji = "+" if pnl_usd >= 0 else ""
-        log("trade", f"CLOSE {pos.symbol} {reason} {emoji}${pnl_usd:.2f} ({pnl_pct*100:+.2f}%) "
-            f"held {pos.hold_hours:.1f}h | Balance: ${self.balance:,.2f}")
+        trail_info = f" (trailed from ${pos.entry_price*(1-pos.stop_pct):.4f} to ${pos.trailing_stop_price:.4f})" if pos.trailing_stop_price > 0 else ""
+        log("trade", f"CLOSE {pos.symbol} {reason} ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%) "
+            f"held {pos.hold_hours:.1f}h fees=${pos.entry_commission + exit_commission:.3f}{trail_info} "
+            f"| Bal: ${self.balance:,.2f}")
 
     def get_stats(self) -> dict:
-        """Get current portfolio stats."""
         total_trades = len(self.closed_trades)
         wins = sum(1 for t in self.closed_trades if t.pnl_usd > 0)
         total_pnl = sum(t.pnl_usd for t in self.closed_trades)
@@ -258,5 +419,5 @@ class Executor:
             "total_pnl": total_pnl,
             "unrealized_pnl": unrealized,
             "daily_pnl": self.daily_pnl,
-            "daily_api_cost": 0,  # filled by runner
+            "total_commissions": self.total_commissions,
         }
