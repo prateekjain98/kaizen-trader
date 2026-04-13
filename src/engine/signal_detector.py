@@ -96,6 +96,10 @@ class SignalDetector:
             return self._process_fgi(sid, signal, snapshot)
         elif signal.event_type == "trending":
             return self._process_trending(sid, signal, snapshot)
+        elif signal.event_type == "major_pump":
+            return self._process_major_pump(sid, signal, snapshot)
+        elif signal.event_type == "large_move":
+            return self._process_large_move(sid, signal, snapshot)
 
         return None
 
@@ -212,5 +216,43 @@ class SignalDetector:
             reasoning=f"#{rank} trending on CoinGecko. 24h volume ${volume:,.0f}, change {change:+.1f}%.",
             suggested_side="long" if change > 0 else "",
             suggested_stop_pct=0.08, suggested_target_pct=0.15,
+            data=signal.data,
+        )
+
+    def _process_major_pump(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
+        """Major pump detected (>50% in 24h with volume) — inform Claude for analysis."""
+        change = signal.data.get("change_pct", 0)
+        volume = signal.data.get("volume_24h", 0)
+        symbol = signal.symbol
+        price = snapshot.prices.get(symbol, 0)
+
+        return SignalPacket(
+            signal_id=sid, symbol=symbol, signal_type="major_pump",
+            priority=2, timestamp=signal.timestamp, source="binance_movers",
+            price_usd=price, volume_24h=volume, price_change_24h=change,
+            fear_greed_index=snapshot.fear_greed_index,
+            reasoning=f"{symbol} +{change:.0f}% in 24h with ${volume:,.0f} volume. Evaluate: is momentum continuing or exhausted?",
+            data=signal.data,
+        )
+
+    def _process_large_move(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
+        """Large real-time move detected via WS (>10% change)."""
+        change = signal.data.get("change_pct", 0)
+        price = signal.data.get("price", 0)
+        symbol = signal.symbol
+
+        # Only high-volume moves
+        volume = signal.data.get("volume_24h", 0)
+        if volume < 5_000_000:
+            return None
+
+        return SignalPacket(
+            signal_id=sid, symbol=symbol, signal_type="large_move",
+            priority=2 if abs(change) > 20 else 1,
+            timestamp=signal.timestamp, source="binance_ws",
+            price_usd=price, volume_24h=volume, price_change_24h=change,
+            fear_greed_index=snapshot.fear_greed_index,
+            reasoning=f"{symbol} moved {change:+.1f}% with ${volume:,.0f} volume.",
+            suggested_side="long" if change > 0 else "short",
             data=signal.data,
         )
