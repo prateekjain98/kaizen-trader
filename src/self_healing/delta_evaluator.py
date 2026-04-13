@@ -1,10 +1,9 @@
 """Track parameter changes and evaluate whether they improved or worsened performance."""
 
-import json
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional
 
 from src.config import CONFIG_BOUNDS
@@ -145,8 +144,8 @@ class DeltaEvaluator:
                     for word in delta.reason.split()[:5]:
                         if len(word) > 4:
                             memory.reinforce(word, profitable)
-            except Exception:
-                pass  # memory reinforcement is best-effort
+            except Exception as err:
+                log("warn", f"Memory reinforcement failed for {delta.parameter}: {err}")
 
         return evaluated
 
@@ -184,12 +183,15 @@ class DeltaEvaluator:
         snapshot_config(config, f"delta-revert: {delta.parameter} {delta.new_value} -> {reverted_value}")
 
 
-# Module singleton
+# Module singleton (double-checked lock pattern)
 _evaluator: Optional[DeltaEvaluator] = None
+_evaluator_lock = threading.Lock()
 
 
 def get_evaluator() -> DeltaEvaluator:
     global _evaluator
     if _evaluator is None:
-        _evaluator = DeltaEvaluator()
+        with _evaluator_lock:
+            if _evaluator is None:
+                _evaluator = DeltaEvaluator()
     return _evaluator

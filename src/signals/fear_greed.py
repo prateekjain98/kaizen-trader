@@ -1,5 +1,6 @@
 """Fear & Greed Index fetcher (Alternative.me)."""
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -23,50 +24,57 @@ _cached: Optional[FearGreedReading] = None
 _last_fetch_at: float = 0
 _CACHE_TTL_MS = 30 * 60_000
 _breaker = CircuitBreaker("fear_greed")
+_lock = threading.Lock()
 
 
 def fetch_fear_greed() -> Optional[FearGreedReading]:
     global _cached, _last_fetch_at
     now = time.time() * 1000
-    if _cached and now - _last_fetch_at < _CACHE_TTL_MS:
-        return _cached
+
+    with _lock:
+        if _cached and now - _last_fetch_at < _CACHE_TTL_MS:
+            return _cached
+        cached_snapshot = _cached
+        last_fetch_snapshot = _last_fetch_at
 
     # Staleness warning
-    if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
-        log("warn", f"Fear & Greed data is stale (last fetch {(now - _last_fetch_at) / 60_000:.0f}m ago)")
+    if cached_snapshot and last_fetch_snapshot > 0 and now - last_fetch_snapshot > 2 * _CACHE_TTL_MS:
+        log("warn", f"Fear & Greed data is stale (last fetch {(now - last_fetch_snapshot) / 60_000:.0f}m ago)")
 
     if not _breaker.can_call():
         log("warn", "Fear & Greed circuit breaker OPEN — returning cached data")
-        return _cached
+        return cached_snapshot
 
     try:
         res = requests.get("https://api.alternative.me/fng/?limit=2", timeout=5)
         if res.status_code != 200:
             log("warn", f"Fear & Greed fetch failed: {res.status_code}")
             _breaker.record_failure()
-            return _cached
+            return cached_snapshot
         data = res.json()
         items = data.get("data", [])
         if not items:
             _breaker.record_failure()
-            return _cached
+            return cached_snapshot
 
         today = int(items[0]["value"])
         yesterday = int(items[1]["value"]) if len(items) > 1 else today
 
-        _cached = FearGreedReading(
+        reading = FearGreedReading(
             index=today,
             label=items[0]["value_classification"],
             delta1d=today - yesterday,
             fetched_at=now,
         )
-        _last_fetch_at = now
+        with _lock:
+            _cached = reading
+            _last_fetch_at = now
         _breaker.record_success()
-        return _cached
+        return reading
     except Exception as err:
         log("warn", f"Fear & Greed network error: {err}")
         _breaker.record_failure()
-        return _cached
+        return cached_snapshot
 
 
 def fear_greed_to_market_phase(fgi: int) -> str:

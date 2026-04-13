@@ -11,6 +11,7 @@ from src.evaluation.metrics import (
     _mean, _std_dev, _max_drawdown, _max_consecutive_losses, _kelly_fraction,
 )
 from src.utils.safe_math import safe_ratio
+from src.indicators.core import compute_rsi, compute_vwap
 from src.backtesting.data_loader import load_klines
 
 
@@ -39,39 +40,21 @@ class BacktestResult:
 
 def _date_to_ms(date_str: str) -> int:
     """Convert 'YYYY-MM-DD' to epoch milliseconds (UTC)."""
-    import datetime
-    dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-    dt = dt.replace(tzinfo=datetime.timezone.utc)
+    from datetime import datetime, timezone
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
 
 def _compute_rsi(closes: list[float], period: int = 14) -> Optional[float]:
-    """Compute RSI from a list of close prices."""
-    if len(closes) < period + 1:
-        return None
-    recent = closes[-(period + 1):]
-    gains = losses = 0.0
-    for i in range(1, len(recent)):
-        diff = recent[i] - recent[i - 1]
-        if diff > 0:
-            gains += diff
-        else:
-            losses += -diff
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - 100 / (1 + rs)
+    """Compute RSI using canonical Wilder smoothing from indicators/core."""
+    return compute_rsi(closes, period)
 
 
 def _compute_vwap(candles: list[dict]) -> Optional[float]:
-    """Compute VWAP from recent candles."""
+    """Compute VWAP from recent candles using the canonical implementation."""
     if not candles:
         return None
-    sum_pv = sum(c["close"] * c["volume"] for c in candles)
-    sum_v = sum(c["volume"] for c in candles)
-    return sum_pv / sum_v if sum_v > 0 else None
+    return compute_vwap([c["close"] for c in candles], [c["volume"] for c in candles])
 
 
 def _compute_momentum_pct(candles: list[dict], lookback: int) -> Optional[float]:

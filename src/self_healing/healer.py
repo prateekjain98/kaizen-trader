@@ -1,6 +1,5 @@
 """Self-Healing Engine — diagnoses losses and patches parameters."""
 
-import dataclasses
 import threading
 import time
 

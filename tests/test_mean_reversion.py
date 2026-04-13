@@ -3,7 +3,7 @@
 import pytest
 
 from src.strategies.mean_reversion import (
-    _compute_vwap, _compute_rsi, OHLCVSample,
+    _compute_vwap, _compute_rsi_from_samples as _compute_rsi, OHLCVSample,
 )
 
 

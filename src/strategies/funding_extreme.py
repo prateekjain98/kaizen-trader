@@ -20,16 +20,21 @@ class FundingRateData:
 
 
 _funding_cache: dict[str, FundingRateData] = {}
+_funding_cache_ts: dict[str, float] = {}  # symbol -> last update timestamp
 _funding_lock = threading.Lock()
 _MAX_FUNDING_CACHE = 200
 
 
 def update_funding_data(data: FundingRateData) -> None:
+    now = time.time()
     with _funding_lock:
         if len(_funding_cache) >= _MAX_FUNDING_CACHE and data.symbol not in _funding_cache:
-            oldest_key = min(_funding_cache, key=lambda k: _funding_cache[k].funding_rate)
+            # Evict least recently updated entry
+            oldest_key = min(_funding_cache_ts, key=_funding_cache_ts.get)
             del _funding_cache[oldest_key]
+            del _funding_cache_ts[oldest_key]
         _funding_cache[data.symbol] = data
+        _funding_cache_ts[data.symbol] = now
 
 
 STRATEGY_META = {

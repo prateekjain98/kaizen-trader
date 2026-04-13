@@ -1,6 +1,5 @@
 """Auto-create GitHub issues for blind spots, data gaps, and chronic underperformers."""
 
-import json
 import os
 import subprocess
 import threading
@@ -32,20 +31,40 @@ def _get_repo() -> str:
     return os.environ.get("GITHUB_REPO", "")
 
 
-def _reset_daily_cap() -> None:
-    """Reset the daily issue counter if the date has changed."""
+def _reserve_slot(trigger_key: str) -> bool:
+    """Atomically check dedup + daily cap and reserve a slot.
+
+    Returns True if a slot was reserved (caller should create the issue).
+    If the issue creation fails, call _release_slot() to undo.
+    """
     global _daily_count, _daily_date
-    today = time.strftime("%Y-%m-%d")
     with _lock:
+        today = time.strftime("%Y-%m-%d")
         if today != _daily_date:
             _daily_date = today
             _daily_count = 0
+        if trigger_key in _created_issues:
+            return False
+        if _daily_count >= MAX_ISSUES_PER_DAY:
+            return False
+        _daily_count += 1
+        return True
 
 
-def _is_duplicate(trigger_type: str, trigger_key: str) -> bool:
-    """Check if an issue with this trigger already exists."""
+def _record_issue(trigger_type: str, trigger_key: str, issue_num: int) -> None:
+    """Record a successfully created issue."""
     with _lock:
-        return trigger_key in _created_issues
+        _created_issues[trigger_key] = IssueRecord(
+            trigger_type=trigger_type, trigger_key=trigger_key,
+            issue_number=issue_num, created_at=time.time()
+        )
+
+
+def _release_slot() -> None:
+    """Release a reserved slot if issue creation failed."""
+    global _daily_count
+    with _lock:
+        _daily_count = max(0, _daily_count - 1)
 
 
 def _create_issue_via_gh(title: str, body: str, labels: list[str]) -> Optional[int]:
@@ -67,7 +86,6 @@ def _create_issue_via_gh(title: str, body: str, labels: list[str]) -> Optional[i
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
-            # Parse issue URL to get number
             url = result.stdout.strip()
             issue_number = int(url.rstrip("/").split("/")[-1])
             log("info", f"GitHub issue #{issue_number} created: {title}")
@@ -83,17 +101,9 @@ def _create_issue_via_gh(title: str, body: str, labels: list[str]) -> Optional[i
 def create_blind_spot_issue(fingerprint_key: str, occurrences: int,
                             avg_loss_pct: float, affected_strategies: list[str]) -> Optional[int]:
     """Create an issue for a detected blind spot pattern."""
-    global _daily_count
-    _reset_daily_cap()
-
     trigger_key = f"blind_spot:{fingerprint_key}"
-    if _is_duplicate("blind_spot", trigger_key):
+    if not _reserve_slot(trigger_key):
         return None
-
-    with _lock:
-        if _daily_count >= MAX_ISSUES_PER_DAY:
-            log("warn", "Daily GitHub issue cap reached -- skipping blind spot issue")
-            return None
 
     title = f"Blind Spot: {fingerprint_key}"
     body = f"""## Detected Blind Spot Pattern
@@ -118,28 +128,17 @@ This issue was created automatically by the Kaizen Trader blind spot detector.
 
     issue_num = _create_issue_via_gh(title, body, ["blind-spot", "automated"])
     if issue_num:
-        with _lock:
-            _created_issues[trigger_key] = IssueRecord(
-                trigger_type="blind_spot", trigger_key=trigger_key,
-                issue_number=issue_num, created_at=time.time()
-            )
-            _daily_count += 1
+        _record_issue("blind_spot", trigger_key, issue_num)
+    else:
+        _release_slot()
     return issue_num
 
 
 def create_data_gap_issue(suggestion: str, context: str = "") -> Optional[int]:
     """Create an issue when Claude analysis suggests a missing data source."""
-    global _daily_count
-    _reset_daily_cap()
-
-    # Use first 80 chars as dedup key
     trigger_key = f"data_gap:{suggestion[:80]}"
-    if _is_duplicate("data_gap", trigger_key):
+    if not _reserve_slot(trigger_key):
         return None
-
-    with _lock:
-        if _daily_count >= MAX_ISSUES_PER_DAY:
-            return None
 
     title = f"Data Gap: {suggestion[:60]}"
     body = f"""## Missing Data Source / Integration
@@ -164,12 +163,9 @@ This issue was created automatically by the Kaizen Trader Claude analysis loop.
 
     issue_num = _create_issue_via_gh(title, body, ["data-gap", "automated"])
     if issue_num:
-        with _lock:
-            _created_issues[trigger_key] = IssueRecord(
-                trigger_type="data_gap", trigger_key=trigger_key,
-                issue_number=issue_num, created_at=time.time()
-            )
-            _daily_count += 1
+        _record_issue("data_gap", trigger_key, issue_num)
+    else:
+        _release_slot()
     return issue_num
 
 
@@ -177,16 +173,9 @@ def create_chronic_underperformer_issue(strategy_id: str, days_disabled: int,
                                         win_rate: float, sharpe: float,
                                         consecutive_losses: int) -> Optional[int]:
     """Create an issue when a strategy has been disabled for >14 days."""
-    global _daily_count
-    _reset_daily_cap()
-
     trigger_key = f"chronic:{strategy_id}"
-    if _is_duplicate("chronic_underperformer", trigger_key):
+    if not _reserve_slot(trigger_key):
         return None
-
-    with _lock:
-        if _daily_count >= MAX_ISSUES_PER_DAY:
-            return None
 
     title = f"Chronic Underperformer: {strategy_id}"
     body = f"""## Strategy Disabled for {days_disabled} Days
@@ -213,12 +202,9 @@ This issue was created automatically by the Kaizen Trader Darwinian strategy sel
 
     issue_num = _create_issue_via_gh(title, body, ["chronic-underperformer", "automated"])
     if issue_num:
-        with _lock:
-            _created_issues[trigger_key] = IssueRecord(
-                trigger_type="chronic_underperformer", trigger_key=trigger_key,
-                issue_number=issue_num, created_at=time.time()
-            )
-            _daily_count += 1
+        _record_issue("chronic_underperformer", trigger_key, issue_num)
+    else:
+        _release_slot()
     return issue_num
 
 

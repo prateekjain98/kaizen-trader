@@ -27,7 +27,7 @@ _last_cleanup: float = 0
 
 STRATEGY_META = {
     "strategies": [
-        {"id": "listing_announcement", "function": "on_listing_announcement",
+        {"id": "listing_pump", "function": "on_listing_announcement",
          "description": "Detects new exchange listings and rides the initial pump",
          "tier": "swing"},
     ],

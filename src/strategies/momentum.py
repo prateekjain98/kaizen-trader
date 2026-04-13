@@ -37,6 +37,29 @@ STRATEGY_META = {
 }
 
 
+def get_swing_buffer(symbol: str) -> list[PriceSample]:
+    """Thread-safe access to swing price buffer for a symbol."""
+    with _lock:
+        return list(_swing_buffers.get(symbol, []))
+
+
+def get_scalp_buffer(symbol: str) -> list[PriceSample]:
+    """Thread-safe access to scalp price buffer for a symbol."""
+    with _lock:
+        return list(_scalp_buffers.get(symbol, []))
+
+
+def get_ready_symbols(min_samples: int = 5) -> tuple[set[str], set[str]]:
+    """Thread-safe check for which symbols have enough buffered data.
+
+    Returns (swing_ready, scalp_ready) sets.
+    """
+    with _lock:
+        swing_ready = {s for s, buf in _swing_buffers.items() if len(buf) >= min_samples}
+        scalp_ready = {s for s, buf in _scalp_buffers.items() if len(buf) >= min_samples}
+    return swing_ready, scalp_ready
+
+
 def push_price_sample(symbol: str, price: float, volume_24h: float) -> None:
     now = time.time() * 1000
     sample = PriceSample(price=price, volume_24h=volume_24h, ts=now)

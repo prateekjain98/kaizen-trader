@@ -244,6 +244,15 @@ def compute_rsi(closes: list[float], period: int = 14) -> Optional[float]:
     return safe_ratio(100 - 100 / (1 + rs))
 
 
+def compute_vwap(closes: list[float], volumes: list[float]) -> Optional[float]:
+    """Compute volume-weighted average price from parallel close/volume lists."""
+    if not closes or len(closes) != len(volumes):
+        return None
+    sum_pv = sum(c * v for c, v in zip(closes, volumes))
+    sum_v = sum(volumes)
+    return sum_pv / sum_v if sum_v > 0 else None
+
+
 # ─── Per-symbol candle buffer + snapshot cache ───────────────────────────────
 
 _MAX_SYMBOLS = 500

@@ -11,8 +11,6 @@ from src.automation.github_issues import (
     create_blind_spot_issue,
     create_data_gap_issue,
     create_chronic_underperformer_issue,
-    _is_duplicate,
-    _reset_daily_cap,
     MAX_ISSUES_PER_DAY,
 )
 

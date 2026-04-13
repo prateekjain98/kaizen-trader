@@ -1,6 +1,7 @@
 """Claude-powered log analyzer — the core self-improving loop."""
 
 import json
+import math
 from dataclasses import asdict
 from typing import Optional
 
@@ -8,7 +9,7 @@ import anthropic
 from pydantic import BaseModel, Field
 
 from src.automation.github_issues import create_data_gap_issue
-from src.config import env, CONFIG_BOUNDS, default_scanner_config
+from src.config import env, CONFIG_BOUNDS
 from src.self_healing.blind_spots import get_detector
 from src.self_healing.chart_analyzer import render_chart, analyze_chart
 from src.self_healing.delta_evaluator import get_evaluator
@@ -213,8 +214,8 @@ def _apply_changes(config: ScannerConfig, changes: list[ParameterChange]) -> dic
             rejected.append(f"{change.parameter} — unknown parameter")
             continue
 
-        if not isinstance(change.proposedValue, (int, float)):
-            rejected.append(f"{change.parameter} — non-numeric value")
+        if not isinstance(change.proposedValue, (int, float)) or not math.isfinite(change.proposedValue):
+            rejected.append(f"{change.parameter} — non-numeric or non-finite value")
             continue
 
         lo, hi = bounds

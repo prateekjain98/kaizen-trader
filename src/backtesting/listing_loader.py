@@ -11,7 +11,6 @@ The loader builds a CSV dataset: symbol, exchange, listing_date_ms, listing_type
 import csv
 import json
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.request import urlopen, Request
@@ -76,8 +75,8 @@ def _probe_binance_spot_listing_date(symbol: str) -> Optional[int]:
             data = json.loads(resp.read().decode())
         if data:
             return int(data[0][0])  # open_time of first ever candle
-    except Exception:
-        pass
+    except (URLError, json.JSONDecodeError, KeyError, IndexError) as e:
+        print(f"    Spot probe failed for {symbol}: {e}")
     return None
 
 
@@ -130,9 +129,99 @@ def _write_cache(records: list[dict]) -> None:
         writer.writerows(records)
 
 
+def _fetch_all_binance_spot_symbols() -> list[str]:
+    """Get ALL base assets with USDT pairs on Binance Spot."""
+    url = "https://api.binance.com/api/v3/exchangeInfo"
+    req = Request(url, headers={"User-Agent": "kaizen-trader-backtest/1.0"})
+    try:
+        with urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        return sorted(set(
+            s["baseAsset"] for s in data.get("symbols", [])
+            if s["symbol"].endswith("USDT") and s["quoteAsset"] == "USDT"
+        ))
+    except Exception as e:
+        print(f"  WARNING: Binance Spot exchangeInfo failed: {e}")
+        return []
+
+
+def _fetch_all_coinbase_symbols() -> list[str]:
+    """Get ALL base assets with USD pairs on Coinbase Exchange."""
+    url = "https://api.exchange.coinbase.com/products"
+    req = Request(url, headers={"User-Agent": "kaizen-trader-backtest/1.0"})
+    try:
+        with urlopen(req, timeout=15) as resp:
+            products = json.loads(resp.read().decode())
+        return sorted(set(
+            p["base_currency"] for p in products
+            if p["quote_currency"] == "USD" and p["status"] == "online"
+        ))
+    except Exception as e:
+        print(f"  WARNING: Coinbase products API failed: {e}")
+        return []
+
+
+def _probe_coinbase_listing_date(symbol: str) -> Optional[int]:
+    """Find the first available 1d candle for a symbol on Coinbase.
+
+    Coinbase Exchange API: GET /products/{product_id}/candles
+    """
+    product_id = f"{symbol.upper()}-USD"
+
+    # Probe year by year for first available candle date
+    best_ms = None
+    for year in range(2017, 2027):
+        start_iso = f"{year}-01-01T00:00:00Z"
+        end_iso = f"{year}-01-15T00:00:00Z"
+        probe_url = (
+            f"https://api.exchange.coinbase.com/products/{product_id}/candles"
+            f"?granularity=86400&start={start_iso}&end={end_iso}"
+        )
+        probe_req = Request(probe_url, headers={"User-Agent": "kaizen-trader-backtest/1.0"})
+        try:
+            with urlopen(probe_req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            if data and len(data) > 0:
+                # Coinbase returns [timestamp, low, high, open, close, volume]
+                # Timestamps are Unix seconds, data is in reverse chrono order
+                earliest = min(row[0] for row in data)
+                earliest_ms = earliest * 1000
+                if best_ms is None or earliest_ms < best_ms:
+                    best_ms = earliest_ms
+                break  # found first year with data
+        except (URLError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+            pass  # expected for years before listing — continue probing
+        time.sleep(0.1)
+
+    if best_ms:
+        return best_ms
+
+    # If year-level probe failed, try the current product info
+    return None
+
+
+def _fetch_coinbase_listings(symbols: list[str]) -> list[dict]:
+    """Probe Coinbase for listing dates of given symbols."""
+    listings = []
+    for i, sym in enumerate(symbols):
+        listing_ms = _probe_coinbase_listing_date(sym)
+        if listing_ms:
+            listings.append({
+                "symbol": sym,
+                "exchange": "coinbase",
+                "listing_date_ms": listing_ms,
+                "listing_type": "spot",
+            })
+        if (i + 1) % 25 == 0:
+            print(f"    Probed {i + 1}/{len(symbols)} Coinbase symbols...")
+        time.sleep(0.12)
+    return listings
+
+
 def load_exchange_listings(
     symbols: Optional[list[str]] = None,
     force_refresh: bool = False,
+    probe_all_spot: bool = False,
 ) -> list[dict]:
     """Load exchange listing dates from all available sources.
 
@@ -140,24 +229,46 @@ def load_exchange_listings(
 
     Args:
         symbols: Optional list of symbols to probe for spot listing dates.
-                 If None, only returns Binance Futures data (fast).
         force_refresh: If True, ignores cache and re-fetches from APIs.
+        probe_all_spot: If True, fetches ALL Binance Spot symbols and probes
+                        their first candle date. This gives the complete listing
+                        history (~660+ symbols) but takes ~2-3 minutes.
     """
     if not force_refresh:
         cached = _read_cache()
         if cached:
             return cached
 
-    print("  Fetching Binance Futures listing dates...")
-    all_listings = _fetch_binance_futures_listings()
-    print(f"    Got {len(all_listings)} futures listings")
+    all_listings = []
 
-    # Also probe spot listing dates if symbols provided
-    if symbols:
+    # Source 1: Binance Futures onboardDate (exact timestamps, fast)
+    print("  Fetching Binance Futures listing dates...")
+    futures = _fetch_binance_futures_listings()
+    all_listings.extend(futures)
+    print(f"    Got {len(futures)} futures listings")
+
+    # Source 2: Binance Spot — probe first candle for each symbol
+    if probe_all_spot:
+        print("  Fetching ALL Binance Spot symbols...")
+        spot_symbols = _fetch_all_binance_spot_symbols()
+        print(f"    Found {len(spot_symbols)} Spot USDT pairs. Probing first candle dates...")
+        spot = _fetch_binance_spot_listings(spot_symbols)
+        all_listings.extend(spot)
+        print(f"    Got {len(spot)} spot listing dates")
+    elif symbols:
         print(f"  Probing Binance Spot listing dates for {len(symbols)} symbols...")
         spot = _fetch_binance_spot_listings(symbols)
-        print(f"    Got {len(spot)} spot listings")
         all_listings.extend(spot)
+        print(f"    Got {len(spot)} spot listings")
+
+    # Source 3: Coinbase — probe first candle for each USD product
+    if probe_all_spot:
+        print("  Fetching ALL Coinbase symbols...")
+        cb_symbols = _fetch_all_coinbase_symbols()
+        print(f"    Found {len(cb_symbols)} Coinbase USD pairs. Probing first candle dates...")
+        cb = _fetch_coinbase_listings(cb_symbols)
+        all_listings.extend(cb)
+        print(f"    Got {len(cb)} Coinbase listing dates")
 
     # Deduplicate: keep earliest listing per (symbol, exchange)
     seen = {}
@@ -169,6 +280,7 @@ def load_exchange_listings(
 
     if deduped:
         _write_cache(deduped)
+        print(f"  Total unique listing events cached: {len(deduped)}")
 
     return deduped
 
@@ -219,14 +331,15 @@ def score_listing_quality(
         score += 12
 
     # First major exchange listing = highest alpha
-    if sym_listings and sym_listings[0]["symbol"] == symbol:
-        is_first = True
-        for prev in sym_listings:
-            if prev["exchange"] != exchange and prev["listing_date_ms"] < \
-               next((r["listing_date_ms"] for r in sym_listings
-                     if r["exchange"] == exchange), float("inf")):
-                is_first = False
-                break
+    this_exchange_ms = next(
+        (r["listing_date_ms"] for r in sym_listings if r["exchange"] == exchange),
+        None,
+    )
+    if this_exchange_ms is not None:
+        is_first = not any(
+            r["exchange"] != exchange and r["listing_date_ms"] < this_exchange_ms
+            for r in sym_listings
+        )
         if is_first:
             score += 20
 

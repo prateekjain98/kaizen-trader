@@ -1,7 +1,6 @@
 """Self-Healing AI Crypto Trader — Main Entry Point."""
 
 import http.server
-import inspect
 import json
 import os
 import signal
@@ -28,13 +27,13 @@ from src.risk.protections import DEFAULT_PROTECTIONS
 from src.self_healing.log_analyzer import run_analysis
 from src.self_healing.healer import on_position_closed
 from src.self_healing.delta_evaluator import get_evaluator
-from src.signals.fear_greed import fetch_fear_greed, build_market_context, fear_greed_to_market_phase
+from src.signals.fear_greed import fetch_fear_greed, build_market_context
 from src.signals.news import fetch_news_sentiment, NewsSentiment
 from src.signals.social import fetch_social_sentiment, SocialSentiment
 from src.signals.funding import fetch_funding_data
 from src.signals.whale import poll_whale_alerts
 from src.signals.protocol import fetch_protocol_revenue
-from src.signals.token_unlocks import fetch_token_unlocks, is_unlock_risk, TokenUnlock
+from src.signals.token_unlocks import is_unlock_risk
 from src.signals.options import fetch_options_sentiment, OptionsSentiment
 from src.signals.stablecoin import fetch_stablecoin_flows, StablecoinFlows
 from src.signals.derivatives import fetch_derivatives_data, fetch_leverage_profile, DerivativesData
@@ -67,7 +66,7 @@ from src.indicators.core import (
     get_atr, _aggregate_to_htf,
 )
 from src.indicators.cvd import push_trade as push_cvd_trade, get_cvd_snapshot
-from src.indicators.regime import classify_regime, get_regime_score
+from src.indicators.regime import classify_regime
 from src.types import ScannerConfig, MarketContext, Position, TradeSignal
 from src.risk.loss_cooldown import is_on_cooldown, record_trade_result
 from src.risk.regime_gate import is_regime_blocked
@@ -507,9 +506,9 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
             stop_price = entry_price * (1 + trail_pct)
 
     # Capture momentum at entry for self-healing diagnosis
-    from src.strategies.momentum import _swing_buffers
+    from src.strategies.momentum import get_swing_buffer
     _momentum_at_entry = 0.0
-    buf = _swing_buffers.get(signal.symbol, [])
+    buf = get_swing_buffer(signal.symbol)
     if len(buf) >= 2 and buf[0].price > 0:
         _momentum_at_entry = (buf[-1].price - buf[0].price) / buf[0].price
 
@@ -569,7 +568,7 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
 
 def _log_diagnostics() -> None:
     """Log system diagnostics every 60s to help debug trading pipeline."""
-    from src.strategies.momentum import _swing_buffers, _scalp_buffers
+    from src.strategies.momentum import get_ready_symbols
     from src.indicators.core import get_snapshot, get_atr
 
     uptime = time.time() - _start_time
@@ -578,13 +577,11 @@ def _log_diagnostics() -> None:
     with _price_lock:
         n_prices = len(_latest_prices)
         symbols_with_prices = list(_latest_prices.keys())[:5]
-
-    total_ticks = sum(_tick_count.values())
-    n_tick_symbols = len(_tick_count)
+        total_ticks = sum(_tick_count.values())
+        n_tick_symbols = len(_tick_count)
 
     # Buffer status for momentum
-    swing_ready = {s for s, buf in _swing_buffers.items() if len(buf) >= 5}
-    scalp_ready = {s for s, buf in _scalp_buffers.items() if len(buf) >= 5}
+    swing_ready, scalp_ready = get_ready_symbols(min_samples=5)
 
     # Indicator readiness (sample BTC)
     btc_snap = get_snapshot("BTC")
@@ -638,16 +635,19 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
                 symbol=symbol)
             return  # reject >20% single-tick moves as feed glitches
 
-    # Update latest price
+    # Update latest price and tick count under lock
     with _price_lock:
         _latest_prices[symbol] = price
-    _tick_count[symbol] = _tick_count.get(symbol, 0) + 1
+        _tick_count[symbol] = _tick_count.get(symbol, 0) + 1
 
     # Periodic diagnostics
     global _last_diag_time
     now_diag = time.time()
-    if now_diag - _last_diag_time >= _DIAG_INTERVAL_S:
-        _last_diag_time = now_diag
+    with _price_lock:
+        should_diag = now_diag - _last_diag_time >= _DIAG_INTERVAL_S
+        if should_diag:
+            _last_diag_time = now_diag
+    if should_diag:
         _log_diagnostics()
 
     # Update open position prices
@@ -658,8 +658,10 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
     # Periodically sync position prices to Convex for dashboard
     global _last_convex_sync_time
     now_sync = time.time()
-    if now_sync - _last_convex_sync_time >= _CONVEX_SYNC_INTERVAL_S:
-        _last_convex_sync_time = now_sync
+    with _price_lock:
+        should_sync = now_sync - _last_convex_sync_time >= _CONVEX_SYNC_INTERVAL_S
+        if should_sync:
+            _last_convex_sync_time = now_sync
         for pos in get_open_positions():
             db_update_position_price(
                 pos.id, pos.current_price,
@@ -673,24 +675,29 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
     push_indicator_tick(symbol, price, volume)
 
     # Infer trade side from price movement for CVD
-    prev_price = _prev_prices.get(symbol, price)
-    _prev_prices[symbol] = price
+    with _price_lock:
+        prev_price = _prev_prices.get(symbol, price)
+        _prev_prices[symbol] = price
     inferred_side = "buy" if price >= prev_price else "sell"
     push_cvd_trade(symbol, price, volume, inferred_side)
 
     # Periodically aggregate minute candles to higher timeframes
     now_s = time.time()
-    last_agg = _last_htf_aggregate.get(symbol, 0)
-    if now_s - last_agg >= _HTF_AGGREGATE_INTERVAL_S:
-        _last_htf_aggregate[symbol] = now_s
+    with _price_lock:
+        last_agg = _last_htf_aggregate.get(symbol, 0)
+        should_agg = now_s - last_agg >= _HTF_AGGREGATE_INTERVAL_S
+        if should_agg:
+            _last_htf_aggregate[symbol] = now_s
+    if should_agg:
         _aggregate_to_htf(symbol)
 
     # Throttle scanning
     now = time.time()
-    last_scan = _last_scan_time.get(symbol, 0)
-    if now - last_scan < _MIN_SCAN_INTERVAL_S:
-        return
-    _last_scan_time[symbol] = now
+    with _price_lock:
+        last_scan = _last_scan_time.get(symbol, 0)
+        if now - last_scan < _MIN_SCAN_INTERVAL_S:
+            return
+        _last_scan_time[symbol] = now
 
     # Get shared context
     ctx = _get_market_context()
@@ -740,7 +747,7 @@ def _try_scan(scan_fn, ctx: MarketContext) -> None:
 
 def _try_scan_correlation(symbol: str, product_id: str, price: float, ctx: MarketContext) -> None:
     """Scan correlation break strategy using BTC as reference."""
-    from src.strategies.momentum import _swing_buffers
+    from src.strategies.momentum import get_swing_buffer
     if symbol == "BTC":
         return
     with _price_lock:
@@ -748,8 +755,8 @@ def _try_scan_correlation(symbol: str, product_id: str, price: float, ctx: Marke
     if not btc_price:
         return
     # Compute actual 1h % change from swing buffers
-    btc_buf = _swing_buffers.get("BTC", [])
-    alt_buf = _swing_buffers.get(symbol, [])
+    btc_buf = get_swing_buffer("BTC")
+    alt_buf = get_swing_buffer(symbol)
     btc_1h_pct = 0.0
     alt_1h_pct = 0.0
     if len(btc_buf) >= 2 and btc_buf[0].price > 0:
@@ -944,8 +951,8 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
                 tightened = pos.low_watermark * (1 + tighter_trail)
                 if tightened < pos.stop_price:
                     pos.stop_price = tightened
-    except Exception:
-        pass  # regime detection is best-effort
+    except Exception as err:
+        log("warn", f"Regime stop adjustment failed: {err}", symbol=pos.symbol)
 
     # DCA scaling-in: check if we should add another tranche
     if pos.tranche_count < pos.max_tranches:
@@ -1324,11 +1331,22 @@ _start_time = time.time()
 _thread_registry: dict[str, threading.Thread] = {}
 
 
+_HEALTH_TOKEN = os.environ.get("HEALTH_TOKEN", "")
+
+
 class _HealthHandler(http.server.BaseHTTPRequestHandler):
     """Minimal HTTP handler for Railway health checks."""
 
     def do_GET(self):
         if self.path == "/health":
+            # Require auth token if configured
+            if _HEALTH_TOKEN:
+                auth = self.headers.get("Authorization", "")
+                if auth != f"Bearer {_HEALTH_TOKEN}":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+
             open_positions = get_open_positions()
             registry = get_registry()
 

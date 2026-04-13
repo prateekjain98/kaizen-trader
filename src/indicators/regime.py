@@ -18,7 +18,6 @@ from typing import Optional
 
 from src.indicators.core import get_snapshot, IndicatorSnapshot
 from src.signals.fear_greed import fetch_fear_greed
-from src.signals.funding import fetch_funding_data
 from src.utils.safe_math import safe_ratio
 
 

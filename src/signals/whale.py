@@ -46,11 +46,11 @@ def poll_whale_alerts(symbols: list[str]) -> None:
     since = _last_cursor or int((now - 7_200_000) / 1000)
     url = (
         f"https://api.whale-alert.io/v1/transactions"
-        f"?api_key={env.whale_alert_api_key}&min_value={MIN_USD}&start={since}&limit=100"
+        f"?min_value={MIN_USD}&start={since}&limit=100"
     )
 
     try:
-        res = requests.get(url, timeout=8)
+        res = requests.get(url, headers={"X-WA-API-KEY": env.whale_alert_api_key}, timeout=8)
         if res.status_code != 200:
             log("warn", f"Whale Alert fetch failed: {res.status_code}")
             _breaker.record_failure()

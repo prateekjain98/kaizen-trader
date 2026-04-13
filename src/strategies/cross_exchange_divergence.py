@@ -11,13 +11,12 @@ Instead, we detect when one exchange leads the other and trade the lagging one.
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import requests
 
 from src.types import TradeSignal, ScannerConfig, MarketContext
-from src.storage.database import log
 from src.signals._circuit_breaker import CircuitBreaker
 from src.utils.binance_symbols import BINANCE_SYMBOL_MAP as _BINANCE_MAP
 from src.utils.cache import TTLCache

@@ -70,21 +70,23 @@ class CoinbaseWebSocket:
         api_key = env.coinbase_api_key or ""
         api_secret = env.coinbase_api_secret or ""
 
-        # Use retry=False so we control reconnection ourselves
-        if api_key and api_secret:
-            self._client = WSClient(
-                api_key=api_key,
-                api_secret=api_secret,
+        def _make_ws_client():
+            """Create a WSClient instance (shared between initial connect and reconnect)."""
+            if api_key and api_secret:
+                return WSClient(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    on_message=self._on_message,
+                    on_close=self._on_close,
+                    retry=False,
+                )
+            return WSClient(
                 on_message=self._on_message,
                 on_close=self._on_close,
                 retry=False,
             )
-        else:
-            self._client = WSClient(
-                on_message=self._on_message,
-                on_close=self._on_close,
-                retry=False,
-            )
+
+        self._client = _make_ws_client()
 
         def _run():
             from coinbase.websocket import WSClientConnectionClosedException, WSClientException
@@ -99,22 +101,9 @@ class CoinbaseWebSocket:
                         product_ids=self.product_ids,
                         channels=["ticker", "heartbeats"],
                     )
-                    # Level2 disabled — causes connection drops from EU servers.
-                    # Orderbook data is fetched via REST fallback in orderbook_imbalance strategy.
-                    # if api_key:
-                    #     try:
-                    #         self._client.subscribe(
-                    #             product_ids=self.product_ids,
-                    #             channels=["level2"],
-                    #         )
-                    #     except Exception as e:
-                    #         log("warn", f"Coinbase WS level2 subscription failed: {e}")
 
                     log("info", "Coinbase WS subscriptions sent")
 
-                    # Keep the thread alive — sleep_with_exception_check will raise
-                    # if the SDK's internal WS thread encounters an error.
-                    # Also break if _on_close fired (status changed to disconnected).
                     while not self._stop_event.is_set() and self._status == "connected":
                         self._client.sleep_with_exception_check(sleep=5)
 
@@ -129,26 +118,12 @@ class CoinbaseWebSocket:
                 if self._stop_event.is_set():
                     break
 
-                # Wait before reconnecting, but check stop event
                 if self._stop_event.wait(timeout=5):
                     break
 
                 # Create a fresh client for reconnection
                 try:
-                    if api_key and api_secret:
-                        self._client = WSClient(
-                            api_key=api_key,
-                            api_secret=api_secret,
-                            on_message=self._on_message,
-                            on_close=self._on_close,
-                            retry=False,
-                        )
-                    else:
-                        self._client = WSClient(
-                            on_message=self._on_message,
-                            on_close=self._on_close,
-                            retry=False,
-                        )
+                    self._client = _make_ws_client()
                 except Exception as e:
                     log("error", f"Failed to create WS client: {e}")
                     if self._stop_event.wait(timeout=10):

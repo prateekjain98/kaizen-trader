@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+from src.indicators.core import compute_rsi, compute_vwap
 from src.types import TradeSignal, ScannerConfig, MarketContext
 
 
@@ -39,30 +40,16 @@ def push_ohlcv_sample(symbol: str, close: float, volume: float) -> None:
 
 
 def _compute_vwap(samples: list[OHLCVSample]) -> Optional[float]:
+    """Compute VWAP from OHLCV samples using the canonical implementation."""
     if not samples:
         return None
-    sum_pv = sum(s.close * s.volume for s in samples)
-    sum_v = sum(s.volume for s in samples)
-    return sum_pv / sum_v if sum_v != 0 else None
+    return compute_vwap([s.close for s in samples], [s.volume for s in samples])
 
 
-def _compute_rsi(samples: list[OHLCVSample], period: int = 14) -> Optional[float]:
-    if len(samples) < period + 1:
-        return None
-    recent = samples[-(period + 1):]
-    gains = losses = 0.0
-    for i in range(1, len(recent)):
-        diff = recent[i].close - recent[i - 1].close
-        if diff > 0:
-            gains += diff
-        else:
-            losses += -diff
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - 100 / (1 + rs)
+def _compute_rsi_from_samples(samples: list[OHLCVSample], period: int = 14) -> Optional[float]:
+    """Compute RSI from OHLCV samples using the canonical Wilder smoothing."""
+    closes = [s.close for s in samples]
+    return compute_rsi(closes, period)
 
 
 def scan_mean_reversion(
@@ -76,7 +63,7 @@ def scan_mean_reversion(
     now = time.time() * 1000
 
     vwap = _compute_vwap(buf)
-    rsi = _compute_rsi(buf)
+    rsi = _compute_rsi_from_samples(buf)
     recent_20 = buf[-20:]
     avg_volume = sum(s.volume for s in recent_20) / len(recent_20) if recent_20 else 0
     current_volume = buf[-1].volume if buf else 0

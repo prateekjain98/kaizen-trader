@@ -13,6 +13,7 @@ from src.signals.stablecoin import StablecoinFlows
 from src.signals.derivatives import DerivativesData
 from src.indicators.cvd import CVDSnapshot
 from src.indicators.regime import RegimeSnapshot
+from src.storage.database import log
 from src.utils.safe_math import safe_score
 
 
@@ -294,7 +295,10 @@ def _exchange_flow_adjustment(signal: TradeSignal) -> float:
     try:
         from src.strategies.whale_tracker import get_net_exchange_flow
         flows = get_net_exchange_flow()
-    except Exception:
+    except ImportError:
+        return 0
+    except Exception as err:
+        log("warn", f"Exchange flow adjustment failed: {err}")
         return 0
 
     net = flows.get("net_flow_usd", 0)

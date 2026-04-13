@@ -17,3 +17,5 @@ convex/node_modules/
 .claude/
 skills-lock.json
 package-lock.json
+.dead_letters.jsonl
+reports/

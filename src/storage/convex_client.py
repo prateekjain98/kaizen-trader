@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import queue
 import threading
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -99,8 +102,8 @@ class ConvexStorage:
                     if attempt < retries - 1:
                         time.sleep(0.5 * (attempt + 1))
                     else:
-                        print(f"[CONVEX ERROR] Failed to call {mutation_name} "
-                              f"after {retries} attempt(s): {exc}")
+                        logger.error(f"Failed to call {mutation_name} "
+                                     f"after {retries} attempt(s): {exc}")
                         # Dead-letter queue: persist failed critical mutations to disk
                         if mutation_name in self._CRITICAL_MUTATIONS:
                             self._write_dead_letter(mutation_name, args, str(exc))
@@ -108,10 +111,8 @@ class ConvexStorage:
     def _write_dead_letter(self, mutation_name: str, args: dict, error: str) -> None:
         """Persist failed critical mutations to a local file for recovery."""
         try:
-            dead_letter_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                ".dead_letters.jsonl",
-            )
+            from pathlib import Path
+            dead_letter_path = Path(__file__).resolve().parents[2] / ".dead_letters.jsonl"
             entry = {
                 "mutation": mutation_name,
                 "args": args,
@@ -121,7 +122,7 @@ class ConvexStorage:
             with open(dead_letter_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception as write_err:
-            print(f"[CONVEX ERROR] Dead letter write also failed: {write_err}")
+            logger.error(f"Dead letter write also failed: {write_err}")
 
     @staticmethod
     def _strip_none(d: dict) -> dict:

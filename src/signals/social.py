@@ -113,9 +113,9 @@ def fetch_social_sentiment(symbols: list[str]) -> list[SocialSentiment]:
     any_success = False
 
     for chunk in chunks:
-        url = f"https://lunarcrush.com/api4/public/coins/list/v2?symbols={','.join(chunk)}&key={env.lunarcrush_api_key}"
+        url = f"https://lunarcrush.com/api4/public/coins/list/v2?symbols={','.join(chunk)}"
         try:
-            res = requests.get(url, timeout=8)
+            res = requests.get(url, headers={"Authorization": f"Bearer {env.lunarcrush_api_key}"}, timeout=8)
             if res.status_code != 200:
                 log("warn", f"LunarCrush fetch failed: {res.status_code}")
                 continue
@@ -179,11 +179,11 @@ def fetch_topic_sentiment(symbol: str) -> Optional[SocialSentiment]:
 
     # LunarCrush topic uses the coin name, but we pass symbol for simplicity
     topic = symbol.lower()
-    url = f"https://lunarcrush.com/api4/public/topic/{topic}?key={env.lunarcrush_api_key}"
+    url = f"https://lunarcrush.com/api4/public/topic/{topic}"
 
     try:
         _record_topic_call()
-        res = requests.get(url, timeout=8)
+        res = requests.get(url, headers={"Authorization": f"Bearer {env.lunarcrush_api_key}"}, timeout=8)
         if res.status_code != 200:
             log("warn", f"LunarCrush topic fetch failed: {res.status_code}")
             _breaker.record_failure()
@@ -236,11 +236,10 @@ def fetch_social_time_series(symbol: str, interval: str = "1d",
     url = (
         f"https://lunarcrush.com/api4/public/topic/{topic}/time-series/v2"
         f"?interval={interval}&data_points={data_points}"
-        f"&key={env.lunarcrush_api_key}"
     )
 
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers={"Authorization": f"Bearer {env.lunarcrush_api_key}"}, timeout=10)
         if res.status_code != 200:
             log("warn", f"LunarCrush time-series fetch failed: {res.status_code}")
             _breaker.record_failure()

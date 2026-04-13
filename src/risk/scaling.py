@@ -8,11 +8,9 @@ Instead of going all-in at entry, swing positions enter in up to 3 tranches:
 Scalp positions always enter in a single tranche.
 """
 
-import time
 from typing import Optional
 
 from src.types import Position
-from src.storage.database import log
 
 
 # Tranche schedule: (fraction_of_total, trigger_type, trigger_pct)

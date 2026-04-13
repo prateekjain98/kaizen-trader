@@ -88,9 +88,9 @@ def fetch_news_sentiment(symbols: list[str]) -> list[NewsSentiment]:
         log("warn", "News circuit breaker OPEN — returning cached data")
         return _cached
 
-    url = f"https://cryptopanic.com/api/free/v1/posts/?auth_token={env.cryptopanic_token}&public=true&kind=news"
+    url = "https://cryptopanic.com/api/free/v1/posts/?public=true&kind=news"
     try:
-        res = requests.get(url, timeout=8)
+        res = requests.get(url, headers={"Authorization": f"Token {env.cryptopanic_token}"}, timeout=8)
         if res.status_code != 200:
             log("warn", f"CryptoPanic fetch failed: {res.status_code}")
             _breaker.record_failure()
