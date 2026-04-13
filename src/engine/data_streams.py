@@ -223,6 +223,60 @@ def fetch_lunarcrush_trending() -> list[dict]:
         return []
 
 
+def fetch_reddit_crypto_sentiment() -> list[dict]:
+    """Get top posts from r/cryptocurrency. Free, no auth."""
+    data = _fetch_json("https://www.reddit.com/r/cryptocurrency/hot.json?limit=10")
+    if not data:
+        return []
+    posts = data.get("data", {}).get("children", [])
+    return [
+        {
+            "title": p["data"].get("title", ""),
+            "score": p["data"].get("score", 0),
+            "num_comments": p["data"].get("num_comments", 0),
+            "url": p["data"].get("url", ""),
+        }
+        for p in posts
+        if p.get("data", {}).get("score", 0) > 10
+    ]
+
+
+def fetch_coingecko_global() -> dict:
+    """Get global crypto market stats. Free, no auth."""
+    data = _fetch_json("https://api.coingecko.com/api/v3/global")
+    if not data:
+        return {}
+    d = data.get("data", {})
+    return {
+        "total_market_cap_usd": d.get("total_market_cap", {}).get("usd", 0),
+        "total_volume_24h": d.get("total_volume", {}).get("usd", 0),
+        "btc_dominance": d.get("market_cap_percentage", {}).get("btc", 0),
+        "market_cap_change_24h": d.get("market_cap_change_percentage_24h_usd", 0),
+    }
+
+
+def fetch_binance_top_movers(limit: int = 10) -> tuple[list[dict], list[dict]]:
+    """Get top gainers and losers from Binance Futures 24h. Free, no auth."""
+    data = _fetch_json("https://fapi.binance.com/fapi/v1/ticker/24hr")
+    if not data:
+        return [], []
+    usdt = [t for t in data if t.get("symbol", "").endswith("USDT")]
+    for t in usdt:
+        t["_change"] = float(t.get("priceChangePercent", 0))
+        t["_volume"] = float(t.get("quoteVolume", 0))
+        t["_symbol"] = t["symbol"].replace("USDT", "")
+        if t["_symbol"].startswith("1000"):
+            t["_symbol"] = t["_symbol"][4:]
+
+    gainers = sorted(usdt, key=lambda x: x["_change"], reverse=True)[:limit]
+    losers = sorted(usdt, key=lambda x: x["_change"])[:limit]
+
+    def _fmt(items):
+        return [{"symbol": t["_symbol"], "change_pct": t["_change"], "volume_24h": t["_volume"]} for t in items]
+
+    return _fmt(gainers), _fmt(losers)
+
+
 def fetch_binance_prices(symbols: list[str]) -> dict[str, float]:
     """Fetch current prices for multiple symbols from Binance."""
     data = _fetch_json("https://api.binance.com/api/v3/ticker/price")
@@ -318,6 +372,9 @@ class DataStreams:
             ("binance_listings", self._poll_binance_listings, 60),  # 1 min
             ("coinbase_listings", self._poll_coinbase_listings, 30),# 30 sec
             ("lunarcrush", self._poll_lunarcrush, 120),             # 2 min (rate limited)
+            ("reddit", self._poll_reddit, 300),                     # 5 min
+            ("global_market", self._poll_global_market, 300),       # 5 min
+            ("top_movers", self._poll_top_movers, 60),              # 1 min — catches pumps fast
         ]
 
         for name, fn, interval_s in streams:
@@ -477,4 +534,64 @@ class DataStreams:
                     data=coin,
                     timestamp=now,
                     priority=2 if coin.get("galaxy_score", 0) > 80 else 1,
+                ))
+
+    def _poll_reddit(self):
+        posts = fetch_reddit_crypto_sentiment()
+        # Reddit is for market context, not direct signals — stored for brain tick
+        pass
+
+    def _poll_global_market(self):
+        data = fetch_coingecko_global()
+        if not data:
+            return
+        now = time.time() * 1000
+
+        # Signal on large market-wide moves
+        change = data.get("market_cap_change_24h", 0)
+        if abs(change) > 5:
+            self.on_signal(TokenSignal(
+                source="coingecko_global",
+                symbol="MARKET",
+                event_type="market_move",
+                data=data,
+                timestamp=now,
+                priority=2,
+            ))
+
+    def _poll_top_movers(self):
+        """Detect tokens with massive 24h moves — catches pumps like ALPACA +391%."""
+        gainers, losers = fetch_binance_top_movers(limit=10)
+        now = time.time() * 1000
+
+        for g in gainers:
+            change = g.get("change_pct", 0)
+            vol = g.get("volume_24h", 0)
+            sym = g.get("symbol", "")
+
+            # Major pump: >50% with >$10M volume = real move, not manipulation
+            if change > 50 and vol > 10_000_000:
+                self.on_signal(TokenSignal(
+                    source="binance_movers",
+                    symbol=sym,
+                    event_type="major_pump",
+                    data=g,
+                    timestamp=now,
+                    priority=2 if change > 100 else 1,
+                ))
+
+        for l in losers:
+            change = l.get("change_pct", 0)
+            vol = l.get("volume_24h", 0)
+            sym = l.get("symbol", "")
+
+            # Major dump: >30% with volume = potential bounce or avoid
+            if change < -30 and vol > 10_000_000:
+                self.on_signal(TokenSignal(
+                    source="binance_movers",
+                    symbol=sym,
+                    event_type="major_dump",
+                    data=l,
+                    timestamp=now,
+                    priority=1,
                 ))
