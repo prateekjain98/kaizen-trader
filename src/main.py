@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import uuid
+import dataclasses
 from dataclasses import asdict
 from typing import Optional
 
@@ -335,6 +336,10 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
             f"product_id={signal.product_id} entry_price={signal.entry_price}")
         return
 
+    # Snapshot config to avoid TOCTOU races with healer/analyzer threads
+    with _config_lock:
+        cfg = dataclasses.replace(config)
+
     # Check if strategy is enabled
     if not strategy_selector.is_strategy_enabled(signal.strategy):
         log("info", f"Signal blocked (strategy disabled): {signal.strategy} {signal.symbol}",
@@ -373,7 +378,7 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
     if signal.created_at > 0:
         age_s = (now_ms - signal.created_at) / 1000
         decay_factor = max(0.5, 1.0 - (age_s / 60.0))  # linear decay, floor at 50%
-        signal.score *= decay_factor
+        signal = dataclasses.replace(signal, score=signal.score * decay_factor)
 
     # Price sanity check: verify signal entry price is close to latest price
     with _price_lock:
@@ -411,7 +416,7 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
 
     # Qualify
     qual = qualify(
-        signal, ctx, config,
+        signal, ctx, cfg,
         news=news, social=social, cvd=cvd, regime=regime,
         options=options, derivatives=derivatives,
         stablecoin=stablecoin, has_unlock_risk=has_unlock_risk,
@@ -441,7 +446,7 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
         return
 
     # Position sizing
-    portfolio_usd = get_paper_balance() if env.paper_trading else env.max_position_usd * env.max_open_positions
+    portfolio_usd = get_paper_balance() if env.paper_trading else env.portfolio_usd
     size_usd = kelly_size(signal.strategy, portfolio_usd, qual.score)
     if size_usd <= 0:
         log("info", f"Kelly sizing returned 0 for {signal.strategy}", symbol=signal.symbol)
@@ -468,11 +473,11 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
 
     # Determine trail and hold time based on tier
     if signal.tier == "scalp":
-        trail_pct = config.base_trail_pct_scalp
-        max_hold_ms = config.max_hold_ms_scalp
+        trail_pct = cfg.base_trail_pct_scalp
+        max_hold_ms = cfg.max_hold_ms_scalp
     else:
-        trail_pct = config.base_trail_pct_swing
-        max_hold_ms = config.max_hold_ms_swing
+        trail_pct = cfg.base_trail_pct_swing
+        max_hold_ms = cfg.max_hold_ms_swing
 
     # Execute
     now = time.time() * 1000
@@ -521,7 +526,7 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
 
     # Proactive regime scaling: adjust stop distance based on current volatility
     trail_pct *= regime_scaling.stop_multiplier
-    trail_pct = min(trail_pct, config.max_trail_pct)
+    trail_pct = min(trail_pct, cfg.max_trail_pct)
     if signal.side == "long":
         stop_price = entry_price * (1 - trail_pct)
     else:
@@ -648,24 +653,20 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
     # Price feed validation: reject unreasonable prices
     if price <= 0.001:
         return  # absolute floor — no sub-penny assets
-    with _price_lock:
-        prev = _latest_prices.get(symbol)
-    if prev and prev > 0:
-        change = abs(price - prev) / prev
-        if change > 0.20:
-            log("warn", f"Price spike rejected: {symbol} {prev:.4f} -> {price:.4f} ({change:.1%})",
-                symbol=symbol)
-            return  # reject >20% single-tick moves as feed glitches
 
-    # Update latest price and tick count under lock
-    with _price_lock:
-        _latest_prices[symbol] = price
-        _tick_count[symbol] = _tick_count.get(symbol, 0) + 1
-
-    # Periodic diagnostics
     global _last_diag_time
     now_diag = time.time()
+
     with _price_lock:
+        prev = _latest_prices.get(symbol)
+        if prev and prev > 0:
+            change = abs(price - prev) / prev
+            if change > 0.20:
+                log("warn", f"Price spike rejected: {symbol} {prev:.4f} -> {price:.4f} ({change:.1%})",
+                    symbol=symbol)
+                return  # reject >20% single-tick moves as feed glitches
+        _latest_prices[symbol] = price
+        _tick_count[symbol] = _tick_count.get(symbol, 0) + 1
         should_diag = now_diag - _last_diag_time >= _DIAG_INTERVAL_S
         if should_diag:
             _last_diag_time = now_diag
@@ -1143,7 +1144,7 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
         fgi_on_position_closed(pos.symbol)
 
     # Update peak portfolio for drawdown-based sizing
-    portfolio_usd = get_paper_balance() if env.paper_trading else env.max_position_usd * env.max_open_positions
+    portfolio_usd = get_paper_balance() if env.paper_trading else env.portfolio_usd
     update_peak(portfolio_usd)
 
     # Self-healing: diagnose the trade
@@ -1401,8 +1402,8 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
                     if hasattr(t, "pnl_usd") and t.pnl_usd is not None
                     and hasattr(t, "closed_at") and t.closed_at and t.closed_at >= today_start_ms
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log("warn", f"Health check: failed to compute daily PnL: {type(exc).__name__}")
 
             # Last trade timestamp
             last_trade_at = 0
@@ -1410,8 +1411,8 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
                 recent = get_closed_trades(1)
                 if recent and hasattr(recent[0], "closed_at") and recent[0].closed_at:
                     last_trade_at = int(recent[0].closed_at)
-            except Exception:
-                pass
+            except Exception as exc:
+                log("warn", f"Health check: failed to fetch last trade: {type(exc).__name__}")
 
             # Portfolio metrics
             sharpe = compute_sharpe()
@@ -1446,6 +1447,8 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
 
 def _start_health_server() -> None:
     """Start a background HTTP server for health checks."""
+    if not _HEALTH_TOKEN:
+        log("warn", "HEALTH_TOKEN not set — health endpoint exposes system state without auth")
     port = int(os.environ.get("PORT", "8080"))
     server = http.server.HTTPServer(("0.0.0.0", port), _HealthHandler)
     thread = threading.Thread(target=server.serve_forever, name="health", daemon=True)
