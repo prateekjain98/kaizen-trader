@@ -60,8 +60,9 @@ DEFAULT_SYMBOLS = [
 DEFAULT_START = "2020-01-01"
 DEFAULT_END = "2025-03-31"
 DEFAULT_BALANCE = 10_000.0
-COMMISSION_PCT = 0.001
+COMMISSION_PCT = 0.00075   # Binance with BNB discount (0.075% per side)
 SLIPPAGE_PCT = 0.0005
+FIXED_POSITION_SIZE = 100  # $100 per trade — no compounding, fair comparison
 REPORT_DIR = Path(__file__).resolve().parent.parent / "reports"
 
 # ---------------------------------------------------------------------------
@@ -469,6 +470,7 @@ class StrategySimulator:
     Each strategy subclass implements:
     - scan(symbol, candles, config, market_ctx, now_ms) -> Optional[TradeSignal]
     - required_candles() -> int  (minimum candle window)
+    - timeframe() -> str  (candle interval: "1h", "4h", "1d", "5m")
     - data_feeds() -> list[str]  (what external data it needs)
     """
     strategy_id: str = ""
@@ -489,6 +491,10 @@ class StrategySimulator:
     def required_candles(self) -> int:
         return 30
 
+    def timeframe(self) -> str:
+        """Candle interval this strategy needs. Subclasses override."""
+        return "1h"
+
     def data_feeds(self) -> list[str]:
         return ["klines"]
 
@@ -501,15 +507,11 @@ class StrategySimulator:
             return price * (1 + SLIPPAGE_PCT)
         return price * (1 - SLIPPAGE_PCT)
 
-    def _kelly_size(self, qual_score: float) -> float:
-        if self.balance < 50:
+    def _position_size(self, qual_score: float) -> float:
+        """Fixed position size — no compounding, fair comparison across strategies."""
+        if self.balance < FIXED_POSITION_SIZE:
             return 0
-        fraction = 0.25  # 25% of balance — matches combined mode
-        qual_mult = 0.5 + (qual_score / 100)
-        raw = fraction * self.balance * qual_mult
-        # Cap at 40% of balance per position
-        max_position = self.balance * 0.40
-        return max(10, min(raw, max_position))
+        return FIXED_POSITION_SIZE
 
     def _check_cooldown(self, symbol: str, now_ms: float) -> bool:
         return now_ms < self.cooldowns.get(symbol, 0)
@@ -519,12 +521,12 @@ class StrategySimulator:
 
     def open_position(self, signal: TradeSignal, now_ms: float, config: ScannerConfig,
                       candles: list[dict], ctx: MarketContext) -> Optional[BacktestPosition]:
-        if len(self.open_positions) >= 5:  # max 5 open per strategy
+        if len(self.open_positions) >= 20:  # max 20 open per strategy
             return None
         if any(p.symbol == signal.symbol for p in self.open_positions):
             return None
 
-        size_usd = self._kelly_size(signal.score)
+        size_usd = self._position_size(signal.score)
         entry_price = self._apply_slippage(signal.entry_price, signal.side, True)
         commission = size_usd * COMMISSION_PCT
 
@@ -674,21 +676,18 @@ class StrategySimulator:
                         print(f"  LOSS {pos.symbol} {pos.strategy} {pnl_pct*100:.2f}% "
                               f"[{analysis.category}:{analysis.loss_reason}] {analysis.explanation[:80]}")
 
-                    # Apply parameter change if suggested
+                    # Self-healing DISABLED during backtest — test strategies with intended params
+                    # (keeping analysis for reporting but NOT mutating config)
                     if analysis.parameter_change:
                         pc = analysis.parameter_change
-                        old_val = getattr(config, pc["key"])
-                        setattr(config, pc["key"], pc["new"])
                         self.parameter_changes.append({
                             "trade_id": pos.id,
                             "symbol": pos.symbol,
                             "reason": analysis.loss_reason,
                             "key": pc["key"],
                             "old": pc["old"],
-                            "new": pc["new"],
+                            "new": pc.get("new", pc["old"]),
                         })
-                        if verbose:
-                            print(f"    -> Adjusted {pc['key']}: {pc['old']:.4f} -> {pc['new']:.4f}")
                 elif verbose:
                     print(f"  WIN  {pos.symbol} {pos.strategy} +{pnl_pct*100:.2f}%")
             else:
@@ -772,6 +771,9 @@ class MomentumSimulator(StrategySimulator):
 
     def required_candles(self):
         return 60
+
+    def timeframe(self):
+        return "4h"
 
     def scan(self, symbol, candles, config, ctx, now_ms):
         if self._check_cooldown(symbol, now_ms):
@@ -1128,6 +1130,7 @@ class FearGreedSimulator(StrategySimulator):
     Research: buying at FGI<=20 and selling at FGI>=80 beats buy-and-hold over 7 years."""
     strategy_id = "fear_greed_contrarian"
     tier = "swing"
+    # FGI is a BTC/ETH-specific signal — expanding to alts dilutes edge (tested: 46.7% WR vs 61.4%)
     _eligible = {"BTC", "ETH"}
 
     def __init__(self):
@@ -1136,6 +1139,9 @@ class FearGreedSimulator(StrategySimulator):
 
     def required_candles(self):
         return 20
+
+    def timeframe(self):
+        return "1d"
 
     def data_feeds(self):
         return ["klines", "fgi"]
@@ -1655,7 +1661,7 @@ class ListingPumpSimulator(StrategySimulator):
     strategy_id = "listing_pump"
     tier = "swing"
 
-    _LISTING_WINDOW_MS = 6 * 3_600_000  # 6h window after listing to enter
+    _LISTING_WINDOW_MS = 24 * 3_600_000  # 24h window after listing (was 6h — too narrow for backtesting)
 
     def __init__(self):
         super().__init__()
@@ -1664,7 +1670,10 @@ class ListingPumpSimulator(StrategySimulator):
         self.listing_events: dict[str, list[tuple[int, str]]] = {}
 
     def required_candles(self):
-        return 24
+        return 2
+
+    def timeframe(self):
+        return "5m"  # minimal — listings fire on first candles available
 
     def data_feeds(self):
         return ["klines", "listings"]
@@ -1683,25 +1692,36 @@ class ListingPumpSimulator(StrategySimulator):
                 continue
 
             age_ms = now_ms - listing_ms
-            # Signal within 6h window after listing
+            # Signal within window after listing
             if 0 <= age_ms <= self._LISTING_WINDOW_MS:
-                # Confirm with volume: need at least 2x normal volume
+                # FILTER 1: Price must be pumping — need +5% from first candle
+                if len(candles) >= 2:
+                    first_price = candles[0]["close"]
+                    price_change = (price - first_price) / first_price if first_price > 0 else 0
+                    if price_change < 0.05:
+                        continue  # not pumping, skip this listing
+
+                # FILTER 2: Volume confirmation
                 if len(candles) >= 12:
                     baseline = candles[:-6]
                     recent = candles[-6:]
                     baseline_vol = sum(c["volume"] for c in baseline) / len(baseline) if baseline else 0
                     recent_vol = sum(c["volume"] for c in recent) / len(recent) if recent else 0
                     vol_ratio = recent_vol / baseline_vol if baseline_vol > 0 else 10.0
+                elif len(candles) >= 3:
+                    # Early in listing — check if volume is significant (not dead)
+                    avg_vol = sum(c["volume"] for c in candles) / len(candles)
+                    vol_ratio = 5.0 if avg_vol > 0 else 0
                 else:
-                    vol_ratio = 5.0  # assume high volume near listing
+                    vol_ratio = 5.0
 
-                if vol_ratio >= 2.0:
+                if vol_ratio >= 1.5:
                     self._signaled.add(signal_key)
-                    freshness_bonus = max(0, 15 - int(age_ms / 60_000 / 60))
-                    vol_score = min(20, vol_ratio * 3)
-                    # Coinbase listings get higher score (more retail impact)
+                    freshness_bonus = max(0, 20 - int(age_ms / 3_600_000))  # hours since listing
+                    vol_score = min(20, vol_ratio * 2)
+                    pump_score = min(20, price_change * 100) if len(candles) >= 2 else 10
                     exchange_bonus = 5 if "coinbase" in exchange else 0
-                    score = min(95, 55 + freshness_bonus + vol_score + exchange_bonus)
+                    score = min(95, 50 + freshness_bonus + vol_score + pump_score + exchange_bonus)
 
                     return TradeSignal(
                         id=str(uuid.uuid4()), symbol=symbol, product_id=f"{symbol}-USD",
@@ -1736,7 +1756,7 @@ class ListingPumpSimulator(StrategySimulator):
 
         # Listing pattern: 10x+ volume explosion AND 15%+ price pump
         if vol_explosion >= 10.0 and price_change > 0.15:
-            self._signaled.add(symbol)
+            self._signaled.add(f"{symbol}:heuristic:{int(now_ms)}")  # don't block real listing events
             price = candles[-1]["close"]
 
             freshness_score = min(20, max(0, 20 - len(recent)))
@@ -1774,7 +1794,7 @@ class ProtocolRevenueSimulator(StrategySimulator):
 # ---------------------------------------------------------------------------
 
 class BBSqueezeSimulator(StrategySimulator):
-    """BB/KC squeeze breakout — BB inside Keltner Channel = true squeeze.
+    """BB/KC squeeze breakout (4h timeframe). — BB inside Keltner Channel = true squeeze.
     Direction from MACD histogram, not price vs middle band.
     Research: adding KC filter + MACD direction takes WR from 40% to 50-55%."""
     strategy_id = "bb_squeeze"
@@ -1787,6 +1807,9 @@ class BBSqueezeSimulator(StrategySimulator):
 
     def required_candles(self):
         return 50
+
+    def timeframe(self):
+        return "4h"
 
     def scan(self, symbol, candles, config, ctx, now_ms):
         if self._check_cooldown(symbol, now_ms):
@@ -1888,7 +1911,10 @@ class EMACrossoverSimulator(StrategySimulator):
         self._prev_ema_state: dict[str, str] = {}
 
     def required_candles(self):
-        return 60  # Need enough for EMA(50) + some history
+        return 60
+
+    def timeframe(self):
+        return "4h"  # Need enough for EMA(50) + some history
 
     def scan(self, symbol, candles, config, ctx, now_ms):
         if self._check_cooldown(symbol, now_ms):
@@ -2025,7 +2051,11 @@ class SystematicBacktester:
 
     def run_strategy(self, strategy_id: str, symbol_candles: dict[str, list[dict]],
                      config: ScannerConfig) -> StrategyBacktestResult:
-        """Run a single strategy through the backtest."""
+        """Run a single strategy through the backtest.
+
+        Loads candle data at the strategy's declared timeframe.
+        If timeframe != 1h, downloads fresh data at the correct interval.
+        """
         sim_class = ALL_SIMULATORS.get(strategy_id)
         if not sim_class:
             print(f"  Unknown strategy: {strategy_id}")
@@ -2038,8 +2068,23 @@ class SystematicBacktester:
 
         sim = sim_class()
 
+        # Load data at the strategy's correct timeframe
+        tf = sim.timeframe()
+        if tf != "1h":
+            print(f"  Strategy requires {tf} candles — loading...")
+            tf_candles: dict[str, list[dict]] = {}
+            for sym in self.symbols:
+                try:
+                    candles = load_klines(sym, tf, self.start_ms, self.end_ms)
+                    if candles:
+                        tf_candles[sym] = candles
+                except Exception:
+                    pass
+            print(f"  Loaded {tf} data for {len(tf_candles)} symbols")
+            # Use timeframe-specific candles for this strategy
+            symbol_candles = tf_candles
+
         # Check if strategy can be meaningfully backtested
-        # Allow feeds we can load: klines, btc_klines, funding, oi, futures_klines
         _LOADABLE_FEEDS = {"klines", "btc_klines", "funding", "oi", "futures_klines", "listings", "fgi"}
         feeds = sim.data_feeds()
         unloadable = [f for f in feeds if f not in _LOADABLE_FEEDS]
@@ -2451,12 +2496,15 @@ class TrendFollowingSimulator(StrategySimulator):
     strategy_id = "trend_following"
     tier = "swing"
 
-    _DONCHIAN_LOOKBACK = 360   # 15 days in 1h bars
-    _EXIT_LOOKBACK = 180       # 7.5 day exit channel
-    _TREND_FILTER = 1200       # 50-day SMA in 1h bars
+    _DONCHIAN_LOOKBACK = 15    # 15 days (daily candles)
+    _EXIT_LOOKBACK = 8         # 8 day exit channel
+    _TREND_FILTER = 50         # 50-day SMA
 
     def required_candles(self):
         return max(self._DONCHIAN_LOOKBACK + 5, self._TREND_FILTER + 5)
+
+    def timeframe(self):
+        return "1d"
 
     def scan(self, symbol, candles, config, ctx, now_ms):
         if self._check_cooldown(symbol, now_ms):
@@ -2500,7 +2548,7 @@ class TrendFollowingSimulator(StrategySimulator):
                 strategy="trend_following", side="long", tier="swing",
                 score=score, confidence="medium",
                 sources=["price_action"],
-                reasoning=f"{symbol} new 50-period high (ADX={adx_result[0]:.0f}, vol={vol_ratio:.1f}x, above EMA50)",
+                reasoning=f"{symbol} Donchian {self._DONCHIAN_LOOKBACK}-bar high break, vol={vol_ratio:.1f}x",
                 entry_price=price, stop_price=price * (1 - stop_dist),
                 target_price=price * (1 + stop_dist * 3.0),  # 3:1 R:R for trend trades
                 suggested_size_usd=120, expires_at=now_ms + 14 * 86_400_000, created_at=now_ms,
@@ -2542,6 +2590,12 @@ class RSIDivergenceSimulator(StrategySimulator):
 
     def required_candles(self):
         return 40
+
+    def timeframe(self):
+        return "1d"
+
+    def timeframe(self):
+        return "4h"
 
     def scan(self, symbol, candles, config, ctx, now_ms):
         if self._check_cooldown(symbol, now_ms):
@@ -2668,6 +2722,9 @@ class VolumeBreakoutSimulator(StrategySimulator):
 
     def required_candles(self):
         return 50
+
+    def timeframe(self):
+        return "4h"
 
     def scan(self, symbol, candles, config, ctx, now_ms):
         if self._check_cooldown(symbol, now_ms):
