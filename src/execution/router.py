@@ -18,10 +18,12 @@ from src.types import Trade
 
 _twap_config = TWAPConfig(threshold_usd=500, num_slices=3, interval_s=30)
 
-# Symbols that should route to Binance (futures-only assets or better liquidity)
-# These don't have Coinbase Advanced Trade pairs
+# Route all supported symbols to Binance for execution
+# (Coinbase WS is data-only; Binance is the execution venue)
 _BINANCE_ONLY_SYMBOLS = {
-    "INJ", "FET", "SEI", "APT", "SUI",
+    "BTC", "ETH", "SOL", "BNB", "AVAX", "LINK", "UNI", "AAVE",
+    "ARB", "OP", "DOGE", "MATIC", "SUI", "APT", "SEI", "INJ",
+    "FET", "TIA",
 }
 
 _lock = threading.Lock()

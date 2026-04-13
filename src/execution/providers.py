@@ -77,6 +77,7 @@ class BinanceProvider:
     """
 
     FAPI_BASE = "https://fapi.binance.com"
+    _leverage_set: set[str] = set()  # Track symbols with leverage already configured
 
     @property
     def name(self) -> str:
@@ -85,8 +86,34 @@ class BinanceProvider:
     def _get_binance_symbol(self, symbol: str) -> str:
         return to_binance_ticker(symbol) or f"{symbol.upper()}USDT"
 
+    def _ensure_leverage(self, binance_symbol: str) -> None:
+        """Set leverage to 1x for a symbol (once per session)."""
+        if binance_symbol in self._leverage_set:
+            return
+        if not env.binance_api_key or not env.binance_api_secret:
+            return
+        timestamp = int(time.time() * 1000)
+        params = f"symbol={binance_symbol}&leverage=1&timestamp={timestamp}"
+        signature = hmac.new(
+            env.binance_api_secret.encode(), params.encode(), "sha256"
+        ).hexdigest()
+        try:
+            resp = requests.post(
+                f"{self.FAPI_BASE}/fapi/v1/leverage",
+                headers={"X-MBX-APIKEY": env.binance_api_key},
+                data=f"{params}&signature={signature}",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            self._leverage_set.add(binance_symbol)
+            log("info", f"Binance leverage set to 1x for {binance_symbol}")
+        except Exception as exc:
+            log("warn", f"Failed to set leverage for {binance_symbol}: {exc}")
+
     def _sign_and_post(self, params: str) -> dict:
         """Sign params with HMAC and POST to Binance Futures order endpoint."""
+        if not env.binance_api_secret or not env.binance_api_key:
+            raise ValueError("Binance API keys not configured")
         signature = hmac.new(
             env.binance_api_secret.encode(), params.encode(), "sha256"
         ).hexdigest()
@@ -103,6 +130,7 @@ class BinanceProvider:
                      quantity: float, market_price: float) -> Trade:
         """Shared order execution for both buy and sell."""
         binance_symbol = self._get_binance_symbol(symbol)
+        self._ensure_leverage(binance_symbol)
 
         if not env.binance_api_key or not env.binance_api_secret:
             log("error", f"Binance API keys not configured for {symbol}", symbol=symbol)
@@ -135,8 +163,9 @@ class BinanceProvider:
                 placed_at=time.time() * 1000,
             )
         except Exception as exc:
-            log("error", f"Binance {side} failed for {symbol}: {exc}", symbol=symbol)
-            return _failed_trade(position_id, symbol, side.lower(), str(exc))
+            safe_msg = f"Binance {side} order failed ({type(exc).__name__})"
+            log("error", safe_msg, symbol=symbol)
+            return _failed_trade(position_id, symbol, side.lower(), safe_msg)
 
     def buy(self, symbol: str, product_id: str, size_usd: float,
             position_id: str, market_price: float) -> Trade:
