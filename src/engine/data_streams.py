@@ -277,6 +277,28 @@ def fetch_binance_top_movers(limit: int = 10) -> tuple[list[dict], list[dict]]:
     return _fmt(gainers), _fmt(losers)
 
 
+def fetch_crypto_news() -> list[dict]:
+    """Get latest crypto news from CoinTelegraph RSS. Free, no auth."""
+    import re
+    try:
+        req = Request("https://cointelegraph.com/rss", headers=_UA)
+        with urlopen(req, timeout=10) as resp:
+            xml = resp.read().decode()
+        titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", xml)
+        links = re.findall(r"<link>(https://cointelegraph\.com/news/[^<]+)</link>", xml)
+        pub_dates = re.findall(r"<pubDate>(.*?)</pubDate>", xml)
+        results = []
+        for i, title in enumerate(titles[:15]):
+            results.append({
+                "title": title,
+                "url": links[i] if i < len(links) else "",
+                "published": pub_dates[i] if i < len(pub_dates) else "",
+            })
+        return results
+    except Exception:
+        return []
+
+
 def fetch_binance_prices(symbols: list[str]) -> dict[str, float]:
     """Fetch current prices for multiple symbols from Binance."""
     data = _fetch_json("https://api.binance.com/api/v3/ticker/price")
@@ -375,6 +397,7 @@ class DataStreams:
             ("reddit", self._poll_reddit, 300),                     # 5 min
             ("global_market", self._poll_global_market, 300),       # 5 min
             ("top_movers", self._poll_top_movers, 60),              # 1 min — catches pumps fast
+            ("crypto_news", self._poll_news, 300),                  # 5 min — CoinTelegraph RSS
         ]
 
         for name, fn, interval_s in streams:
@@ -594,4 +617,25 @@ class DataStreams:
                     data=l,
                     timestamp=now,
                     priority=1,
+                ))
+
+    def _poll_news(self):
+        """Fetch crypto news from CoinTelegraph RSS."""
+        articles = fetch_crypto_news()
+        now = time.time() * 1000
+
+        # Look for market-moving keywords in headlines
+        _URGENT_KEYWORDS = ["hack", "exploit", "SEC", "ban", "crash", "surge", "listing",
+                            "binance", "coinbase", "regulation", "arrest", "fraud"]
+        for a in articles[:5]:
+            title_lower = a.get("title", "").lower()
+            is_urgent = any(kw in title_lower for kw in _URGENT_KEYWORDS)
+            if is_urgent:
+                self.on_signal(TokenSignal(
+                    source="cointelegraph",
+                    symbol="NEWS",
+                    event_type="breaking_news",
+                    data=a,
+                    timestamp=now,
+                    priority=2,
                 ))
