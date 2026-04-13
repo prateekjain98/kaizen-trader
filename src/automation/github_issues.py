@@ -74,12 +74,22 @@ def _release_slot() -> None:
         _daily_count = max(0, _daily_count - 1)
 
 
+def _sanitize_for_gh(s: str, max_len: int = 4000) -> str:
+    """Strip control characters and limit length for gh CLI args."""
+    cleaned = "".join(c for c in s if c == "\n" or (c >= " " and ord(c) < 0x10000))
+    return cleaned[:max_len]
+
+
 def _create_issue_via_gh(title: str, body: str, labels: list[str]) -> Optional[int]:
     """Create a GitHub issue using the `gh` CLI. Returns issue number or None."""
     repo = _get_repo()
     if not repo:
         log("warn", "GITHUB_REPO not set -- skipping issue creation")
         return None
+
+    title = _sanitize_for_gh(title, max_len=256)
+    body = _sanitize_for_gh(body, max_len=4000)
+    labels = [_sanitize_for_gh(l, max_len=50) for l in labels]
 
     cmd = [
         "gh", "issue", "create",

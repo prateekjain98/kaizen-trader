@@ -234,6 +234,8 @@ def fetch_social_time_series(symbol: str, interval: str = "1d",
         return []
     if not _SYMBOL_PATTERN.fullmatch(symbol):
         return []
+    if interval not in ("1h", "1d", "1w"):
+        return []
 
     if not _breaker.can_call():
         log("warn", "Social circuit breaker OPEN — skipping time series fetch")

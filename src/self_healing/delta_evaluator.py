@@ -42,14 +42,36 @@ class DeltaEvaluator:
     WORSENED_WIN_RATE_DROP = 0.08  # 8% win rate drop = worsened (was 5%, too sensitive to noise)
     WORSENED_PNL_DROP = 0.10  # 10% avg PnL drop = worsened
     MAX_REVERTS_PER_CYCLE = 1  # Only revert 1 parameter per evaluation
+    OSCILLATION_WINDOW = 6  # Check last N deltas per parameter for oscillation
 
     def __init__(self):
         self._deltas: list[ParameterDelta] = []
         self._lock = threading.Lock()
 
+    def _is_oscillating(self, parameter: str) -> bool:
+        """Detect if a parameter is ping-ponging between values."""
+        with self._lock:
+            recent = [d for d in self._deltas if d.parameter == parameter][-self.OSCILLATION_WINDOW:]
+        if len(recent) < 4:
+            return False
+        # Check for alternating direction changes (up/down/up/down)
+        directions = []
+        for i in range(1, len(recent)):
+            directions.append(1 if recent[i].new_value > recent[i].old_value else -1)
+        reversals = sum(1 for i in range(1, len(directions)) if directions[i] != directions[i - 1])
+        return reversals >= len(directions) - 1  # Nearly all direction changes = oscillation
+
     def record_delta(self, parameter: str, old_value: float, new_value: float,
-                     reason: str, source: str, config: object) -> ParameterDelta:
-        """Record a parameter change with a snapshot of recent performance."""
+                     reason: str, source: str, config: object) -> Optional[ParameterDelta]:
+        """Record a parameter change with a snapshot of recent performance.
+
+        Returns None if oscillation is detected (change should be skipped).
+        """
+        if self._is_oscillating(parameter):
+            log("warn", f"Oscillation detected for {parameter} — skipping change {old_value} -> {new_value}",
+                data={"source": source, "reason": reason[:100]})
+            return None
+
         recent = get_closed_trades(20)
         before = self._compute_snapshot(recent)
 
@@ -179,7 +201,9 @@ class DeltaEvaluator:
 
         lo, hi = bounds
         reverted_value = min(hi, max(lo, delta.old_value))
-        setattr(config, delta.parameter, reverted_value)
+        from src.main import _config_lock
+        with _config_lock:
+            setattr(config, delta.parameter, reverted_value)
         snapshot_config(config, f"delta-revert: {delta.parameter} {delta.new_value} -> {reverted_value}")
 
         # Record the revert itself as a new delta so the change history is complete

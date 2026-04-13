@@ -113,7 +113,7 @@ class Trade:
     quantity: float
     size_usd: float
     price: float
-    status: Literal["pending", "filled", "error"]
+    status: Literal["pending", "filled", "error", "failed", "paper"]
     paper_trading: bool
     placed_at: float
     commission: float = 0.0

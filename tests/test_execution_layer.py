@@ -143,7 +143,7 @@ class TestRouter:
         self._reset_router()
         with patch("src.execution.router.env") as mock_env:
             mock_env.paper_trading = False
-            provider = get_provider("BTC")
+            provider = get_provider("XRP")
             assert provider.name == "coinbase"
 
     def test_binance_only_symbols(self):
