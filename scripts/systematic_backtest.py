@@ -2506,21 +2506,18 @@ class TrendFollowingSimulator(StrategySimulator):
                 suggested_size_usd=120, expires_at=now_ms + 14 * 86_400_000, created_at=now_ms,
             )
 
-        # SHORT: new 50-period low, below EMA50
-        low_50 = min(lows[-50:])
-        if (price <= low_50 * 1.01
-                and price < ema_50
-                and vol_ratio > 1.2
-                and ctx.phase not in ("extreme_greed", "bull")):
-            stop_dist = max(0.04, min(0.08, atr_pct * 3.0))
-            score = min(85, 58 + adx_result[0] * 0.4 + vol_ratio * 2)
-            self._set_cooldown(symbol, now_ms, 86_400_000 * 2)
+        # SHORT: price breaks below Donchian low + trend filter down
+        if (price < dc_low and sma_now < sma_prev
+                and vol_ratio > 1.0
+                and ctx.phase not in ("extreme_greed",)):
+            score = min(85, 58 + min(20, (dc_low - price) / price * 500) + vol_ratio * 2)
+            self._set_cooldown(symbol, now_ms, 86_400_000 * 3)
             return TradeSignal(
                 id=str(uuid.uuid4()), symbol=symbol, product_id=f"{symbol}-USD",
                 strategy="trend_following", side="short", tier="swing",
                 score=score, confidence="medium",
                 sources=["price_action"],
-                reasoning=f"{symbol} new 50-period low (ADX={adx_result[0]:.0f}, below EMA50)",
+                reasoning=f"{symbol} Donchian low break, trend down",
                 entry_price=price, stop_price=price * (1 + stop_dist),
                 target_price=price * (1 - stop_dist * 3.0),
                 suggested_size_usd=100, expires_at=now_ms + 14 * 86_400_000, created_at=now_ms,
