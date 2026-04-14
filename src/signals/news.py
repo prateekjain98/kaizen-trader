@@ -1,10 +1,13 @@
-"""CryptoPanic news sentiment fetcher."""
+"""News sentiment fetcher — CryptoPanic (with key) or CoinTelegraph RSS (free fallback)."""
 
+import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 
 import requests
 
@@ -73,10 +76,63 @@ def _update_baseline(symbol: str, count: int) -> float:
     return count / avg if avg > 0 else 1.0
 
 
+def _fetch_cointelegraph_rss(symbols: list[str]) -> list[NewsSentiment]:
+    """Free fallback: CoinTelegraph RSS. No auth required."""
+    try:
+        req = Request("https://cointelegraph.com/rss",
+                       headers={"User-Agent": "kaizen-trader/2.0"})
+        with urlopen(req, timeout=10) as resp:
+            xml = resp.read().decode()
+    except Exception as err:
+        log("warn", f"CoinTelegraph RSS fetch failed: {err}")
+        return []
+
+    titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", xml)
+    if not titles:
+        # Try non-CDATA titles
+        titles = re.findall(r"<title>([^<]+)</title>", xml)
+
+    now = time.time() * 1000
+    # Match headlines to symbols by keyword
+    symbol_aliases = {s: {s.lower()} for s in symbols}
+    _EXTRA = {"BTC": {"bitcoin"}, "ETH": {"ethereum", "ether"}, "SOL": {"solana"},
+              "BNB": {"binance"}, "AVAX": {"avalanche"}, "LINK": {"chainlink"},
+              "DOGE": {"dogecoin"}, "MATIC": {"polygon"}, "ARB": {"arbitrum"},
+              "OP": {"optimism"}, "SUI": {"sui"}, "APT": {"aptos"},
+              "SEI": {"sei"}, "INJ": {"injective"}, "TIA": {"celestia"},
+              "UNI": {"uniswap"}, "AAVE": {"aave"}, "FET": {"fetch"}}
+    for s in symbols:
+        if s in _EXTRA:
+            symbol_aliases[s] |= _EXTRA[s]
+
+    by_symbol: dict[str, list[str]] = {}
+    for title in titles[:20]:
+        lower = title.lower()
+        for sym, aliases in symbol_aliases.items():
+            if any(a in lower for a in aliases):
+                by_symbol.setdefault(sym, []).append(title)
+
+    sentiments: list[NewsSentiment] = []
+    for sym, matched_titles in by_symbol.items():
+        scores = [_score_headline(t) for t in matched_titles]
+        avg = sum(scores) / len(scores) if scores else 0
+        velocity = _update_baseline(sym, len(matched_titles))
+        sentiments.append(NewsSentiment(
+            symbol=sym,
+            score=max(-1.0, min(1.0, avg)),
+            mention_count=len(matched_titles),
+            top_headlines=matched_titles[:3],
+            velocity_ratio=velocity,
+            sampled_at=now,
+        ))
+
+    if sentiments:
+        log("info", f"CoinTelegraph RSS: {len(sentiments)} symbols with news mentions")
+    return sentiments
+
+
 def fetch_news_sentiment(symbols: list[str]) -> list[NewsSentiment]:
     global _last_fetch_at, _cached
-    if not env.cryptopanic_token:
-        return []
     now = time.time() * 1000
     with _lock:
         if now - _last_fetch_at < _CACHE_TTL_MS:
@@ -86,24 +142,36 @@ def fetch_news_sentiment(symbols: list[str]) -> list[NewsSentiment]:
     if _cached and _last_fetch_at > 0 and now - _last_fetch_at > 2 * _CACHE_TTL_MS:
         log("warn", f"News data is stale (last fetch {(now - _last_fetch_at) / 60_000:.0f}m ago)")
 
-    if not _breaker.can_call():
-        log("warn", "News circuit breaker OPEN — returning cached data")
-        return _cached
-
-    url = "https://cryptopanic.com/api/free/v1/posts/?public=true&kind=news"
-    try:
-        res = requests.get(url, headers={"Authorization": f"Token {env.cryptopanic_token}"}, timeout=8)
-        if res.status_code != 200:
-            log("warn", f"CryptoPanic fetch failed: {res.status_code}")
+    # ── CryptoPanic (if token configured) ──────────────────────────────
+    if env.cryptopanic_token and _breaker.can_call():
+        url = "https://cryptopanic.com/api/free/v1/posts/?public=true&kind=news"
+        try:
+            res = requests.get(url, headers={"Authorization": f"Token {env.cryptopanic_token}"}, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                _breaker.record_success()
+                sentiments = _parse_cryptopanic(data, symbols, now)
+                with _lock:
+                    _last_fetch_at = now
+                    _cached = sentiments
+                return sentiments
+            else:
+                log("warn", f"CryptoPanic fetch failed: {res.status_code}")
+                _breaker.record_failure()
+        except Exception as err:
+            log("warn", f"CryptoPanic network error: {err}")
             _breaker.record_failure()
-            return _cached
-        data = res.json()
-        _breaker.record_success()
-    except Exception as err:
-        log("warn", f"CryptoPanic network error: {err}")
-        _breaker.record_failure()
-        return _cached
 
+    # ── CoinTelegraph RSS fallback (free, no auth) ─────────────────────
+    sentiments = _fetch_cointelegraph_rss(symbols)
+    with _lock:
+        _last_fetch_at = now
+        _cached = sentiments
+    return sentiments
+
+
+def _parse_cryptopanic(data: dict, symbols: list[str], now: float) -> list[NewsSentiment]:
+    """Parse CryptoPanic API response into NewsSentiment list."""
     by_symbol: dict[str, list[dict]] = {}
     for post in data.get("results", []):
         for currency in post.get("currencies", []):
@@ -131,8 +199,4 @@ def fetch_news_sentiment(symbols: list[str]) -> list[NewsSentiment]:
             velocity_ratio=velocity_ratio,
             sampled_at=now,
         ))
-
-    with _lock:
-        _last_fetch_at = now
-        _cached = sentiments
     return sentiments
