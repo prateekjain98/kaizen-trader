@@ -17,7 +17,7 @@ from src.config import env, default_scanner_config, validate_config
 from src.evaluation.strategy_selector import StrategySelector, SelectionConfig
 from src.execution.paper import get_paper_balance
 from src.execution.router import execute_buy, execute_sell
-from src.feeds.coinbase_ws import CoinbaseWebSocket
+from src.engine.binance_ws import BinanceWebSocket
 from src.qualification.scorer import qualify
 from src.risk.portfolio import (
     init_protections, can_open_position, register_open, register_close,
@@ -60,7 +60,7 @@ from src.strategies.fear_greed_contrarian import (
     on_position_closed as fgi_on_position_closed,
 )
 from src.strategies.correlation_break import scan_correlation_break
-from src.strategies.cross_exchange_divergence import scan_cross_exchange_divergence
+# cross_exchange_divergence disabled — single exchange (Binance) only
 from src.strategies.narrative_momentum import scan_narrative_momentum
 from src.strategies.protocol_revenue import scan_protocol_revenue, ProtocolMetrics
 from src.indicators.core import (
@@ -78,22 +78,49 @@ from src.risk.signal_aggregator import SignalAggregator
 from src.storage.database import insert_trade_journal
 from src.evaluation.metrics import monte_carlo_significance
 
-# ─── Default watchlist (Coinbase product IDs) ────────────────────────────────
-DEFAULT_WATCHLIST = [
-    # Tier 1 — Major (>$1B daily volume)
-    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "BNB-USD",
-    # Tier 2 — Large cap L1/L2
-    "ADA-USD", "AVAX-USD", "LINK-USD", "SUI-USD", "DOT-USD", "NEAR-USD",
-    "LTC-USD", "BCH-USD", "TON-USD", "ATOM-USD", "ALGO-USD", "HBAR-USD",
-    "STX-USD", "FIL-USD", "APT-USD", "SEI-USD", "INJ-USD", "TIA-USD",
-    "POL-USD",
-    # Tier 3 — DeFi / Infrastructure
-    "AAVE-USD", "UNI-USD", "LDO-USD", "ONDO-USD", "ENA-USD", "SNX-USD",
-    "CRV-USD", "ENS-USD", "RENDER-USD", "FET-USD", "IMX-USD",
-    # Tier 4 — Momentum / Narrative
-    "ARB-USD", "OP-USD", "HYPE-USD", "TAO-USD", "WLD-USD",
-    "PEPE-USD", "PENGU-USD", "BONK-USD", "FLOKI-USD", "WIF-USD",
-]
+# ─── Watchlist (populated dynamically from Binance Futures at startup) ────────
+DEFAULT_WATCHLIST: list[str] = []  # filled by _init_watchlist()
+
+
+def _init_watchlist() -> list[str]:
+    """Fetch ALL active USDT futures symbols from Binance at startup."""
+    import requests as _req
+    try:
+        resp = _req.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        symbols = []
+        for s in data.get("symbols", []):
+            if s.get("status") != "TRADING" or not s["symbol"].endswith("USDT"):
+                continue
+            base = s["symbol"].replace("USDT", "")
+            if base.startswith("1000"):
+                base = base[4:]
+            # Skip non-crypto pairs (commodities, equities, forex, indices)
+            _SKIP = {"BTCDOM", "DEFI", "USDC", "USTC", "PAXG", "XAUT",
+                     "XAU", "XAG", "CL", "TSLA", "AMZN", "AAPL", "GOOGL",
+                     "META", "NVDA", "MSTR", "COIN", "INTC", "PLTR", "HOOD",
+                     "XPD", "XPT", "NATGAS", "QQQ", "SPY", "EWJ", "EWY",
+                     "PAYP", "TSM", "SNDK"}
+            if base in _SKIP:
+                continue
+            # Skip non-ASCII symbols (e.g. Chinese character memecoins)
+            if not base.isascii():
+                continue
+            symbols.append(base)
+        symbols = sorted(set(symbols))
+        print(f"[INIT] Loaded {len(symbols)} tradeable symbols from Binance Futures", flush=True)
+        return symbols
+    except Exception as err:
+        print(f"[INIT] Failed to fetch Binance symbols: {err} — using fallback list", flush=True)
+        return [
+            "BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "ADA", "AVAX",
+            "LINK", "SUI", "DOT", "NEAR", "LTC", "BCH", "TON", "ATOM",
+            "ALGO", "HBAR", "STX", "FIL", "APT", "SEI", "INJ", "TIA",
+            "AAVE", "UNI", "LDO", "ONDO", "ENA", "SNX", "CRV", "ENS",
+            "RENDER", "FET", "IMX", "ARB", "OP", "HYPE", "TAO", "WLD",
+            "PEPE", "PENGU", "BONK", "FLOKI", "WIF", "POL",
+        ]
 
 # Mutable config — self-healer patches this live
 config = ScannerConfig(**asdict(default_scanner_config))
@@ -130,7 +157,7 @@ _last_diag_time = 0.0
 _DIAG_INTERVAL_S = 60  # log diagnostics every 60 seconds
 _last_convex_sync_time = 0.0
 _CONVEX_SYNC_INTERVAL_S = 10  # sync position prices to Convex every 10 seconds
-_ws_instance: Optional[CoinbaseWebSocket] = None  # for health check access
+_ws_instance: Optional[BinanceWebSocket] = None  # for health check access
 
 _news_lock = threading.Lock()
 _news_cache: dict[str, NewsSentiment] = {}  # symbol -> NewsSentiment
@@ -203,8 +230,8 @@ def _get_market_context() -> MarketContext:
 # ─── Signal refresh ──────────────────────────────────────────────────────────
 
 def _get_watchlist_symbols() -> list[str]:
-    """Extract bare symbols from product IDs."""
-    return [pid.replace("-USD", "") for pid in DEFAULT_WATCHLIST]
+    """Return bare symbols from the watchlist."""
+    return list(DEFAULT_WATCHLIST)
 
 
 def _refresh_signals() -> None:
@@ -321,7 +348,7 @@ def _scan_protocol_revenue_signals() -> None:
             current_price = _latest_prices.get(pr.symbol)
         if not current_price:
             continue
-        product_id = f"{pr.symbol}-USD"
+        product_id = f"{pr.symbol}USDT"
         metric = ProtocolMetrics(
             symbol=pr.symbol, product_id=product_id,
             protocol=pr.protocol, revenue_24h=pr.revenue_24h,
@@ -657,8 +684,8 @@ def _log_diagnostics() -> None:
 
 # ─── Tick-driven strategy scanning ───────────────────────────────────────────
 
-def _on_tick(symbol: str, price: float, volume: float) -> None:
-    """Called on each WebSocket tick. Feed data to strategies and scan."""
+def _on_tick(symbol: str, price: float, volume: float, change_pct: float = 0.0) -> None:
+    """Called on each Binance Futures WS tick. Feed data to strategies and scan."""
     # Price feed validation: reject unreasonable prices
     if price <= 0.001:
         return  # absolute floor — no sub-penny assets
@@ -735,7 +762,7 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
 
     # Get shared context
     ctx = _get_market_context()
-    product_id = f"{symbol}-USD"
+    product_id = f"{symbol}USDT"
 
     # --- Tick-driven strategies ---
     # Each strategy has a different signature; call them explicitly.
@@ -761,11 +788,8 @@ def _on_tick(symbol: str, price: float, volume: float) -> None:
     # 7. Correlation break (requires BTC % change data)
     _try_scan_correlation(symbol, product_id, price, ctx)
 
-    # 8. Orderbook imbalance (scanned on book updates, but also scan here)
+    # 8. Orderbook imbalance
     _try_scan(lambda: scan_orderbook_imbalance(symbol, product_id, price, config), ctx)
-
-    # 9. Cross-exchange divergence (Coinbase vs Binance price dislocation)
-    _try_scan(lambda: scan_cross_exchange_divergence(symbol, product_id, price, config, ctx), ctx)
 
 
 def _try_scan(scan_fn, ctx: MarketContext) -> None:
@@ -819,7 +843,7 @@ def _scan_narrative_momentum(ctx: MarketContext) -> None:
         return
     with _price_lock:
         current_prices = dict(_latest_prices)
-    product_id_map = {sym: f"{sym}-USD" for sym in current_prices}
+    product_id_map = {sym: f"{sym}USDT" for sym in current_prices}
     try:
         sig = scan_narrative_momentum(product_id_map, config, current_prices, ctx=ctx)
         if sig:
@@ -1495,18 +1519,13 @@ def main() -> None:
         log("warn", "ANTHROPIC_API_KEY not set — Claude log analysis disabled")
 
     # Required API keys
-    _missing_keys = []
-    if not env.coinbase_api_key:
-        _missing_keys.append("COINBASE_API_KEY")
-    if _missing_keys:
-        log("error", f"Missing required API keys: {', '.join(_missing_keys)}")
+    if not env.binance_api_key and not env.paper_trading:
+        log("error", "BINANCE_API_KEY not set — required for live trading")
         sys.exit(1)
 
     # Optional API keys — features degrade gracefully without them
     if not env.lunarcrush_api_key:
         log("warn", "LUNARCRUSH_API_KEY not set — social signals disabled, narrative_momentum strategy will not fire")
-    if not env.binance_api_key:
-        log("warn", "BINANCE_API_KEY not set — Binance signals, derivatives, and cross-exchange strategy disabled")
 
     # CONFIG_BOUNDS validation at startup
     violations = validate_config(config)
@@ -1575,16 +1594,19 @@ def main() -> None:
     _thread_registry["signal_refresh"] = signal_thread
     _thread_registry["market_context"] = ctx_thread
 
-    # ── Connect WebSocket ─────────────────────────────────────────────────
+    # ── Initialize watchlist from Binance Futures ──────────────────────────
+    global DEFAULT_WATCHLIST
+    DEFAULT_WATCHLIST = _init_watchlist()
+
+    # ── Connect Binance Futures WebSocket (ALL symbols, no subscription needed) ─
     global _ws_instance
-    ws = CoinbaseWebSocket(
-        product_ids=DEFAULT_WATCHLIST,
+    ws = BinanceWebSocket(
         on_tick=_on_tick,
-        on_book=_on_book,
+        on_funding=lambda sym, rate, mark: None,  # funding handled by signal refresh
     )
     _ws_instance = ws
     ws.connect()
-    log("info", f"Coinbase WebSocket connecting to {len(DEFAULT_WATCHLIST)} products")
+    log("info", f"Binance Futures WS connecting — streaming ALL USDT pairs ({len(DEFAULT_WATCHLIST)} tracked)")
 
     # ── Strategy banner ───────────────────────────────────────────────────
     strategy_banner = _build_strategy_banner()

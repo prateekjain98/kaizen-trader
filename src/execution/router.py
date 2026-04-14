@@ -2,8 +2,7 @@
 
 Routing logic:
 1. If paper trading is enabled, always use PaperProvider.
-2. Otherwise, route based on symbol → exchange mapping.
-3. Default exchange is Coinbase (existing behavior).
+2. Otherwise, route all symbols to Binance Futures.
 """
 
 import threading
@@ -11,29 +10,12 @@ from typing import Optional
 
 from src.config import env
 from src.execution.protocol import ExecutionProvider
-from src.execution.providers import CoinbaseProvider, PaperProvider, BinanceProvider
+from src.execution.providers import PaperProvider, BinanceProvider
 from src.execution.twap import TWAPExecutor, TWAPConfig
 from src.storage.database import log
 from src.types import Trade
 
 _twap_config = TWAPConfig(threshold_usd=500, num_slices=3, interval_s=30)
-
-# Route all supported symbols to Binance for execution
-# (Coinbase WS is data-only; Binance is the execution venue)
-_BINANCE_ONLY_SYMBOLS = {
-    # Tier 1
-    "BTC", "ETH", "SOL", "XRP", "DOGE", "BNB",
-    # Tier 2 — L1/L2
-    "ADA", "AVAX", "LINK", "SUI", "DOT", "NEAR", "LTC", "BCH",
-    "TON", "ATOM", "ALGO", "HBAR", "STX", "FIL", "APT", "SEI",
-    "INJ", "TIA", "POL",
-    # Tier 3 — DeFi / Infra
-    "AAVE", "UNI", "LDO", "ONDO", "ENA", "SNX", "CRV", "ENS",
-    "RENDER", "FET", "IMX",
-    # Tier 4 — Momentum / Narrative
-    "ARB", "OP", "HYPE", "TAO", "WLD", "PEPE", "PENGU", "BONK",
-    "FLOKI", "WIF",
-}
 
 _lock = threading.Lock()
 _providers: dict[str, ExecutionProvider] = {}
@@ -44,9 +26,7 @@ def _get_provider(name: str) -> ExecutionProvider:
     """Lazy-initialize and cache providers."""
     with _lock:
         if name not in _providers:
-            if name == "coinbase":
-                _providers[name] = CoinbaseProvider()
-            elif name == "binance":
+            if name == "binance":
                 _providers[name] = BinanceProvider()
             elif name == "paper":
                 _providers[name] = PaperProvider()
@@ -78,19 +58,15 @@ def _resolve_exchange(symbol: str) -> str:
     if override:
         return override
 
-    # Binance-only symbols
-    if sym in _BINANCE_ONLY_SYMBOLS:
-        return "binance"
-
-    # Default to Coinbase for everything else
-    return "coinbase"
+    # All symbols go to Binance Futures
+    return "binance"
 
 
 def get_provider(symbol: str) -> ExecutionProvider:
     """Get the appropriate execution provider for a symbol.
 
     If paper trading is enabled, always returns PaperProvider.
-    Otherwise, routes to the correct exchange based on symbol.
+    Otherwise, routes to Binance Futures.
     """
     if env.paper_trading:
         return _get_provider("paper")
@@ -121,7 +97,7 @@ def execute_sell(symbol: str, product_id: str, quantity: float,
 def get_all_balances() -> dict[str, dict[str, float]]:
     """Get balances from all configured exchanges."""
     result = {}
-    for name in ["paper"] if env.paper_trading else ["coinbase", "binance"]:
+    for name in ["paper"] if env.paper_trading else ["binance"]:
         try:
             provider = _get_provider(name)
             result[name] = provider.get_balances()
