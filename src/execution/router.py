@@ -21,9 +21,18 @@ _twap_config = TWAPConfig(threshold_usd=500, num_slices=3, interval_s=30)
 # Route all supported symbols to Binance for execution
 # (Coinbase WS is data-only; Binance is the execution venue)
 _BINANCE_ONLY_SYMBOLS = {
-    "BTC", "ETH", "SOL", "BNB", "AVAX", "LINK", "UNI", "AAVE",
-    "ARB", "OP", "DOGE", "MATIC", "SUI", "APT", "SEI", "INJ",
-    "FET", "TIA",
+    # Tier 1
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "BNB",
+    # Tier 2 — L1/L2
+    "ADA", "AVAX", "LINK", "SUI", "DOT", "NEAR", "LTC", "BCH",
+    "TON", "ATOM", "ALGO", "HBAR", "STX", "FIL", "APT", "SEI",
+    "INJ", "TIA", "POL",
+    # Tier 3 — DeFi / Infra
+    "AAVE", "UNI", "LDO", "ONDO", "ENA", "SNX", "CRV", "ENS",
+    "RENDER", "FET", "IMX",
+    # Tier 4 — Momentum / Narrative
+    "ARB", "OP", "HYPE", "TAO", "WLD", "PEPE", "PENGU", "BONK",
+    "FLOKI", "WIF",
 }
 
 _lock = threading.Lock()

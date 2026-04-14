@@ -96,11 +96,21 @@ def _fetch_cointelegraph_rss(symbols: list[str]) -> list[NewsSentiment]:
     # Match headlines to symbols by keyword
     symbol_aliases = {s: {s.lower()} for s in symbols}
     _EXTRA = {"BTC": {"bitcoin"}, "ETH": {"ethereum", "ether"}, "SOL": {"solana"},
-              "BNB": {"binance"}, "AVAX": {"avalanche"}, "LINK": {"chainlink"},
-              "DOGE": {"dogecoin"}, "MATIC": {"polygon"}, "ARB": {"arbitrum"},
-              "OP": {"optimism"}, "SUI": {"sui"}, "APT": {"aptos"},
-              "SEI": {"sei"}, "INJ": {"injective"}, "TIA": {"celestia"},
-              "UNI": {"uniswap"}, "AAVE": {"aave"}, "FET": {"fetch"}}
+              "BNB": {"binance"}, "XRP": {"ripple"}, "DOGE": {"dogecoin"},
+              "ADA": {"cardano"}, "AVAX": {"avalanche"}, "LINK": {"chainlink"},
+              "DOT": {"polkadot"}, "NEAR": {"near protocol"}, "LTC": {"litecoin"},
+              "BCH": {"bitcoin cash"}, "TON": {"toncoin"}, "ATOM": {"cosmos"},
+              "ALGO": {"algorand"}, "HBAR": {"hedera"}, "STX": {"stacks"},
+              "FIL": {"filecoin"}, "APT": {"aptos"}, "SEI": {"sei"},
+              "INJ": {"injective"}, "TIA": {"celestia"}, "POL": {"polygon"},
+              "AAVE": {"aave"}, "UNI": {"uniswap"}, "LDO": {"lido"},
+              "ONDO": {"ondo"}, "ENA": {"ethena"}, "SNX": {"synthetix"},
+              "CRV": {"curve"}, "ENS": {"ethereum name"}, "RENDER": {"render"},
+              "FET": {"fetch"}, "IMX": {"immutable"}, "ARB": {"arbitrum"},
+              "OP": {"optimism"}, "TAO": {"bittensor"}, "WLD": {"worldcoin"},
+              "PEPE": {"pepe"}, "FLOKI": {"floki"}, "SUI": {"sui"},
+              "HYPE": {"hyperliquid"}, "WIF": {"dogwifhat"},
+              "BONK": {"bonk"}, "PENGU": {"pudgy penguin"}}
     for s in symbols:
         if s in _EXTRA:
             symbol_aliases[s] |= _EXTRA[s]

@@ -80,10 +80,19 @@ from src.evaluation.metrics import monte_carlo_significance
 
 # ─── Default watchlist (Coinbase product IDs) ────────────────────────────────
 DEFAULT_WATCHLIST = [
-    "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD",
-    "UNI-USD", "AAVE-USD", "ARB-USD", "OP-USD", "DOGE-USD",
-    "MATIC-USD", "SUI-USD", "APT-USD", "SEI-USD", "TIA-USD",
-    "ONDO-USD", "LDO-USD", "RENDER-USD", "FET-USD", "INJ-USD",
+    # Tier 1 — Major (>$1B daily volume)
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "BNB-USD",
+    # Tier 2 — Large cap L1/L2
+    "ADA-USD", "AVAX-USD", "LINK-USD", "SUI-USD", "DOT-USD", "NEAR-USD",
+    "LTC-USD", "BCH-USD", "TON-USD", "ATOM-USD", "ALGO-USD", "HBAR-USD",
+    "STX-USD", "FIL-USD", "APT-USD", "SEI-USD", "INJ-USD", "TIA-USD",
+    "POL-USD",
+    # Tier 3 — DeFi / Infrastructure
+    "AAVE-USD", "UNI-USD", "LDO-USD", "ONDO-USD", "ENA-USD", "SNX-USD",
+    "CRV-USD", "ENS-USD", "RENDER-USD", "FET-USD", "IMX-USD",
+    # Tier 4 — Momentum / Narrative
+    "ARB-USD", "OP-USD", "HYPE-USD", "TAO-USD", "WLD-USD",
+    "PEPE-USD", "PENGU-USD", "BONK-USD", "FLOKI-USD", "WIF-USD",
 ]
 
 # Mutable config — self-healer patches this live
