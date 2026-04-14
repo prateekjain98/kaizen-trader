@@ -215,6 +215,18 @@ class BinanceWebSocket:
     def is_connected(self) -> bool:
         return self._status == "connected"
 
+    def check_health(self, max_silence_s: float = 30.0) -> bool:
+        """Check if WS is receiving ticks. Force-reconnect if stale."""
+        if self._status != "connected":
+            return False
+        silence = time.time() - self._last_tick_time
+        if silence > max_silence_s:
+            log("warn", f"Binance WS tick silence for {silence:.0f}s — force reconnecting")
+            self.disconnect()
+            self.connect()
+            return False
+        return True
+
     @property
     def tick_count(self) -> int:
         return self._tick_count
