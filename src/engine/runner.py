@@ -16,18 +16,110 @@ Usage:
 """
 
 import argparse
+import hashlib
+import hmac
+import os
 import signal
 import sys
 import threading
 import time
 from collections import deque
+from urllib.request import urlopen, Request
 
-from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices, fetch_reddit_crypto_sentiment, fetch_crypto_news
+from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices, fetch_binance_top_movers, fetch_reddit_crypto_sentiment, fetch_crypto_news
 from src.engine.signal_detector import SignalDetector, SignalPacket
 from src.engine.claude_brain import ClaudeBrain
 from src.engine.executor import Executor
 from src.engine.correlation_scanner import CorrelationScanner
 from src.engine.log import log
+
+def _fetch_binance_account_balance() -> float | None:
+    """Fetch USDT balance from the configured exchange account.
+
+    Supports Binance Futures and OKX. Checks EXCHANGE env var to decide.
+    """
+    import json as _json
+    from src.config import env as _env
+
+    if _env.exchange == "okx":
+        # Use OKX balance endpoint
+        if not _env.okx_api_key or not _env.okx_api_secret:
+            log("warn", "OKX_API_KEY / OKX_API_SECRET not set — cannot fetch balance")
+            return None
+        try:
+            from src.execution.providers import OKXProvider
+            provider = OKXProvider()
+            balances = provider.get_balances()
+            return balances.get("USDT", None)
+        except Exception as e:
+            log("error", f"Failed to fetch OKX balance: {e}")
+            return None
+
+    # Default: Binance
+    api_key = os.environ.get("BINANCE_API_KEY")
+    api_secret = os.environ.get("BINANCE_API_SECRET")
+    if not api_key or not api_secret:
+        log("warn", "BINANCE_API_KEY / BINANCE_API_SECRET not set — cannot fetch balance")
+        return None
+    try:
+        ts = int(time.time() * 1000)
+        params = f"timestamp={ts}"
+        signature = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
+        url = f"https://fapi.binance.com/fapi/v2/balance?{params}&signature={signature}"
+        req = Request(url, headers={"X-MBX-APIKEY": api_key})
+        with urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode())
+        for asset in data:
+            if asset.get("asset") == "USDT":
+                return float(asset.get("balance", 0))
+        return None
+    except Exception as e:
+        log("error", f"Failed to fetch Binance balance: {e}")
+        return None
+
+
+def _fetch_single_kline(sym: str) -> tuple[str, float | None]:
+    """Fetch 1h price change % for a single symbol. Returns (symbol, pct_change_or_None)."""
+    import json as _json
+    try:
+        pair = sym.upper() + "USDT"
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={pair}&interval=1h&limit=2"
+        req = Request(url, headers={"User-Agent": "kaizen-trader/1.0"})
+        with urlopen(req, timeout=2) as resp:
+            data = _json.loads(resp.read().decode())
+        if data and len(data) >= 2:
+            prev_close = float(data[-2][4])
+            curr_close = float(data[-1][4])
+            if prev_close > 0:
+                return sym, ((curr_close - prev_close) / prev_close) * 100
+    except Exception:
+        pass
+    return sym, None
+
+
+def _fetch_1h_kline_changes(symbols: list[str]) -> dict[str, float]:
+    """Fetch 1h price change % for a list of symbols from Binance klines API.
+
+    Returns {symbol: pct_change} e.g. {"SOL": 3.5, "DOGE": -1.2}.
+    Free, no auth required. Uses thread pool with 10s total timeout.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    changes: dict[str, float] = {}
+    try:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(_fetch_single_kline, sym): sym for sym in symbols}
+            for future in as_completed(futures, timeout=10):
+                try:
+                    sym, change = future.result(timeout=2)
+                    if change is not None:
+                        changes[sym] = change
+                except Exception:
+                    continue
+    except Exception:
+        # Timeout or other error — return whatever data we have
+        pass
+    return changes
+
 
 # Top symbols to scan for correlation breaks (from backtest)
 _CORR_SYMBOLS = [
@@ -60,7 +152,16 @@ class TradingEngine:
 
         # Components
         self.detector = SignalDetector()
-        self.brain = ClaudeBrain(balance=balance)
+
+        # Use ClaudeBrain if API key available, otherwise fall back to RuleBrain
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            self.brain = ClaudeBrain(balance=balance)
+            log("info", "Brain: ClaudeBrain (Anthropic API)")
+        else:
+            from src.engine.rule_brain import RuleBrain
+            self.brain = RuleBrain(balance=balance)
+            log("info", "Brain: RuleBrain (no ANTHROPIC_API_KEY — zero API cost)")
+
         self.executor = Executor(paper=paper, initial_balance=balance)
         self.streams = DataStreams(on_signal=self._on_raw_signal)
         self.corr_scanner = CorrelationScanner()
@@ -91,6 +192,7 @@ class TradingEngine:
                 "size_usd": p.size_usd, "entry": p.entry_price,
                 "current_price": p.current_price,
                 "pnl_pct": p.unrealized_pnl_pct * 100,
+                "opened_at": p.opened_at,
             }
             for p in self.executor.positions
         ]
@@ -129,6 +231,27 @@ class TradingEngine:
         except Exception as e:
             log("warn", f"News fetch failed: {e}")
             self.brain.latest_news = []
+
+        # Fetch 1h kline data for top movers — critical for RuleBrain acceleration scoring
+        try:
+            gainers, losers = fetch_binance_top_movers(limit=20)
+            movers = gainers + losers
+            symbols_to_check = [m["symbol"] for m in movers][:20]
+            hourly_changes = _fetch_1h_kline_changes(symbols_to_check)
+
+            # Inject 1h acceleration into pending signals so RuleBrain can score them
+            for sig in self.brain.pending_signals:
+                sym = sig.symbol
+                if sym in hourly_changes and (sig.data is not None):
+                    sig.data["acceleration_1h"] = hourly_changes[sym]
+                elif sym in hourly_changes:
+                    sig.data = {"acceleration_1h": hourly_changes[sym]}
+
+            if hourly_changes:
+                top_accel = max(hourly_changes.items(), key=lambda x: abs(x[1]))
+                log("info", f"📊 1h klines: {len(hourly_changes)} symbols, top={top_accel[0]} {top_accel[1]:+.1f}%")
+        except Exception as e:
+            log("warn", f"1h kline fetch failed: {e}")
 
     def _brain_tick_loop(self):
         """Main brain loop — runs every tick_interval seconds."""
@@ -184,7 +307,9 @@ class TradingEngine:
                                 break
 
             except Exception as e:
-                log("error", f"Brain tick error: {e}")
+                log("error", f"Brain tick error: {e} — restarting in 10s")
+                self._stop.wait(timeout=10)
+                continue
 
             self._stop.wait(timeout=self.tick_interval)
 
@@ -276,7 +401,7 @@ class TradingEngine:
         for t in threads:
             t.start()
 
-        log("info", "Engine running. Claude brain active.")
+        log("info", "Engine running. Brain active.")
 
     def stop(self):
         """Gracefully stop the engine."""
@@ -308,17 +433,42 @@ def main():
     parser.add_argument("--live", action="store_true", help="Enable live Binance execution")
     parser.add_argument("--balance", type=float, default=10_000, help="Starting balance")
     parser.add_argument("--tick", type=int, default=60, help="Brain tick interval in seconds")
+    parser.add_argument("--auto-balance", action="store_true", help="Fetch balance from Binance account instead of using --balance")
+    parser.add_argument("--confirm", action="store_true", help="Skip live-mode countdown (same as KAIZEN_LIVE_CONFIRMED=true)")
     args = parser.parse_args()
 
+    if args.auto_balance:
+        fetched = _fetch_binance_account_balance()
+        if fetched is not None:
+            args.balance = fetched
+            print(f"  Binance account balance: ${args.balance:,.2f}")
+        else:
+            print("  WARNING: Could not fetch Binance balance, using default ${:.2f}".format(args.balance))
+
     if args.live:
-        print("\n  *** LIVE TRADING MODE — real money at risk! ***\n")
-        confirm = input("  Type 'CONFIRM' to proceed: ")
-        if confirm != "CONFIRM":
-            print("  Aborted.")
-            return
+        confirmed = args.confirm or os.environ.get("KAIZEN_LIVE_CONFIRMED", "").lower() in ("true", "1")
+        if confirmed:
+            print("\n  *** LIVE TRADING MODE — confirmed via env/flag, starting immediately ***\n")
+        else:
+            print("\n  *** LIVE TRADING MODE — real money at risk! ***")
+            for i in range(3, 0, -1):
+                print(f"  Starting in {i}s...", flush=True)
+                time.sleep(1)
+            print()
+
+    # Initialize database (Convex) if URL is configured
+    from src.config import env
+    if env.convex_url:
+        from src.storage import database
+        database.init(env.convex_url)
 
     engine = TradingEngine(paper=not args.live, balance=args.balance, tick_interval=args.tick)
-    engine.run_forever()
+    try:
+        engine.run_forever()
+    finally:
+        if env.convex_url:
+            from src.storage import database
+            database.close()
 
 
 if __name__ == "__main__":

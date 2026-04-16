@@ -24,7 +24,8 @@ _SKIP_SYMBOLS = {"BTC", "ETH", "DOGE", "LTC"}
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[list["TokenUnlock"], float]] = {}
-_breaker = CircuitBreaker("token_unlocks", failure_threshold=3, reset_timeout_s=600)
+_breaker = CircuitBreaker("token_unlocks", failure_threshold=3, reset_timeout_s=21_600)  # 6h — API is dead, retry infrequently
+_api_warned = False
 
 
 @dataclass
@@ -50,6 +51,10 @@ def fetch_token_unlocks(symbol: str) -> list[TokenUnlock]:
             return cached[0]
 
     if not _breaker.can_call():
+        global _api_warned
+        if not _api_warned:
+            log("warn", "Token unlock API (Tokenomist) unavailable — unlock risk filter disabled")
+            _api_warned = True
         with _lock:
             return _cache.get(symbol, ([], 0))[0]
 
@@ -59,6 +64,12 @@ def fetch_token_unlocks(symbol: str) -> list[TokenUnlock]:
             timeout=10,
             headers={"Accept": "application/json"},
         )
+        # Tokenomist returns HTML 404 when API is dead — detect and fail fast
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" in content_type or resp.status_code == 404:
+            _breaker.record_failure()
+            with _lock:
+                return _cache.get(symbol, ([], 0))[0]
         resp.raise_for_status()
         data = resp.json()
         _breaker.record_success()
