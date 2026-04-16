@@ -12,6 +12,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -85,7 +86,7 @@ class ClosedTrade:
     exit_commission: float = 0
 
 
-_PORTFOLIO_FILE = Path("/tmp/kaizen_portfolio.json")
+_PORTFOLIO_FILE = Path(__file__).parent.parent.parent / "data" / "portfolio.json"
 
 
 class Executor:
@@ -99,8 +100,8 @@ class Executor:
     """
 
     MAX_POSITIONS = 10
-    MAX_POSITION_SIZE = 500
-    MAX_DAILY_LOSS = 1000
+    MAX_POSITION_SIZE = env.max_position_usd
+    MAX_DAILY_LOSS = env.max_daily_loss_usd
     COMMISSION_PCT = 0.00075    # Binance with BNB discount
     TRAIL_ACTIVATION = 1.5      # Start trailing after 1.5x stop distance profit
 
@@ -112,11 +113,22 @@ class Executor:
         self.daily_pnl: float = 0
         self.total_commissions: float = 0
         self._daily_reset_ts: float = time.time()
-        self._binance = None
+        self._binance = None  # generic exchange provider (binance or okx)
+        self._started_at: str = datetime.now(timezone.utc).isoformat()
+
+        # Ensure data directory exists
+        _PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
 
         if not paper:
-            from src.execution.providers import BinanceProvider
-            self._binance = BinanceProvider()
+            from src.config import env
+            if env.exchange == "okx":
+                from src.execution.providers import OKXProvider
+                self._binance = OKXProvider()
+                log("info", "Exchange: OKX")
+            else:
+                from src.execution.providers import BinanceProvider
+                self._binance = BinanceProvider()
+                log("info", "Exchange: Binance")
 
         # Load saved state
         self._load_state()
@@ -181,7 +193,7 @@ class Executor:
             ],
             "total_pnl": sum(t.pnl_usd for t in self.closed_trades),
             "total_commissions": self.total_commissions,
-            "started_at": "2026-04-13T22:10:00Z",
+            "started_at": self._started_at,
         }
         with open(_PORTFOLIO_FILE, "w") as f:
             json.dump(state, f, indent=2)
@@ -198,7 +210,7 @@ class Executor:
             return False
         if self.daily_pnl <= -self.MAX_DAILY_LOSS:
             return False
-        if self.balance < 50:
+        if self.balance < 5:  # Allow trading on small accounts
             return False
         return True
 
@@ -268,8 +280,14 @@ class Executor:
     def _place_server_side_stops(self, symbol: str, side: str, quantity: float,
                                    entry: float, stop_pct: float, target_pct: float):
         """Place stop loss and take profit orders on Binance server.
-        These execute even if our process crashes."""
+        These execute even if our process crashes.
+        OKX uses a different OCO mechanism — skipped for now."""
         if not self._binance or self.paper:
+            return
+
+        # Only Binance supports this code path; OKX uses a different OCO mechanism
+        if not hasattr(self._binance, '_get_binance_symbol'):
+            log("warn", f"Server-side stops not implemented for {self._binance.name} — skipping for {symbol}")
             return
 
         import hmac
@@ -359,6 +377,10 @@ class Executor:
                 self._close_position(pos, price, "target")
             elif pos.side == "short" and price <= pos.target_price:
                 self._close_position(pos, price, "target")
+
+            # Chop exit — dead trade going nowhere after 60 min
+            elif pos.hold_hours > 1.0 and abs(pos.unrealized_pnl_pct) < 0.02:
+                self._close_position(pos, price, "chop_exit")
 
             # Max hold time (48h)
             elif pos.hold_hours > 48:

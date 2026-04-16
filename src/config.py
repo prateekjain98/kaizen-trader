@@ -37,6 +37,11 @@ class _Env:
     coinbase_api_secret = _optional("COINBASE_API_SECRET")
     binance_api_key = _optional("BINANCE_API_KEY")
     binance_api_secret = _optional("BINANCE_API_SECRET")
+    okx_api_key = _optional("OKX_API_KEY")
+    okx_api_secret = _optional("OKX_API_SECRET")
+    okx_passphrase = _optional("OKX_PASSPHRASE")
+
+    exchange = os.environ.get("EXCHANGE", "binance").lower()  # "binance" or "okx"
 
     convex_url = _optional("CONVEX_URL")  # required for prod — primary database
     anthropic_api_key = _optional("ANTHROPIC_API_KEY")
