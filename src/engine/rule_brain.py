@@ -178,18 +178,25 @@ def _score_signal(
     # Penalties
     # ------------------------------------------------------------------
 
-    # Late-stage pump penalty
-    if price_change_24h > 200:
-        score -= 40
-        factors.append(f"24h pump {price_change_24h:+.0f}% (very late) -40")
-    elif price_change_24h > 100:
-        # Only allow if fresh acceleration AND pump hasn't lasted too long
-        if accel_1h > 5 and pump_hours < PUMP_DURATION_LIMIT_HOURS:
-            score -= 20
-            factors.append(f"24h pump {price_change_24h:+.0f}% (late but accelerating) -20")
+    # Late-stage pump penalty — override if mega acceleration
+    if accel_1h > 10:
+        # Mega acceleration overrides late-pump penalties entirely
+        # If pumping +10% THIS hour, the move is live regardless of 24h
+        factors.append(f"mega accel {accel_1h:+.1f}% overrides late-pump penalty")
+    elif price_change_24h > 200:
+        if accel_1h > 5:
+            score -= 15
+            factors.append(f"24h pump {price_change_24h:+.0f}% (very late but accelerating) -15")
         else:
             score -= 40
-            factors.append(f"24h pump {price_change_24h:+.0f}% (stale, no accel) -40")
+            factors.append(f"24h pump {price_change_24h:+.0f}% (very late, no accel) -40")
+    elif price_change_24h > 100:
+        if accel_1h > 5 and pump_hours < PUMP_DURATION_LIMIT_HOURS:
+            score -= 10
+            factors.append(f"24h pump {price_change_24h:+.0f}% (late but accelerating) -10")
+        else:
+            score -= 30
+            factors.append(f"24h pump {price_change_24h:+.0f}% (stale, no accel) -30")
 
     # Revenge trading penalty — recently closed at a loss
     recent = recently_closed.get(symbol)
