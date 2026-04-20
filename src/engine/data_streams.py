@@ -560,9 +560,11 @@ class DataStreams:
                 ))
 
     def _poll_reddit(self):
+        # Reddit is for market context, not direct signals.
+        # Fetch is kept so the brain can reference sentiment in its tick prompt.
         posts = fetch_reddit_crypto_sentiment()
-        # Reddit is for market context, not direct signals — stored for brain tick
-        pass
+        with self._lock:
+            self.snapshot.reddit_posts = posts
 
     def _poll_global_market(self):
         data = fetch_coingecko_global()
@@ -570,17 +572,8 @@ class DataStreams:
             return
         now = time.time() * 1000
 
-        # Signal on large market-wide moves
-        change = data.get("market_cap_change_24h", 0)
-        if abs(change) > 5:
-            self.on_signal(TokenSignal(
-                source="coingecko_global",
-                symbol="MARKET",
-                event_type="market_move",
-                data=data,
-                timestamp=now,
-                priority=2,
-            ))
+        # Large market-wide moves — stored in snapshot for brain context only.
+        # No signal emitted because SignalDetector has no handler for "market_move".
 
     def _poll_top_movers(self):
         """Detect tokens with massive 24h moves — catches pumps like ALPACA +391%."""
@@ -608,16 +601,8 @@ class DataStreams:
             vol = l.get("volume_24h", 0)
             sym = l.get("symbol", "")
 
-            # Major dump: >30% with volume = potential bounce or avoid
-            if change < -30 and vol > 10_000_000:
-                self.on_signal(TokenSignal(
-                    source="binance_movers",
-                    symbol=sym,
-                    event_type="major_dump",
-                    data=l,
-                    timestamp=now,
-                    priority=1,
-                ))
+            # Major dumps are stored in snapshot for context only.
+            # No signal emitted because SignalDetector has no handler for "major_dump".
 
     def _poll_news(self):
         """Fetch crypto news from CoinTelegraph RSS."""

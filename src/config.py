@@ -46,7 +46,6 @@ class _Env:
     convex_url = _optional("CONVEX_URL")  # required for prod — primary database
     anthropic_api_key = _optional("ANTHROPIC_API_KEY")
     lunarcrush_api_key = _optional("LUNARCRUSH_API_KEY")  # required — core social signal source
-    cryptopanic_token = _optional("CRYPTOPANIC_TOKEN")
     whale_alert_api_key = _optional("WHALE_ALERT_API_KEY")
 
     portfolio_usd = _num("PORTFOLIO_USD", 100)

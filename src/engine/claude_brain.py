@@ -122,8 +122,6 @@ class ClaudeBrain:
         self.pending_signals: list[SignalPacket] = []
         self.calls_today: dict[str, int] = {"haiku": 0, "sonnet": 0}
         self._last_reset = time.time()
-        self._lessons: list[str] = []  # accumulated lessons from trade reviews
-
         # Market state (updated by runner)
         self.fgi: int = 50
         self.fgi_class: str = "Neutral"
@@ -278,9 +276,6 @@ class ClaudeBrain:
             data = json.loads(text)
             lesson = data.get("lesson", "")
             if lesson:
-                self._lessons.append(lesson)
-                # Keep last 50 lessons
-                self._lessons = self._lessons[-50:]
                 log("info", f"Trade lesson: {lesson}")
             return TradeReview(
                 trade_id=trade_data.get("trade_id", ""),

@@ -110,13 +110,3 @@ class TWAPExecutor:
             except Exception:
                 logger.exception("TWAP slice %d/%d failed for %s", i + 2, len(slices) + 1, symbol)
 
-    def execute_sell(
-        self,
-        symbol: str,
-        product_id: str,
-        quantity: float,
-        position_id: str,
-        market_price: float,
-    ) -> Trade:
-        """Execute a sell order (sells are not sliced - exits should be fast)."""
-        return self._provider.sell(symbol, product_id, quantity, position_id, market_price)

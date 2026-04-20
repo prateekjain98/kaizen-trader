@@ -21,39 +21,133 @@
 
 ## What it is
 
-Most trading systems are static: they run the same rules until you manually tune them. kaizen-trader takes a different approach — it continuously analyzes its own trade history, patches its parameters, tracks whether those changes helped or hurt, and creates GitHub issues when it identifies missing data or blind spots.
+A self-improving crypto trading system. Every 60 seconds it ingests 11 free data streams, scores opportunities with a rule-based brain (or optionally Claude Haiku), executes on Binance Futures or OKX, and adapts its own parameters after every loss.
 
-The full audit trail — every trade, every diagnosis, every config snapshot, every parameter delta — is stored in Convex, providing real-time subscriptions for the dashboard and queryable history for self-healing analysis.
+**Live results:** $37.36 → $44.17 (+18.2%) with 1x leverage. Best strategy: funding squeeze (ENJ +26%, MBOX +25%).
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────┐      ┌──────────────────────────┐      ┌──────────────────────────┐
-│  Railway: Python Bot        │      │  Convex: Real-time DB    │      │  Vercel: Dashboard       │
-│  ($20/mo)                   │─────>│  (Free tier)             │<─────│  prateekjain.io/         │
-│                             │      │                          │      │    kaizen-trader         │
-│  - Full trading pipeline    │      │  - positions, trades     │      │                          │
-│  - WebSocket feeds          │      │  - logs, diagnoses       │      │  - Live portfolio        │
-│  - Self-healing + deltas    │      │  - parameter_deltas      │      │  - Real-time positions   │
-│  - Claude analysis          │      │  - config_history        │      │  - AI chat               │
-│  - Strategy evaluation      │      │  - 15-min metric cron    │      │                          │
-│  - Auto GitHub issues       │      │                          │      │                          │
-│  - Health check (:8080)     │      │                          │      │                          │
-└─────────────────────────────┘      └──────────────────────────┘      └──────────────────────────┘
+                          ┌──────────────────────┐
+                          │   Convex (DB)        │
+                          │   positions, trades  │
+                          │   logs, diagnoses    │
+                          └──────┬───────────────┘
+                                 │
+┌────────────────────────────────┼────────────────────────────────┐
+│  Trading Engine (python -m src.engine.runner)                   │
+│                                │                                │
+│  ┌─────────────┐    ┌─────────┴──────┐    ┌─────────────────┐  │
+│  │ DataStreams  │───>│ SignalDetector  │───>│  Brain          │  │
+│  │ 11 free APIs│    │ filter + rank   │    │  RuleBrain ($0) │  │
+│  └─────────────┘    └────────────────┘    │  or ClaudeBrain │  │
+│                                           │  (~$0.50/day)   │  │
+│  ┌──────────────────┐                     └────────┬────────┘  │
+│  │ CorrelationScanner│                              │           │
+│  │ hourly, 197% CAGR │─────────────────────────────>│           │
+│  └──────────────────┘                              │           │
+│                                           ┌────────┴────────┐  │
+│                                           │    Executor     │  │
+│                                           │ Binance / OKX   │  │
+│                                           │ paper or live   │  │
+│                                           └─────────────────┘  │
+│                                                                 │
+│  ┌────────────────────┐    ┌────────────────────────────────┐  │
+│  │ Self-Healing       │    │ watchdog.py                    │  │
+│  │ loss → diagnose →  │    │ stop-loss safety net between   │  │
+│  │ patch parameters   │    │ sessions                       │  │
+│  └────────────────────┘    └────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-The bot runs as a single Python process with three continuous stages:
+---
 
-**1 — Signal ingestion:**
-Coinbase WebSocket streams price ticks and L2 order book updates. Ten external APIs (CryptoPanic, LunarCrush, Whale Alert, Binance Futures, DeFiLlama, Alternative.me, Token Unlocks, Options, Stablecoin Flows, Derivatives) poll on independent schedules and update an in-memory `MarketContext`. Each signal fetcher has a circuit breaker (3 failures -> 5-min cooldown).
+## Quick start
 
-**2 — Trade engine:**
-On every tick (throttled to 2s/symbol), 14 strategy scanners run against the current price and context. Strategies are auto-discovered from `src/strategies/` via the registry. Signals pass the qualification scorer (multi-signal aggregation), are sized via quarter-Kelly, and routed to the executor (paper by default, Coinbase Advanced REST in live mode). A declarative protection chain blocks new positions when daily loss limits, max positions, or cooldowns are hit.
+```bash
+# 1. Clone and install
+git clone https://github.com/your-org/kaizen-trader.git
+cd kaizen-trader
+pip install -r requirements.txt
 
-**3 — Self-healing:**
-Four feedback loops run in parallel — immediate rule-based patching after every loss, periodic Claude deep analysis, delta evaluation to auto-revert bad changes, and Darwinian strategy selection. Details below.
+# 2. Copy env template and fill in your keys
+cp .env.example .env
 
-See [`docs/architecture.md`](docs/architecture.md) for Mermaid diagrams, data flows, and design rationale.
+# 3. Paper trading (no API keys needed)
+python -m src.engine.runner --tick 60
+
+# 4. Live trading on Binance
+python -m src.engine.runner --live --auto-balance --tick 60
+
+# 5. Live trading on OKX
+EXCHANGE=okx python -m src.engine.runner --live --auto-balance --tick 60
+
+# 6. Watchdog (safety net between sessions)
+python watchdog.py
+```
+
+---
+
+## Data streams
+
+All 11 streams are free and require no authentication:
+
+| # | Source | Data | Refresh |
+|---|--------|------|---------|
+| 1 | Binance WebSocket | Price, volume, order book, funding | Real-time |
+| 2 | CoinGecko trending | Hottest tokens | 10 min |
+| 3 | DexScreener | DEX volume spikes, new pairs | 5 min |
+| 4 | Alternative.me | Fear & Greed Index | 1 hour |
+| 5 | Binance funding | Extreme funding rates | 1 min |
+| 6 | Binance listings | New token announcements | 1 min |
+| 7 | Coinbase listings | New Coinbase products | 1 min |
+| 8 | LunarCrush | Social sentiment, galaxy scores | Periodic |
+| 9 | Reddit | Crypto subreddit sentiment | Periodic |
+| 10 | Global market | BTC dominance, total cap | Periodic |
+| 11 | Top movers | Binance 24h gainers/losers | Periodic |
+
+---
+
+## Brains
+
+| Brain | Activation | Cost | How it works |
+|---|---|---|---|
+| **RuleBrain** | Default (no `ANTHROPIC_API_KEY`) | $0 | 12-factor scoring: 1h acceleration, funding squeeze detection, late-pump penalty, chop exit, strategy-specific stops/targets |
+| **ClaudeBrain** | Set `ANTHROPIC_API_KEY` | ~$0.50/day | Haiku sees all positions, signals, and market regime every tick; returns structured BUY/CLOSE/hold decisions |
+
+---
+
+## Key strategies
+
+| Strategy | Description | Live results |
+|---|---|---|
+| Correlation break | Hourly BTC-alt regression divergence | 197% CAGR (backtested) |
+| Funding squeeze | Extreme perp funding + acceleration | ENJ +26%, MBOX +25% |
+| Momentum breakout | 1h acceleration as primary signal | Fresh breakouts only |
+| Listing pump | New exchange listings within 30 min | Event-driven |
+
+Protective mechanisms:
+- **Chop exit** -- cuts trades after 1h with <2% movement
+- **Late-pump penalty** -- skips tokens already up +100% in 24h
+- **1x leverage** always enforced
+- **Server-side stops** on Binance
+
+---
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `PAPER_TRADING` | No | `true` | Set to `false` for live execution |
+| `EXCHANGE` | No | `binance` | `binance` or `okx` |
+| `BINANCE_API_KEY` | For live Binance | -- | Binance Futures API key |
+| `BINANCE_API_SECRET` | For live Binance | -- | Binance Futures API secret |
+| `OKX_API_KEY` | For live OKX | -- | OKX API key |
+| `OKX_API_SECRET` | For live OKX | -- | OKX API secret |
+| `ANTHROPIC_API_KEY` | No | -- | Enables ClaudeBrain (~$0.50/day). Without it, RuleBrain is used at $0 cost |
+| `CONVEX_URL` | For prod | -- | Convex deployment URL for persistent storage |
 
 ---
 
@@ -61,152 +155,10 @@ See [`docs/architecture.md`](docs/architecture.md) for Mermaid diagrams, data fl
 
 | Loop | Frequency | What it does |
 |---|---|---|
-| **L1 — Rule-based healer** | After every loss | Classifies why the trade lost (pump top, tight stop, low qual score, etc.) and patches the responsible parameter |
-| **L2 — Claude analysis** | Every 60 min | Reads 300 trades + 50 diagnoses, computes Sharpe/Sortino/Calmar, reasons through patterns the rule-based healer can't detect, returns structured JSON patches with chain-of-thought |
-| **L3 — Delta evaluator** | Every 2 hours | Every parameter change (from L1 or L2) is recorded with a before/after trade snapshot. After 10+ trades, the evaluator auto-reverts changes that worsened performance |
-| **L4 — Darwinian selector** | Every 1 hour | Evaluates strategies on a rolling window. Disables underperformers, re-trials previously disabled ones, auto-creates GitHub issues for strategies disabled >14 days |
-
----
-
-## Strategies
-
-### Momentum
-| Strategy | Entry condition | Tier |
-|---|---|---|
-| `momentum_swing` | Price +2% in 1h with 2x volume spike above rolling baseline | Swing |
-| `momentum_scalp` | Price +2.5% in 5m, freshness-gated: 40%+ of the move must be in the last 2m | Scalp |
-
-### Mean reversion
-| Strategy | Entry condition | Tier |
-|---|---|---|
-| `mean_reversion` | Price >3% from VWAP + RSI <30 (long) or >3% above VWAP + RSI >70 (short) | Swing |
-| `funding_extreme` | Perp funding >0.1%/8h (over-leveraged longs) or <-0.05% (short squeeze setup) | Swing |
-| `correlation_break` | Alt deviates >3% from its rolling BTC regression baseline | Swing |
-| `fear_greed_contrarian` | Fear & Greed <=15 (buy panic) or >=85 (sell euphoria) — BTC/ETH only | Swing |
-
-### Event-driven
-| Strategy | Entry condition | Tier |
-|---|---|---|
-| `listing_pump` | New listing on Coinbase / Binance / Kraken / Bybit within 30m of announcement | Swing |
-| `whale_accumulation` | Net whale outflow from exchanges >$5M in 2h (accumulation) or >$10M inflow (distribution) | Swing |
-| `liquidation_cascade` | >$2M longs liquidated in 10m + OI falling — cascade short; exhaustion dip buy | Scalp/Swing |
-
-### Structural
-| Strategy | Entry condition | Tier |
-|---|---|---|
-| `orderbook_imbalance` | Bid/ask depth ratio >3x within 1% of price — scalp the wall | Scalp |
-| `narrative_momentum` | Social velocity for a sector spikes 3x — buy the sector laggard | Swing |
-| `protocol_revenue` | DeFiLlama: protocol fees 2x above 7d avg, token hasn't moved yet | Swing |
-
-### Cross-exchange
-| Strategy | Entry condition | Tier |
-|---|---|---|
-| `cross_exchange_divergence` | Price divergence >1% between Coinbase and Binance spot — trade the lagging exchange | Swing |
-
----
-
-## Signal sources
-
-| Source | What it provides | Used by |
-|---|---|---|
-| **Coinbase Advanced** | Real-time ticks + L2 order book via WebSocket | All price-action strategies |
-| **LunarCrush** | Galaxy score, social velocity, sentiment breakdown, AltRank, topic analysis | `narrative_momentum`, qualification scorer |
-| **CryptoPanic** | News headlines with community votes, token-filtered | Qualification scorer, news gate |
-| **Whale Alert** | On-chain transfers >$3M, classified by wallet type | `whale_accumulation` |
-| **Binance Futures** | Funding rates, open interest, real-time liquidation stream | `funding_extreme`, `liquidation_cascade` |
-| **DeFiLlama** | Daily fees for 2000+ protocols | `protocol_revenue` |
-| **Alternative.me** | Fear & Greed Index (updated daily, free, no auth) | `fear_greed_contrarian`, qualification scorer |
-| **Token Unlocks** | Token unlock schedule data | `listing_pump`, risk filter |
-| **Options Sentiment** | Options market put/call ratio, max pain | Qualification scorer |
-| **Stablecoin Flows** | USDT/USDC mint/burn and exchange flows | Qualification scorer |
-| **Derivatives Data** | OI changes, leverage profiles, liquidation levels | `liquidation_cascade`, qualification scorer |
-
-All signal fetchers use per-endpoint circuit breakers (3 failures -> 5-min reset) and return stale cache warnings after 2x TTL.
-
----
-
-## Qualification scoring
-
-Before any trade executes, a multi-signal scorer aggregates the strategy's base score with four independent signal sources:
-
-```
-final_score = base_strategy_score
-            + news_adjustment      (-15 to +15, from CryptoPanic sentiment)
-            + social_adjustment    (-12 to +12, from LunarCrush galaxy score + velocity + AltRank)
-            + context_adjustment   (-10 to +10, from market phase + BTC dominance)
-            + fear_greed_alignment (-8  to +8,  directional agreement with trade side)
-```
-
-Minimum qualifying scores: swing = 55, scalp = 45.
-
----
-
-## Position sizing
-
-Quarter-Kelly sizing reduces variance vs. full Kelly while preserving long-term growth:
-
-```
-rawKelly    = (b*p - q) / b           where b = avg_win/avg_loss, p = win_rate, q = 1-p
-kellySize   = rawKelly * 0.25
-usdSize     = kellySize * portfolioUsd * qual_score_multiplier
-finalSize   = clamp(usdSize, $10, MAX_POSITION_USD)
-```
-
-Until a strategy accumulates >=10 closed trades, it falls back to conservative 1% fixed-fractional sizing.
-
-Graduated drawdown scaling: 5% drawdown -> 75% size, 10% -> 50%, 15% -> 25%, 20%+ -> 10%.
-
----
-
-## Risk protections
-
-The protection chain is declarative — protections are composable rules evaluated in order:
-
-| Protection | Default | Description |
-|---|---|---|
-| `daily_loss_limit` | -$300 | Blocks new positions when daily realized P&L exceeds limit |
-| `max_open_positions` | 5 | Limits concurrent open positions |
-| `cooldown_after_loss` | 60s | Pause after a losing trade |
-
-Each protection implements `check(ctx) -> Verdict`. The chain short-circuits on first block.
-
----
-
-## Technical indicators
-
-Built-in indicators computed from raw tick data (no external dependencies):
-
-| Indicator | Module |
-|---|---|
-| ATR, EMA, Bollinger Bands, MACD, ADX, OBV, RSI | `src/indicators/core.py` |
-| Cumulative Volume Delta (CVD) | `src/indicators/cvd.py` |
-| Market regime classification (trend/range/volatile) | `src/indicators/regime.py` |
-
----
-
-## Thread architecture
-
-The bot runs as a single process with multiple daemon threads:
-
-```
-Main thread
-├── CoinbaseWebSocket thread       (price ticks + L2 book)
-├── Exit checker thread            (every 5s — trailing stops, max hold)
-├── Market context refresh thread  (every 2min — fear/greed)
-├── Signal refresh thread          (every 2.5min — news, social, funding, whale, protocol)
-├── Self-healing analysis thread   (every 60min — Claude)
-├── Strategy evaluation thread     (every 1h — Darwinian selector + delta evaluator)
-├── Health check HTTP server       (port 8080)
-└── Thread health monitor          (every 30s — detect and restart dead threads)
-```
-
-Coordination: `threading.Event` for shutdown, `Lock`/`RLock` on shared state, `queue.Queue` for Convex background flush.
-
----
-
-## Storage
-
-**Convex** — the sole database. Writes are async (queued, flushed every 1s via background thread). Reads are sync (blocking Convex queries). Tables: `positions`, `trades`, `logs`, `diagnoses`, `scanner_config_history`, `parameter_deltas`, `github_issues`, `trade_journal`, `metrics`. Real-time subscriptions for the dashboard via `useQuery`. 15-minute metric aggregation cron.
+| **L1 -- Rule-based healer** | After every loss | Classifies why the trade lost and patches the responsible parameter |
+| **L2 -- Claude analysis** | Every 60 min | Reads trades + diagnoses, computes metrics, returns structured JSON patches |
+| **L3 -- Delta evaluator** | Every 2 hours | Auto-reverts parameter changes that worsened performance after 10+ trades |
+| **L4 -- Darwinian selector** | Every 1 hour | Disables underperformers, re-trials previously disabled strategies |
 
 ---
 
@@ -214,132 +166,44 @@ Coordination: `threading.Event` for shutdown, `Lock`/`RLock` on shared state, `q
 
 ```
 src/
-├── types.py                         All shared types (dataclasses)
-├── config.py                        Parameter defaults, hard bounds, env vars
-├── main.py                          Trading pipeline + health check + thread monitor
+├── engine/                              Live trading engine (primary)
+│   ├── runner.py                        Entry point: DataStreams → Brain → Executor
+│   ├── rule_brain.py                    RuleBrain — $0, 12-factor scoring
+│   ├── claude_brain.py                  ClaudeBrain — LLM-powered decisions
+│   ├── data_streams.py                  11 free data stream ingestion
+│   ├── signal_detector.py               Signal filtering and ranking
+│   ├── correlation_scanner.py           Hourly correlation break scanner
+│   ├── executor.py                      Order execution (Binance/OKX/paper)
+│   ├── binance_ws.py                    Binance WebSocket client
+│   └── log.py                           Structured logging
 │
-├── strategies/                      One file per strategy (14 total)
-│   ├── registry.py                  Auto-discovery — scan for scan_*/on_* functions
-│   ├── momentum.py                  Rolling price/volume, freshness gate
-│   ├── mean_reversion.py            VWAP + RSI(14)
-│   ├── funding_extreme.py           OI change tracking, annualized rate
-│   ├── liquidation_cascade.py       Cascade rider + exhaustion dip buyer
-│   ├── orderbook_imbalance.py       L2 book, bid/ask depth ratio
-│   ├── whale_tracker.py             2h net flow window
-│   ├── fear_greed_contrarian.py     Fear & Greed extremes
-│   ├── cross_exchange_divergence.py Cross-exchange price divergence
-│   └── ...                          correlation_break, listing_pump, narrative_momentum, etc.
+├── main.py                              Legacy self-healing loop (kept for reference)
+├── types.py                             All shared types (dataclasses)
+├── config.py                            Parameter defaults, bounds, env vars
 │
-├── signals/                         External API integrations (all with circuit breakers)
-│   ├── _circuit_breaker.py          3-failure breaker with 5-min reset
-│   ├── news.py                      CryptoPanic
-│   ├── social.py                    LunarCrush
-│   ├── whale.py                     Whale Alert
-│   ├── funding.py                   Binance Futures
-│   ├── fear_greed.py                Alternative.me
-│   ├── protocol.py                  DeFiLlama
-│   ├── token_unlocks.py             Token unlock schedules
-│   ├── options.py                   Options sentiment (put/call, max pain)
-│   ├── stablecoin.py                USDT/USDC mint/burn and exchange flows
-│   └── derivatives.py               OI, leverage, liquidation levels
-│
-├── feeds/
-│   └── coinbase_ws.py               WebSocket with ping/pong, reconnect, thread-safe book
-│
-├── execution/
-│   ├── coinbase.py                  Rate-limited, retries with backoff, idempotent orders
-│   └── paper.py                     Slippage simulation, commission model
-│
-├── risk/
-│   ├── portfolio.py                 Daily P&L tracking, drawdown, RLock-protected
-│   ├── position_sizer.py            Quarter-Kelly with qual score multiplier
-│   └── protections.py               Declarative protection chain
-│
-├── qualification/
-│   └── scorer.py                    Multi-signal aggregation
-│
-├── evaluation/
-│   ├── metrics.py                   Sharpe, Sortino, Calmar, profit factor, expectancy
-│   └── strategy_selector.py         Darwinian enable/disable with probation + re-trial
+├── strategies/                          One file per strategy (14 total)
+│   ├── registry.py                      Auto-discovery via scan_*/on_* functions
+│   ├── momentum.py, mean_reversion.py, funding_extreme.py, ...
+│   └── correlation_break.py, listing_pump.py, narrative_momentum.py, ...
 │
 ├── self_healing/
-│   ├── healer.py                    Rule-based: loss -> classify -> patch -> record delta
-│   ├── log_analyzer.py              Claude: periodic deep analysis with chain-of-thought
-│   ├── delta_evaluator.py           Track parameter changes, auto-revert if worsened
-│   └── blind_spots.py               Fingerprint unknown losses, auto-create GitHub issues
+│   ├── healer.py                        Rule-based loss diagnosis + parameter patching
+│   ├── log_analyzer.py                  Claude-powered deep analysis
+│   ├── delta_evaluator.py               Auto-revert bad parameter changes
+│   └── blind_spots.py                   Unknown loss fingerprinting
 │
-├── indicators/
-│   ├── core.py                      ATR, EMA, Bollinger Bands, MACD, ADX, OBV, RSI
-│   ├── cvd.py                       Cumulative volume delta
-│   └── regime.py                    Market regime classification
-│
-├── backtesting/
-│   ├── data_loader.py               Binance klines with CSV caching
-│   └── engine.py                    Configurable backtest engine
-│
-├── automation/
-│   └── github_issues.py             Auto issue creation (blind spots, data gaps, underperformers)
-│
-├── storage/
-│   ├── database.py                  Storage facade — delegates to Convex
-│   └── convex_client.py             Convex SDK wrapper with background flush
-│
-└── utils/
-    ├── safe_math.py                 NaN/Inf guards for scoring and sizing
-    ├── binance_symbols.py           Binance symbol helpers
-    └── cache.py                     TTL cache
+├── signals/                             External API integrations (circuit breakers)
+├── execution/                           Exchange providers (Binance, OKX, paper)
+├── risk/                                Portfolio tracking, position sizing, protections
+├── indicators/                          ATR, EMA, Bollinger, MACD, RSI, CVD, regime
+├── evaluation/                          Sharpe/Sortino/Calmar, strategy selector
+├── storage/                             Convex database facade
+└── utils/                               Math guards, symbol helpers, cache
 
-scripts/
-├── analyze_logs.py                  Trigger Claude analysis manually
-├── performance.py                   Metrics report (--csv for export)
-└── backtest.py                      CLI backtesting tool
-
-convex/                              Convex serverless functions
-├── schema.ts                        9 tables
-├── mutations.ts                     9 write mutations
-├── queries.ts                       10 read queries for dashboard
-├── crons.ts                         15-minute metric aggregation
-└── aggregations.ts                  computeMetrics helper
-
-docs/
-├── architecture.md                  System design, Mermaid diagrams, design rationale
-└── setup.md                         Installation, configuration, deployment guide
+watchdog.py                              Stop-loss watchdog between sessions
+scripts/                                 analyze_logs.py, performance.py, backtest.py
+convex/                                  Serverless functions, schema, crons
 ```
-
----
-
-## Robustness
-
-- **Thread safety**: All mutable global state protected with `Lock`/`RLock`. Per-thread batch flags via `threading.local()`. Double-checked locking on strategy registry.
-- **Circuit breakers**: Per-endpoint breakers on all 10 signal fetchers (3 failures -> 5-min cooldown).
-- **Division guards**: Every division in all 14 strategies guarded against zero denominators.
-- **NaN/Inf guards**: `safe_score()`/`safe_ratio()` at scoring and sizing boundaries.
-- **Memory bounds**: All rolling buffers capped with expiry-based purging.
-- **Execution safety**: Rate limiting, exponential backoff retries, idempotent order IDs, partial fill handling.
-- **Graceful shutdown**: Signal handler drains threads, closes DB + backends, flushes pending writes.
-- **Thread monitoring**: Dead threads auto-restart with logging.
-
----
-
-## Getting started
-
-See [`docs/setup.md`](docs/setup.md) for installation, configuration, deployment, and adding custom strategies.
-
-## Why not multi-agent simulation (MiroFish)?
-
-We evaluated [MiroFish](https://github.com/666ghj/MiroFish), an open-source swarm intelligence engine that uses CAMEL-OASIS to simulate social agent interactions and generate prediction reports. After reading the actual source code and benchmarking the compute requirements, we concluded it is not a good fit for this system. Here's why:
-
-**Latency kills real-time trading.** MiroFish's minimum useful simulation (10 agents, 10 rounds) takes 1–5 minutes. A medium run (30 agents, 40 rounds) takes 5–20 minutes. The full default (100 agents, 72 rounds) takes 30–90 minutes. Our signal refresh cycle is 2 minutes and scalp strategies need sub-second signals. There is no way to make MiroFish a real-time signal source.
-
-**Cost doesn't scale on a small portfolio.** Each simulation makes ~1 LLM call per active agent per round. A 30-agent, 40-round simulation generates ~900 LLM calls. Running hourly across 20 symbols at $1–4/sim (qwen-plus) costs $480–1,920/day — 3–12% of a $6K portfolio annualized just on simulation inference. Even with gpt-4o-mini ($0.10–0.50/sim), it's $48–240/day.
-
-**LLM agent consensus is not independent signal.** N LLM agents share the same training data and biases. Their "consensus" is one opinion amplified N times, not N independent views. This is fundamentally different from real social media sentiment where thousands of humans with different information sets form opinions independently.
-
-**No proven prediction accuracy.** The OASIS research paper (arXiv:2411.11581) demonstrates qualitative social phenomena — echo chambers, opinion cascades, information polarization — not directional price prediction. Zero published evidence exists that LLM agent swarms produce actionable alpha for crypto markets. Traditional agent-based models for finance are useful for understanding market dynamics and tail risks, not for point-in-time price forecasts.
-
-**Simpler alternatives already exist in our stack.** Our Claude-powered log analyzer (`src/self_healing/log_analyzer.py`) already does deep pattern analysis every 60 minutes. LunarCrush provides real social sentiment from actual humans. A single Claude API call analyzing the same news articles MiroFish would ingest produces comparable analytical quality at 1/100th the cost and 1/60th the latency.
-
-**The one defensible use case** — batch pre-event scenario analysis (1–3 simulations/day before token unlocks or protocol upgrades) — costs $3–12/day but remains speculative. We may revisit if published benchmarks demonstrate measurable prediction accuracy for financial markets.
 
 ---
 
