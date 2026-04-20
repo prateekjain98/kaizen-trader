@@ -15,7 +15,6 @@ from typing import Callable, Optional
 
 from src.engine.log import log
 
-_BINANCE_WS_BASE = "wss://fstream.binance.com/ws"
 _BINANCE_STREAM_BASE = "wss://fstream.binance.com/stream"
 
 

@@ -40,25 +40,6 @@ class SignalPacket:
     suggested_stop_pct: float = 0
     suggested_target_pct: float = 0
 
-    def to_prompt_context(self) -> str:
-        """Compress this signal into a Claude-efficient prompt string."""
-        lines = [
-            f"SIGNAL: {self.signal_type} on {self.symbol}",
-            f"Source: {self.source}",
-            f"Price: ${self.price_usd:,.4f}" if self.price_usd < 1 else f"Price: ${self.price_usd:,.2f}",
-            f"24h Volume: ${self.volume_24h:,.0f}",
-            f"24h Change: {self.price_change_24h:+.1f}%",
-            f"Fear & Greed: {self.fear_greed_index}",
-        ]
-        if self.funding_rate:
-            lines.append(f"Funding Rate: {self.funding_rate*100:+.4f}%")
-        lines.append(f"Reasoning: {self.reasoning}")
-        if self.suggested_side:
-            lines.append(f"Suggested: {self.suggested_side.upper()} | Stop: {self.suggested_stop_pct*100:.0f}% | Target: {self.suggested_target_pct*100:.0f}%")
-        for k, v in self.data.items():
-            if k not in ("symbol", "funding_rate", "mark_price"):
-                lines.append(f"  {k}: {v}")
-        return "\n".join(lines)
 
 
 class SignalDetector:

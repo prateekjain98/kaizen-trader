@@ -270,7 +270,6 @@ class RuleBrain:
 
         # Internal state for learning from results
         self._recently_closed: dict[str, dict] = {}  # symbol -> last closed trade info
-        self._lessons: list[str] = []
         self._win_count: int = 0
         self._loss_count: int = 0
 
@@ -398,9 +397,6 @@ class RuleBrain:
             lesson = f"Strong win on {symbol} ({signal_type}): {pnl_pct:+.1f}% — this setup works"
         else:
             lesson = f"Trade on {symbol} ({signal_type}): {pnl_pct:+.1f}% in {duration_hours:.1f}h"
-
-        self._lessons.append(lesson)
-        self._lessons = self._lessons[-50:]
 
         log("info", f"[RuleBrain] Review: {lesson} | WR: {wr:.0f}% ({self._win_count}W/{self._loss_count}L)")
 
