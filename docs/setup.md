@@ -3,21 +3,8 @@
 ## Prerequisites
 
 - Python 3.11+
-- Convex account (free tier — database backend)
-- Coinbase Advanced Trade account (for price feed + execution)
-- Anthropic API key — optional (for self-healing analysis); the bot works without it (L2 healing is just disabled)
-
-## Installation
-
-```bash
-git clone https://github.com/prateekjain98/kaizen-trader
-cd kaizen-trader
-
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-
-pip install -r requirements.txt
-```
+- Binance Futures account (or OKX)
+- `pip install -r requirements.txt` (or `pip install dotenv requests anthropic websocket-client`)
 
 ## Configuration
 
@@ -25,62 +12,71 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` with your keys. Paper trading is enabled by default.
-
 ### Environment variables
 
 ```bash
-# ── Mode ──────────────────────────────────────────────────────────────────────
-PAPER_TRADING=true                # always start here
+# ── Required ─────────────────────────────────────────────────────────────────
+BINANCE_API_KEY=your_key
+BINANCE_API_SECRET=your_secret
+PAPER_TRADING=false
 
-# ── Required ──────────────────────────────────────────────────────────────────
-COINBASE_API_KEY=                 # price feed + execution
-COINBASE_API_SECRET=
+# ── Optional -- switches to OKX ──────────────────────────────────────────────
+EXCHANGE=okx
+OKX_API_KEY=
+OKX_API_SECRET=
+OKX_PASSPHRASE=
 
-# ── Recommended ───────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY=                # Claude log analysis (optional — bot degrades gracefully without it)
-LUNARCRUSH_API_KEY=               # social signals (Twitter/Reddit/YouTube/TikTok)
-CRYPTOPANIC_TOKEN=                # news sentiment
+# ── Optional -- enables Claude brain ($0.50/day) ─────────────────────────────
+ANTHROPIC_API_KEY=
 
-# ── Optional — enables additional strategies ──────────────────────────────────
-BINANCE_API_KEY=                  # funding_extreme, liquidation_cascade
-BINANCE_API_SECRET=
-WHALE_ALERT_API_KEY=              # whale_accumulation
+# ── Optional -- Convex database ──────────────────────────────────────────────
+CONVEX_URL=
 
-# ── Risk limits ───────────────────────────────────────────────────────────────
-PORTFOLIO_USD=6000                # total portfolio capital
-MAX_POSITION_USD=1200
-MAX_DAILY_LOSS_USD=300
-MAX_OPEN_POSITIONS=5
-
-# ── Self-healing schedule ─────────────────────────────────────────────────────
-LOG_ANALYSIS_INTERVAL_MINS=60
-MIN_TRADES_FOR_ANALYSIS=10
-
-# ── Required — Convex database ────────────────────────────────────────────────
-CONVEX_URL=                       # e.g., https://your-project.convex.cloud
-
-# ── Optional — auto GitHub issue creation ─────────────────────────────────────
-GITHUB_REPO=                      # e.g., prateekjain98/kaizen-trader
-
-# ── Health check ──────────────────────────────────────────────────────────────
-PORT=8080
+# ── Risk limits ──────────────────────────────────────────────────────────────
+MAX_POSITION_USD=20
+MAX_DAILY_LOSS_USD=5
+MAX_OPEN_POSITIONS=4
 ```
-
-Strategies degrade gracefully when their data source isn't configured — the system runs on whatever signals are available.
 
 ## Running
 
 ```bash
-python -m src.main
+# Live trading
+python -m src.engine.runner --live --auto-balance --tick 60
+
+# Paper trading
+python -m src.engine.runner --tick 60
+
+# Watchdog (stop-loss safety net)
+python watchdog.py
 ```
 
-The bot starts all threads (WebSocket feed, signal fetchers, exit checker, self-healing, strategy evaluation) and exposes a health endpoint at `http://localhost:8080/health`.
+## Deployment
 
-## Running tests
+### Railway (recommended)
+
+Set environment variables in the Railway dashboard.
+
+Procfile:
+```
+python -m src.engine.runner --live --auto-balance --tick 60 --confirm
+```
+
+### Docker
+
+Standard Python image, install requirements, same command as above.
+
+### Notes
+
+- The engine auto-restarts brain tick on crash via watchdog thread
+- Binance API keys can be IP-restricted. If your ISP rotates IPs, remove the IP restriction or use a VPS with a static IP
+- OKX does not have this issue
+
+## Legacy entry point
 
 ```bash
-python -m pytest tests/ -v
+# Self-healing loop (backtesting, parameter tuning)
+python -m src.main
 ```
 
 ## Scripts
@@ -93,98 +89,4 @@ python scripts/analyze_logs.py
 python scripts/performance.py
 python scripts/performance.py --last 50
 python scripts/performance.py --csv > trades.csv
-
-# Backtest a strategy
-python scripts/backtest.py --symbol BTC --start 2025-01-01 --end 2025-06-01
-python scripts/backtest.py --symbol ETH --start 2025-03-01 --end 2025-06-01 --commission 0.001
-```
-
-## Querying the database
-
-All data is stored in Convex. Use the Convex dashboard at your `CONVEX_URL` to browse tables directly, or use the bot's Python read APIs:
-
-```python
-from src.storage.database import (
-    get_open_positions, get_closed_trades, get_recent_logs,
-    get_recent_diagnoses, get_trade_journal,
-)
-
-# Recent closed trades
-closed = get_closed_trades(limit=100)
-
-# Self-healer diagnoses
-diagnoses = get_recent_diagnoses(limit=20)
-
-# Error/warning logs
-logs = get_recent_logs(limit=50, level="error")
-```
-
-## Deployment
-
-### Railway (recommended)
-
-```bash
-# Procfile already configured:
-# bot: python -m src.main
-
-# Push to Railway — auto-deploys from GitHub
-railway up
-```
-
-Set environment variables in the Railway dashboard. Health check at `/health` on port 8080.
-
-### Docker
-
-No Docker setup currently — the project deploys via Railway with Nixpacks.
-
-## Adding a strategy
-
-Every strategy is a function returning `Optional[TradeSignal]`:
-
-```python
-# src/strategies/my_strategy.py
-import uuid, time
-from typing import Optional
-from src.types import TradeSignal, ScannerConfig, MarketContext
-
-def scan_my_strategy(
-    symbol: str,
-    product_id: str,
-    current_price: float,
-    config: ScannerConfig,
-    ctx: MarketContext,
-) -> Optional[TradeSignal]:
-    if ctx.fear_greed_index > 30:
-        return None
-
-    return TradeSignal(
-        id=str(uuid.uuid4()),
-        symbol=symbol,
-        product_id=product_id,
-        strategy="my_strategy",
-        side="long",
-        tier="swing",
-        score=72,
-        confidence="medium",
-        sources=["fear_greed"],
-        reasoning=f"{symbol} in extreme fear - contrarian entry",
-        entry_price=current_price,
-        stop_price=current_price * 0.95,
-        suggested_size_usd=100,
-        expires_at=int(time.time() * 1000) + 3_600_000,
-        created_at=int(time.time() * 1000),
-    )
-```
-
-The strategy registry auto-discovers any `scan_*` or `on_*` function in `src/strategies/`. No manual registration needed — drop a file and restart.
-
-For richer metadata, define a `STRATEGY_META` dict in the module:
-
-```python
-STRATEGY_META = {
-    "strategies": [
-        {"id": "my_strategy", "function": "scan_my_strategy", "tier": "swing", "description": "..."}
-    ],
-    "signal_sources": ["fear_greed"],
-}
 ```
