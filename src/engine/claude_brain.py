@@ -46,6 +46,7 @@ class TradeDecision:
     reasoning: str
     signal_id: str
     timestamp: float
+    thesis_conditions: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -123,7 +124,7 @@ Respond with a JSON array. Max 3 actions per tick.
 BUY/CLOSE only — no SELL (we go long only on perpetual futures).
 Empty array [] means no action (this is often correct).
 
-[{"action":"BUY","symbol":"ENJ","side":"long","size_usd":12,"stop_pct":0.10,"target_pct":0.25,"confidence":"high","reasoning":"funding -0.22% + 1h accel +5.8% = squeeze setup"}]
+[{"action":"BUY","symbol":"ENJ","side":"long","size_usd":12,"stop_pct":0.10,"target_pct":0.25,"confidence":"high","reasoning":"funding -0.22% + 1h accel +5.8% = squeeze setup","thesis_conditions":{"funding_negative":true,"strategy":"funding_squeeze"}}]
 [{"action":"CLOSE","symbol":"BTC","reasoning":"held 2h, only +0.3%, chop exit"}]
 []"""
 
@@ -269,6 +270,9 @@ class ClaudeBrain:
         self.trending_tokens: list[str] = []
         self.recent_listings: list[dict] = []
 
+        self.memory = None  # BrainMemory instance, set by runner
+        self.acceleration_data: dict[str, float] = {}  # set by runner from AccelerationTracker
+
         # Social & news
         self.reddit_sentiment: float = 0.0
         self.reddit_post_count: int = 0
@@ -316,19 +320,17 @@ class ClaudeBrain:
         return "\n".join(lines)
 
     def _format_accel(self) -> str:
-        """Format 1h acceleration data from signals."""
-        accel_data = []
-        for s in self.pending_signals:
-            accel = s.data.get("acceleration_1h", 0)
-            if abs(accel) > 2:
-                accel_data.append((s.symbol, accel, s.price_change_24h))
-        if not accel_data:
+        if not self.acceleration_data:
             return "(no significant 1h moves)"
-        accel_data.sort(key=lambda x: x[1], reverse=True)
-        return " | ".join(
-            f"{sym} {a:+.1f}% (24h:{c:+.0f}%)"
-            for sym, a, c in accel_data[:8]
-        )
+        sorted_accel = sorted(self.acceleration_data.items(), key=lambda x: x[1], reverse=True)
+        top = sorted_accel[:8]  # top accelerators
+        bottom = sorted_accel[-3:]  # biggest decliners
+        parts = []
+        if top:
+            parts.append("Rising: " + " | ".join(f"{s} {a:+.1f}%" for s, a in top if a > 2))
+        if bottom:
+            parts.append("Falling: " + " | ".join(f"{s} {a:+.1f}%" for s, a in bottom if a < -5))
+        return "\n  ".join(parts) if parts else "(flat market)"
 
     def _format_funding(self) -> str:
         if not self.funding_rates:
@@ -377,6 +379,10 @@ class ClaudeBrain:
             reddit_sentiment=self.reddit_sentiment,
             reddit_post_count=self.reddit_post_count,
         )
+
+        if self.memory:
+            memory_text = self.memory.get_context_for_prompt()
+            prompt += f"\n\nMEMORY (cross-session):\n{memory_text}"
 
         # Step 1: Haiku fast scan — cheap signal detection
         response = _call_claude(
@@ -474,8 +480,15 @@ class ClaudeBrain:
                 log("info", f"[ClaudeBrain] Sonnet rejected {decision.symbol}: {result.get('reasoning', '')}")
                 return None
 
-            # Apply Sonnet's adjustments
-            decision.size_usd = min(float(result.get("size_usd", decision.size_usd)), 20)
+            # Apply Sonnet's adjustments with confidence-based sizing
+            confidence = result.get("confidence", decision.confidence)
+            if confidence == "high":
+                max_size = min(20.0, self.balance * 0.35)
+            elif confidence == "medium":
+                max_size = min(15.0, self.balance * 0.25)
+            else:
+                max_size = min(12.0, self.balance * 0.20)
+            decision.size_usd = min(float(result.get("size_usd", decision.size_usd)), max_size)
             decision.stop_pct = float(result.get("stop_pct", decision.stop_pct))
             decision.target_pct = float(result.get("target_pct", decision.target_pct))
             decision.reasoning += f" [Sonnet: {result.get('reasoning', 'approved')}]"
@@ -518,6 +531,7 @@ class ClaudeBrain:
                         reasoning=action.get("reasoning", ""),
                         signal_id=f"claude-{int(time.time())}",
                         timestamp=time.time() * 1000,
+                        thesis_conditions=action.get("thesis_conditions", {}),
                     ))
                 elif act == "CLOSE":
                     decisions.append(TradeDecision(
@@ -570,7 +584,62 @@ class ClaudeBrain:
         except Exception:
             return None
 
+    def deep_analysis(self) -> Optional[str]:
+        """Hourly deep market analysis using Opus. Costs ~$0.015/call."""
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Build comprehensive context
+        positions_text = self._format_positions()
+        accel_text = self._format_accel()
+        funding_text = self._format_funding()
+
+        memory_text = ""
+        if self.memory:
+            memory_text = self.memory.get_context_for_prompt()
+
+        prompt = f"""HOURLY DEEP ANALYSIS ({ts})
+
+Portfolio: ${self.balance:,.0f} | Day P&L: ${self.daily_pnl:+,.2f} | FGI: {self.fgi} ({self.fgi_class})
+
+POSITIONS:
+{positions_text}
+
+1H ACCELERATION (all symbols):
+{accel_text}
+
+FUNDING LANDSCAPE:
+{funding_text}
+
+TRENDING: {', '.join(self.trending_tokens[:10]) or '(none)'}
+
+{f'MEMORY:{chr(10)}{memory_text}' if memory_text else ''}
+
+Questions:
+1. What is the current market regime? (trending/ranging/volatile/dead)
+2. What high-conviction setups should we hunt in the next 1-2 hours?
+3. Should we adjust stops/targets on any open positions?
+4. What risks do you see that the 60s scanner might miss?
+
+Be specific and actionable. Max 200 words."""
+
+        response = _call_claude(
+            prompt,
+            model="claude-opus-4-6",
+            max_tokens=400,
+            system="You are an elite crypto trader doing your hourly market assessment. Be concise and actionable."
+        )
+        self.calls_today["opus"] = self.calls_today.get("opus", 0) + 1
+
+        if response:
+            log("info", f"[ClaudeBrain] Opus analysis: {response[:200]}")
+            if self.memory:
+                self.memory.add_lesson(response[:500], "opus_hourly")
+
+        return response
+
     def get_daily_cost_estimate(self) -> float:
         haiku_cost = self.calls_today["haiku"] * 0.00025
         sonnet_cost = self.calls_today["sonnet"] * 0.003
-        return haiku_cost + sonnet_cost
+        opus_cost = self.calls_today.get("opus", 0) * 0.015
+        return haiku_cost + sonnet_cost + opus_cost

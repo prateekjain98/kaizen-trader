@@ -26,6 +26,8 @@ import time
 from collections import deque
 from urllib.request import urlopen, Request
 
+from src.engine.acceleration_tracker import AccelerationTracker
+from src.engine.brain_memory import BrainMemory
 from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices, fetch_binance_top_movers, fetch_reddit_crypto_sentiment, fetch_crypto_news
 from src.engine.signal_detector import SignalDetector, SignalPacket
 from src.engine.claude_brain import ClaudeBrain
@@ -78,49 +80,6 @@ def _fetch_binance_account_balance() -> float | None:
         return None
 
 
-def _fetch_single_kline(sym: str) -> tuple[str, float | None]:
-    """Fetch 1h price change % for a single symbol. Returns (symbol, pct_change_or_None)."""
-    import json as _json
-    try:
-        pair = sym.upper() + "USDT"
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={pair}&interval=1h&limit=2"
-        req = Request(url, headers={"User-Agent": "kaizen-trader/1.0"})
-        with urlopen(req, timeout=2) as resp:
-            data = _json.loads(resp.read().decode())
-        if data and len(data) >= 2:
-            prev_close = float(data[-2][4])
-            curr_close = float(data[-1][4])
-            if prev_close > 0:
-                return sym, ((curr_close - prev_close) / prev_close) * 100
-    except Exception:
-        pass
-    return sym, None
-
-
-def _fetch_1h_kline_changes(symbols: list[str]) -> dict[str, float]:
-    """Fetch 1h price change % for a list of symbols from Binance klines API.
-
-    Returns {symbol: pct_change} e.g. {"SOL": 3.5, "DOGE": -1.2}.
-    Free, no auth required. Uses thread pool with 10s total timeout.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    changes: dict[str, float] = {}
-    try:
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {pool.submit(_fetch_single_kline, sym): sym for sym in symbols}
-            for future in as_completed(futures, timeout=10):
-                try:
-                    sym, change = future.result(timeout=2)
-                    if change is not None:
-                        changes[sym] = change
-                except Exception:
-                    continue
-    except Exception:
-        # Timeout or other error — return whatever data we have
-        pass
-    return changes
-
-
 # Top symbols to scan for correlation breaks (from backtest)
 _CORR_SYMBOLS = [
     "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "LINK", "AVAX",
@@ -164,6 +123,9 @@ class TradingEngine:
 
         self.executor = Executor(paper=paper, initial_balance=balance)
         self.streams = DataStreams(on_signal=self._on_raw_signal)
+        self.memory = BrainMemory()
+        self.memory.load()
+        self.accel_tracker = AccelerationTracker()
         self.corr_scanner = CorrelationScanner()
 
         # Stats
@@ -232,26 +194,21 @@ class TradingEngine:
             log("warn", f"News fetch failed: {e}")
             self.brain.latest_news = []
 
-        # Fetch 1h kline data for top movers — critical for RuleBrain acceleration scoring
-        try:
-            gainers, losers = fetch_binance_top_movers(limit=20)
-            movers = gainers + losers
-            symbols_to_check = [m["symbol"] for m in movers][:20]
-            hourly_changes = _fetch_1h_kline_changes(symbols_to_check)
+        # Get 1h acceleration from WS-based tracker (all symbols, zero API calls)
+        all_accel = self.accel_tracker.get_all_accelerations(min_abs_pct=1.0)
+        for sig in self.brain.pending_signals:
+            if sig.symbol in all_accel and sig.data is not None:
+                sig.data["acceleration_1h"] = all_accel[sig.symbol]
+        # Pass acceleration data to brain
+        if hasattr(self.brain, 'acceleration_data'):
+            self.brain.acceleration_data = all_accel
+        top_accel = self.accel_tracker.get_top_accelerators(5)
+        if top_accel:
+            log("info", f"1h accel: {' | '.join(f'{s} {a:+.1f}%' for s, a in top_accel)}")
 
-            # Inject 1h acceleration into pending signals so RuleBrain can score them
-            for sig in self.brain.pending_signals:
-                sym = sig.symbol
-                if sym in hourly_changes and (sig.data is not None):
-                    sig.data["acceleration_1h"] = hourly_changes[sym]
-                elif sym in hourly_changes:
-                    sig.data = {"acceleration_1h": hourly_changes[sym]}
-
-            if hourly_changes:
-                top_accel = max(hourly_changes.items(), key=lambda x: abs(x[1]))
-                log("info", f"📊 1h klines: {len(hourly_changes)} symbols, top={top_accel[0]} {top_accel[1]:+.1f}%")
-        except Exception as e:
-            log("warn", f"1h kline fetch failed: {e}")
+        # Pass memory to brain
+        if hasattr(self.brain, 'memory'):
+            self.brain.memory = self.memory
 
     def _brain_tick_loop(self):
         """Main brain loop — runs every tick_interval seconds."""
@@ -302,8 +259,19 @@ class TradingEngine:
                         # Find and close the position
                         for pos in self.executor.positions:
                             if pos.symbol == decision.symbol:
+                                pnl_pct = pos.unrealized_pnl_pct * 100
+                                pnl_usd = pos.unrealized_pnl_usd if hasattr(pos, 'unrealized_pnl_usd') else 0
                                 self.executor._close_position(pos, pos.current_price, "claude_decision")
                                 self.trades_closed += 1
+                                self.memory.record_trade(
+                                    symbol=pos.symbol,
+                                    pnl_pct=pnl_pct,
+                                    pnl_usd=pnl_usd,
+                                    exit_reason="claude_decision",
+                                    strategy=pos.signal_type,
+                                    duration_h=pos.hold_hours,
+                                )
+                                self.memory.save()
                                 break
 
             except Exception as e:
@@ -317,8 +285,12 @@ class TradingEngine:
         """Poll Binance prices, check stops/targets, feed correlation scanner."""
         while not self._stop.is_set():
             try:
-                # Feed correlation scanner with all tracked symbol prices
+                # Feed prices into acceleration tracker
                 all_prices = self.streams.snapshot.prices
+                for symbol, price in all_prices.items():
+                    self.accel_tracker.update(symbol, price)
+
+                # Feed correlation scanner with all tracked symbol prices
                 now_ms = time.time() * 1000
                 for sym in _CORR_SYMBOLS:
                     price = all_prices.get(sym, 0)
@@ -351,10 +323,53 @@ class TradingEngine:
                                     "signal_type": latest.position.signal_type,
                                     "reasoning": latest.position.reasoning,
                                 })
+                                self.memory.record_trade(
+                                    symbol=sym,
+                                    pnl_pct=latest.pnl_pct * 100,
+                                    pnl_usd=latest.pnl_usd if hasattr(latest, 'pnl_usd') else 0,
+                                    exit_reason=latest.exit_reason if hasattr(latest, 'exit_reason') else "stop_target",
+                                    strategy=latest.position.signal_type,
+                                    duration_h=latest.position.hold_hours,
+                                )
+                                self.memory.save()
+
+                # Check thesis for each open position
+                for pos in list(self.executor.positions):
+                    if not getattr(pos, 'thesis_conditions', None) or pos.hold_hours < 0.5:
+                        continue  # skip first 30 min
+                    tc = pos.thesis_conditions
+                    broken = False
+                    reason = ""
+
+                    if tc.get("funding_negative"):
+                        current_funding = self.streams.snapshot.funding_rates.get(pos.symbol, 0)
+                        if current_funding > 0.0005:  # funding flipped meaningfully positive
+                            broken = True
+                            reason = f"funding flipped positive ({current_funding*100:+.3f}%)"
+
+                    if broken:
+                        log("trade", f"THESIS BREAK: {pos.symbol} - {reason}")
+                        self.executor._close_position(pos, pos.current_price, "thesis_break")
+                        if self.memory:
+                            self.memory.record_trade(pos.symbol, pos.unrealized_pnl_pct * 100, pos.unrealized_pnl_usd if hasattr(pos, 'unrealized_pnl_usd') else 0, "thesis_break", pos.signal_type, pos.hold_hours)
+                            self.memory.save()
             except Exception as e:
                 log("warn", f"Price update error: {e}")
 
             self._stop.wait(timeout=5)  # check prices every 5s
+
+    def _opus_analysis_loop(self):
+        """Hourly deep market analysis using Opus (~$0.015/call)."""
+        self._stop.wait(timeout=300)  # wait 5 min for data warmup
+        while not self._stop.is_set():
+            try:
+                if hasattr(self.brain, 'deep_analysis'):
+                    analysis = self.brain.deep_analysis()
+                    if analysis and self.memory:
+                        self.memory.save()
+            except Exception as e:
+                log("warn", f"Opus analysis failed: {e}")
+            self._stop.wait(timeout=3600)  # every hour
 
     def _stats_loop(self):
         """Print stats periodically."""
@@ -394,11 +409,14 @@ class TradingEngine:
 
         # Start processing threads
         threads = [
-            threading.Thread(target=self._brain_tick_loop, daemon=True, name="brain-tick"),
-            threading.Thread(target=self._price_update_loop, daemon=True, name="price-updater"),
-            threading.Thread(target=self._stats_loop, daemon=True, name="stats"),
+            ("brain-tick", self._brain_tick_loop),
+            ("price-updater", self._price_update_loop),
+            ("stats", self._stats_loop),
         ]
-        for t in threads:
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            threads.append(("opus-analysis", self._opus_analysis_loop))
+        for name, target in threads:
+            t = threading.Thread(target=target, daemon=True, name=name)
             t.start()
 
         log("info", "Engine running. Brain active.")
@@ -408,6 +426,8 @@ class TradingEngine:
         log("info", "Stopping engine...")
         self._stop.set()
         self.streams.stop()
+        if self.memory:
+            self.memory.save()
 
         stats = self.executor.get_stats()
         log("info", f"Session stats: {stats['total_trades']} trades, "
