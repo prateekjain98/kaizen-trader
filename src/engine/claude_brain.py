@@ -392,6 +392,7 @@ class ClaudeBrain:
             system=_SYSTEM_PROMPT,
         )
         self.calls_today["haiku"] += 1
+        signals_snapshot = list(self.pending_signals)
         self.pending_signals = []
 
         if not response:
@@ -413,7 +414,7 @@ class ClaudeBrain:
 
             if d.action in ("BUY", "SELL"):
                 # Validate with Sonnet for actual entries
-                confirmed = self._validate_with_sonnet(d)
+                confirmed = self._validate_with_sonnet(d, signals_snapshot)
                 if confirmed:
                     validated.append(confirmed)
                 else:
@@ -421,7 +422,7 @@ class ClaudeBrain:
 
         return validated
 
-    def _validate_with_sonnet(self, decision: TradeDecision) -> Optional[TradeDecision]:
+    def _validate_with_sonnet(self, decision: TradeDecision, signals_snapshot: list[SignalPacket] | None = None) -> Optional[TradeDecision]:
         """Use Sonnet to validate and refine a trade decision.
 
         This is the quality gate — Sonnet is smarter and catches
@@ -441,7 +442,8 @@ class ClaudeBrain:
         symbol_funding = self.funding_rates.get(decision.symbol, 0)
         accel_1h = "unknown"
         change_24h = "unknown"
-        for s in self.pending_signals:
+        signals_to_search = signals_snapshot if signals_snapshot is not None else self.pending_signals
+        for s in signals_to_search:
             if s.symbol == decision.symbol:
                 accel_1h = f"{s.data.get('acceleration_1h', 0):+.1f}%"
                 change_24h = f"{s.price_change_24h:+.1f}%"

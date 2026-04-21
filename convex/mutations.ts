@@ -125,7 +125,7 @@ export const deduplicateOpenPositions = mutation({
     const open = await ctx.db
       .query("positions")
       .withIndex("by_status", (q) => q.eq("status", "open"))
-      .collect();
+      .take(500);
     const seen = new Set<string>();
     let removed = 0;
     for (const pos of open) {
@@ -298,7 +298,7 @@ export const clearAllData = mutation({
     ] as const;
     const counts: Record<string, number> = {};
     for (const table of tables) {
-      const rows = await ctx.db.query(table).collect();
+      const rows = await ctx.db.query(table).take(1000);
       for (const row of rows) {
         await ctx.db.delete(row._id);
       }
@@ -353,7 +353,7 @@ export const insertMetrics = mutation({
 export const deleteByExitReason = mutation({
   args: { exitReason: v.string() },
   handler: async (ctx, args) => {
-    const positions = await ctx.db.query("positions").collect();
+    const positions = await ctx.db.query("positions").take(500);
     let deleted = 0;
     for (const pos of positions) {
       if (pos.exitReason === args.exitReason) {

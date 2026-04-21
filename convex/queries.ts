@@ -30,8 +30,7 @@ export const getClosedTrades = query({
     let q = ctx.db
       .query("positions")
       .withIndex("by_closed_at")
-      .order("desc")
-      .filter((q) => q.eq(q.field("status"), "closed"));
+      .order("desc");
     if (args.paperTrading !== undefined) {
       q = q.filter((f) => f.eq(f.field("paperTrading"), args.paperTrading!));
     }
@@ -91,7 +90,7 @@ export const getPendingDeltas = query({
     return await ctx.db
       .query("parameterDeltas")
       .withIndex("by_status", (q) => q.eq("evaluationStatus", "pending"))
-      .collect();
+      .take(100);
   },
 });
 
@@ -101,7 +100,7 @@ export const getOpenIssues = query({
     return await ctx.db
       .query("githubIssues")
       .withIndex("by_status", (q) => q.eq("status", "open"))
-      .collect();
+      .take(100);
   },
 });
 

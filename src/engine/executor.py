@@ -8,7 +8,9 @@ Fixes applied:
     5. Position persistence to JSON (survives restart)
 """
 
+import hmac
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -117,6 +119,7 @@ class Executor:
         self._daily_reset_ts: float = time.time()
         self._binance = None  # generic exchange provider (binance or okx)
         self._started_at: str = datetime.now(timezone.utc).isoformat()
+        self._lock = threading.Lock()
 
         # Ensure data directory exists
         _PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -141,65 +144,67 @@ class Executor:
             try:
                 with open(_PORTFOLIO_FILE) as f:
                     state = json.load(f)
-                self.balance = state.get("balance", self.balance)
-                self.total_commissions = state.get("total_commissions", 0)
-                # Restore positions
-                for p in state.get("positions", []):
-                    self.positions.append(Position(
-                        id=p.get("id", str(uuid.uuid4())),
-                        symbol=p["symbol"], side=p["side"],
-                        entry_price=p["entry_price"], size_usd=p["size_usd"],
-                        quantity=p.get("quantity", p["size_usd"] / p["entry_price"]),
-                        stop_pct=p["stop_pct"], target_pct=p.get("target_pct", 0.15),
-                        opened_at=p["opened_at"], signal_type=p.get("signal_type", ""),
-                        reasoning=p.get("reasoning", ""),
-                        thesis=p.get("thesis", ""),
-                        thesis_conditions=p.get("thesis_conditions", {}),
-                        current_price=p.get("current_price", p["entry_price"]),
-                        high_watermark=p.get("high_watermark", p["entry_price"]),
-                        entry_commission=p.get("entry_commission", 0),
-                        trailing_stop_price=p.get("trailing_stop_price", 0),
-                    ))
-                log("info", f"Loaded portfolio: ${self.balance:,.2f}, {len(self.positions)} positions")
+                with self._lock:
+                    self.balance = state.get("balance", self.balance)
+                    self.total_commissions = state.get("total_commissions", 0)
+                    # Restore positions
+                    for p in state.get("positions", []):
+                        self.positions.append(Position(
+                            id=p.get("id", str(uuid.uuid4())),
+                            symbol=p["symbol"], side=p["side"],
+                            entry_price=p["entry_price"], size_usd=p["size_usd"],
+                            quantity=p.get("quantity", p["size_usd"] / p["entry_price"]),
+                            stop_pct=p["stop_pct"], target_pct=p.get("target_pct", 0.15),
+                            opened_at=p["opened_at"], signal_type=p.get("signal_type", ""),
+                            reasoning=p.get("reasoning", ""),
+                            thesis=p.get("thesis", ""),
+                            thesis_conditions=p.get("thesis_conditions", {}),
+                            current_price=p.get("current_price", p["entry_price"]),
+                            high_watermark=p.get("high_watermark", p["entry_price"]),
+                            entry_commission=p.get("entry_commission", 0),
+                            trailing_stop_price=p.get("trailing_stop_price", 0),
+                        ))
+                    log("info", f"Loaded portfolio: ${self.balance:,.2f}, {len(self.positions)} positions")
             except Exception as e:
                 log("warn", f"Failed to load portfolio state: {e}")
 
     def _save_state(self):
         """Persist portfolio to JSON."""
-        state = {
-            "balance": self.balance,
-            "total_commissions": self.total_commissions,
-            "positions": [
-                {
-                    "id": p.id, "symbol": p.symbol, "side": p.side,
-                    "entry_price": p.entry_price, "size_usd": p.size_usd,
-                    "quantity": p.quantity, "stop_pct": p.stop_pct,
-                    "target_pct": p.target_pct, "opened_at": p.opened_at,
-                    "signal_type": p.signal_type, "reasoning": p.reasoning,
-                    "thesis": p.thesis, "thesis_conditions": p.thesis_conditions,
-                    "current_price": p.current_price,
-                    "high_watermark": p.high_watermark,
-                    "entry_commission": p.entry_commission,
-                    "trailing_stop_price": p.trailing_stop_price,
-                    "stop_price": p.stop_price,
-                    "target_price": p.target_price,
-                }
-                for p in self.positions
-            ],
-            "closed_trades": [
-                {
-                    "symbol": t.position.symbol, "side": t.position.side,
-                    "entry": t.position.entry_price, "exit": t.exit_price,
-                    "pnl_pct": t.pnl_pct, "pnl_usd": t.pnl_usd,
-                    "reason": t.exit_reason, "closed_at": t.closed_at,
-                    "commissions": t.position.entry_commission + t.exit_commission,
-                }
-                for t in self.closed_trades[-50:]  # keep last 50
-            ],
-            "total_pnl": sum(t.pnl_usd for t in self.closed_trades),
-            "total_commissions": self.total_commissions,
-            "started_at": self._started_at,
-        }
+        with self._lock:
+            state = {
+                "balance": self.balance,
+                "total_commissions": self.total_commissions,
+                "positions": [
+                    {
+                        "id": p.id, "symbol": p.symbol, "side": p.side,
+                        "entry_price": p.entry_price, "size_usd": p.size_usd,
+                        "quantity": p.quantity, "stop_pct": p.stop_pct,
+                        "target_pct": p.target_pct, "opened_at": p.opened_at,
+                        "signal_type": p.signal_type, "reasoning": p.reasoning,
+                        "thesis": p.thesis, "thesis_conditions": p.thesis_conditions,
+                        "current_price": p.current_price,
+                        "high_watermark": p.high_watermark,
+                        "entry_commission": p.entry_commission,
+                        "trailing_stop_price": p.trailing_stop_price,
+                        "stop_price": p.stop_price,
+                        "target_price": p.target_price,
+                    }
+                    for p in self.positions
+                ],
+                "closed_trades": [
+                    {
+                        "symbol": t.position.symbol, "side": t.position.side,
+                        "entry": t.position.entry_price, "exit": t.exit_price,
+                        "pnl_pct": t.pnl_pct, "pnl_usd": t.pnl_usd,
+                        "reason": t.exit_reason, "closed_at": t.closed_at,
+                        "commissions": t.position.entry_commission + t.exit_commission,
+                    }
+                    for t in self.closed_trades[-50:]  # keep last 50
+                ],
+                "total_pnl": sum(t.pnl_usd for t in self.closed_trades),
+                "total_commissions": self.total_commissions,
+                "started_at": self._started_at,
+            }
         with open(_PORTFOLIO_FILE, "w") as f:
             json.dump(state, f, indent=2)
 
@@ -224,26 +229,27 @@ class Executor:
 
     def open_position(self, decision: TradeDecision) -> Optional[Position]:
         """Open a new position with commission tracking."""
-        if not self.can_trade():
-            return None
-        if self.has_position(decision.symbol):
-            return None
+        with self._lock:
+            if not self.can_trade():
+                return None
+            if self.has_position(decision.symbol):
+                return None
 
-        size = min(decision.size_usd, self.MAX_POSITION_SIZE, self.balance * 0.4)
-        if size < 10:
-            return None
+            size = min(decision.size_usd, self.MAX_POSITION_SIZE, self.balance * 0.4)
+            if size < 10:
+                return None
 
-        entry_commission = size * self.COMMISSION_PCT
-        if size + entry_commission > self.balance:
-            return None
+            entry_commission = size * self.COMMISSION_PCT
+            if size + entry_commission > self.balance:
+                return None
 
-        entry_price = decision.entry_price
-        if entry_price <= 0:
-            return None
+            entry_price = decision.entry_price
+            if entry_price <= 0:
+                return None
 
-        quantity = size / entry_price
+            quantity = size / entry_price
 
-        # Execute on Binance (live mode)
+        # Execute on Binance (live mode) — outside lock to avoid blocking
         if not self.paper and self._binance:
             try:
                 side_str = "BUY" if decision.side == "long" else "SELL"
@@ -263,22 +269,24 @@ class Executor:
                 log("error", f"Execution error: {decision.symbol}: {e}")
                 return None
 
-        self.balance -= (size + entry_commission)
-        self.total_commissions += entry_commission
+        with self._lock:
+            self.balance -= (size + entry_commission)
+            self.total_commissions += entry_commission
 
-        pos = Position(
-            id=str(uuid.uuid4()), symbol=decision.symbol, side=decision.side,
-            entry_price=entry_price, size_usd=size, quantity=quantity,
-            stop_pct=decision.stop_pct, target_pct=decision.target_pct,
-            opened_at=time.time() * 1000,
-            signal_type=decision.reasoning[:50], reasoning=decision.reasoning,
-            thesis=decision.reasoning,
-            thesis_conditions=getattr(decision, 'thesis_conditions', {}),
-            current_price=entry_price, high_watermark=entry_price,
-            entry_commission=entry_commission,
-        )
+            pos = Position(
+                id=str(uuid.uuid4()), symbol=decision.symbol, side=decision.side,
+                entry_price=entry_price, size_usd=size, quantity=quantity,
+                stop_pct=decision.stop_pct, target_pct=decision.target_pct,
+                opened_at=time.time() * 1000,
+                signal_type=decision.reasoning[:50], reasoning=decision.reasoning,
+                thesis=decision.reasoning,
+                thesis_conditions=getattr(decision, 'thesis_conditions', {}),
+                current_price=entry_price, high_watermark=entry_price,
+                entry_commission=entry_commission,
+            )
 
-        self.positions.append(pos)
+            self.positions.append(pos)
+
         self._save_state()
         log("trade", f"OPEN {pos.side.upper()} {pos.symbol} ${size:.0f} @ ${entry_price:.4f} "
             f"stop=${pos.stop_price:.4f} target=${pos.target_price:.4f} fee=${entry_commission:.3f}")
@@ -297,7 +305,6 @@ class Executor:
             log("warn", f"Server-side stops not implemented for {self._binance.name} — skipping for {symbol}")
             return
 
-        import hmac
         import requests
 
         binance_symbol = self._binance._get_binance_symbol(symbol)
@@ -348,8 +355,15 @@ class Executor:
             log("warn", f"Failed to place server TP for {symbol}: {e}")
 
     def update_price(self, symbol: str, price: float):
-        """Update price, check stops/targets, and manage trailing stops."""
-        for pos in list(self.positions):
+        """Update price, check stops/targets, and manage trailing stops.
+
+        Note: chop exits are handled by the brain (RuleBrain._check_chop_exits
+        or ClaudeBrain tick) to avoid double-closes.
+        """
+        with self._lock:
+            positions_snapshot = list(self.positions)
+
+        for pos in positions_snapshot:
             if pos.symbol != symbol:
                 continue
             pos.current_price = price
@@ -385,10 +399,6 @@ class Executor:
             elif pos.side == "short" and price <= pos.target_price:
                 self._close_position(pos, price, "target")
 
-            # Chop exit — dead trade going nowhere after 60 min
-            elif pos.hold_hours > 1.0 and abs(pos.unrealized_pnl_pct) < 0.02:
-                self._close_position(pos, price, "chop_exit")
-
             # Max hold time (48h)
             elif pos.hold_hours > 48:
                 self._close_position(pos, price, "timeout")
@@ -396,7 +406,6 @@ class Executor:
     def _close_position(self, pos: Position, exit_price: float, reason: str):
         """Close position with full commission accounting."""
         exit_commission = pos.size_usd * self.COMMISSION_PCT
-        self.total_commissions += exit_commission
 
         if pos.side == "long":
             pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
@@ -407,7 +416,7 @@ class Executor:
         gross_pnl = pos.size_usd * pnl_pct
         pnl_usd = gross_pnl - pos.entry_commission - exit_commission
 
-        # Execute close on Binance (live mode)
+        # Execute close on Binance (live mode) — outside lock to avoid blocking
         if not self.paper and self._binance:
             try:
                 close_side = "SELL" if pos.side == "long" else "BUY"
@@ -415,17 +424,20 @@ class Executor:
             except Exception as e:
                 log("error", f"Close execution error: {pos.symbol}: {e}")
 
-        self.balance += pos.size_usd + pnl_usd
-        self.daily_pnl += pnl_usd
+        with self._lock:
+            self.total_commissions += exit_commission
+            self.balance += pos.size_usd + pnl_usd
+            self.daily_pnl += pnl_usd
 
-        closed = ClosedTrade(
-            position=pos, exit_price=exit_price,
-            pnl_pct=pnl_pct, pnl_usd=pnl_usd,
-            exit_reason=reason, closed_at=time.time() * 1000,
-            exit_commission=exit_commission,
-        )
-        self.closed_trades.append(closed)
-        self.positions = [p for p in self.positions if p.id != pos.id]
+            closed = ClosedTrade(
+                position=pos, exit_price=exit_price,
+                pnl_pct=pnl_pct, pnl_usd=pnl_usd,
+                exit_reason=reason, closed_at=time.time() * 1000,
+                exit_commission=exit_commission,
+            )
+            self.closed_trades.append(closed)
+            self.positions = [p for p in self.positions if p.id != pos.id]
+
         self._save_state()
 
         trail_info = f" (trailed from ${pos.entry_price*(1-pos.stop_pct):.4f} to ${pos.trailing_stop_price:.4f})" if pos.trailing_stop_price > 0 else ""
