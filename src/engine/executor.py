@@ -35,6 +35,8 @@ class Position:
     opened_at: float        # unix ms
     signal_type: str
     reasoning: str
+    thesis: str = ""  # human-readable entry thesis
+    thesis_conditions: dict = field(default_factory=dict)  # machine-checkable: {"funding_negative": True, "strategy": "funding_squeeze"}
     current_price: float = 0
     high_watermark: float = 0
     low_watermark: float = float("inf")
@@ -151,6 +153,8 @@ class Executor:
                         stop_pct=p["stop_pct"], target_pct=p.get("target_pct", 0.15),
                         opened_at=p["opened_at"], signal_type=p.get("signal_type", ""),
                         reasoning=p.get("reasoning", ""),
+                        thesis=p.get("thesis", ""),
+                        thesis_conditions=p.get("thesis_conditions", {}),
                         current_price=p.get("current_price", p["entry_price"]),
                         high_watermark=p.get("high_watermark", p["entry_price"]),
                         entry_commission=p.get("entry_commission", 0),
@@ -172,6 +176,7 @@ class Executor:
                     "quantity": p.quantity, "stop_pct": p.stop_pct,
                     "target_pct": p.target_pct, "opened_at": p.opened_at,
                     "signal_type": p.signal_type, "reasoning": p.reasoning,
+                    "thesis": p.thesis, "thesis_conditions": p.thesis_conditions,
                     "current_price": p.current_price,
                     "high_watermark": p.high_watermark,
                     "entry_commission": p.entry_commission,
@@ -267,6 +272,8 @@ class Executor:
             stop_pct=decision.stop_pct, target_pct=decision.target_pct,
             opened_at=time.time() * 1000,
             signal_type=decision.reasoning[:50], reasoning=decision.reasoning,
+            thesis=decision.reasoning,
+            thesis_conditions=getattr(decision, 'thesis_conditions', {}),
             current_price=entry_price, high_watermark=entry_price,
             entry_commission=entry_commission,
         )

@@ -268,6 +268,10 @@ class RuleBrain:
         self.reddit_sentiment: float = 0.0
         self.reddit_post_count: int = 0
 
+        # Cross-session memory and acceleration (set by runner)
+        self.memory = None  # BrainMemory instance, set by runner
+        self.acceleration_data: dict[str, float] = {}  # set by runner from AccelerationTracker
+
         # Internal state for learning from results
         self._recently_closed: dict[str, dict] = {}  # symbol -> last closed trade info
         self._win_count: int = 0
@@ -298,9 +302,21 @@ class RuleBrain:
         # Also check for choppy positions that should be closed
         close_decisions = self._check_chop_exits()
 
+        # Filter out avoided symbols from memory
+        signals_to_score = list(self.pending_signals)
+        if self.memory:
+            filtered = []
+            for sig in signals_to_score:
+                should_avoid, reason = self.memory.should_avoid(sig.symbol)
+                if should_avoid:
+                    log("info", f"[RuleBrain] SKIP {sig.symbol}: {reason}")
+                else:
+                    filtered.append(sig)
+            signals_to_score = filtered
+
         # Score every pending signal
         scored: list[ScoredSignal] = []
-        for packet in self.pending_signals:
+        for packet in signals_to_score:
             result = _score_signal(
                 signal=packet,
                 funding_rates=self.funding_rates,
@@ -334,7 +350,12 @@ class RuleBrain:
         remaining_budget = (self.balance * MAX_BALANCE_DEPLOYED_PCT) - total_deployed
 
         for s in top_signals:
-            size_usd = min(20.0, self.balance * 0.3)
+            if s.score >= 80:
+                size_usd = min(20.0, self.balance * 0.35)
+            elif s.score >= 60:
+                size_usd = min(15.0, self.balance * 0.25)
+            else:
+                size_usd = min(12.0, self.balance * 0.20)
             size_usd = min(size_usd, remaining_budget)
 
             if size_usd < 5:
@@ -343,6 +364,14 @@ class RuleBrain:
 
             reasoning = f"Score {s.score} [{s.strategy_type}]: " + " | ".join(s.factors)
             log("info", f"[RuleBrain] BUY {s.signal.symbol} {s.side} ${size_usd:.0f} — {reasoning}")
+
+            thesis_conditions = {"strategy": s.strategy_type}
+            if s.strategy_type == "funding_squeeze":
+                thesis_conditions["funding_negative"] = True
+            elif s.strategy_type == "correlation_break":
+                thesis_conditions["btc_divergence_negative"] = True
+            elif s.strategy_type == "listing_pump":
+                thesis_conditions["listing_recent"] = True
 
             decisions.append(TradeDecision(
                 action="BUY",
@@ -356,6 +385,7 @@ class RuleBrain:
                 reasoning=reasoning,
                 signal_id=s.signal.signal_id or f"rule-{int(time.time())}",
                 timestamp=time.time() * 1000,
+                thesis_conditions=thesis_conditions,
             ))
 
             remaining_budget -= size_usd
@@ -399,6 +429,17 @@ class RuleBrain:
             lesson = f"Trade on {symbol} ({signal_type}): {pnl_pct:+.1f}% in {duration_hours:.1f}h"
 
         log("info", f"[RuleBrain] Review: {lesson} | WR: {wr:.0f}% ({self._win_count}W/{self._loss_count}L)")
+
+        # Record trade in persistent cross-session memory
+        if self.memory:
+            self.memory.record_trade(
+                symbol=symbol,
+                pnl_pct=pnl_pct,
+                pnl_usd=trade_data.get("pnl_usd", 0),
+                exit_reason=trade_data.get("exit_reason", "unknown"),
+                strategy=trade_data.get("signal_type", "unknown"),
+                duration_h=duration_hours,
+            )
 
         # Expire old recently-closed entries (older than 2 hours)
         now_ms = time.time() * 1000
