@@ -4,8 +4,10 @@
 
 - **Duration:** ~7 days (April 14 02:00 IST → April 21 ongoing)
 - **Starting balance:** $37.36 (Binance Futures deposit)
-- **Final balance:** $44.17 (realized)
-- **Net P&L:** +$6.81 (+18.2%)
+- **Last confirmed balance:** $44.18 (realized, after manual SAGA/TST close)
+- **Engine additional P&L:** +$3.01 (4 trades, 100% WR in latest session) + $3.49 (5 trades, 60% WR in prior session)
+- **Estimated current balance:** ~$47+ (API blocked at time of writing due to IP change)
+- **Net P&L:** +$10+ estimated (+26%+)
 - **Leverage:** 1x always (after fixing initial 20x mistake)
 - **Exchange:** Binance Futures (USDM perpetual contracts)
 
