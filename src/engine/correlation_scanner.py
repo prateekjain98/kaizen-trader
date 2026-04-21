@@ -7,6 +7,7 @@ No LLM calls — pure math, runs in <10ms.
 """
 
 import time
+from collections import deque
 from typing import Optional
 from src.engine.log import log
 
@@ -30,18 +31,16 @@ class CorrelationScanner:
     SHORT_THRESHOLD = 0.065  # alt overperformed BTC by 6.5%+
 
     def __init__(self):
-        self._price_history: dict[str, list[tuple[float, float]]] = {}  # symbol -> [(timestamp, price)]
+        self._price_history: dict[str, deque[tuple[float, float]]] = {}  # symbol -> deque[(timestamp, price)]
         self._corr_history: dict[str, list[tuple[float, float]]] = {}   # symbol -> [(btc_pct, alt_pct)]
         self._last_scan_ms: float = 0
         self._scan_interval_ms = 3_600_000  # 1 hour
 
     def update_price(self, symbol: str, price: float, timestamp_ms: float):
         """Feed real-time price data from WebSocket."""
-        hist = self._price_history.setdefault(symbol, [])
-        hist.append((timestamp_ms, price))
-        # Keep last 2 hours of ticks (for computing hourly returns)
-        cutoff = timestamp_ms - 7_200_000
-        self._price_history[symbol] = [(t, p) for t, p in hist if t > cutoff]
+        if symbol not in self._price_history:
+            self._price_history[symbol] = deque(maxlen=1440)
+        self._price_history[symbol].append((timestamp_ms, price))
 
     def _get_hourly_return(self, symbol: str, now_ms: float) -> Optional[float]:
         """Compute 1h return from price history."""

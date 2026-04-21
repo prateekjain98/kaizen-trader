@@ -36,8 +36,8 @@ PUMP_DURATION_LIMIT_HOURS = 8
 RE_ENTRY_COOLDOWN_MS = 30 * 60 * 1000  # 30 min cooldown before re-entry
 
 BLUE_CHIP_ALTS = frozenset({
-    "ETHUSDT", "SOLUSDT", "DOTUSDT", "LINKUSDT", "AVAXUSDT",
-    "AAVEUSDT", "UNIUSDT", "MATICUSDT", "ATOMUSDT", "NEARUSDT",
+    "ETH", "SOL", "DOT", "LINK", "AVAX",
+    "AAVE", "UNI", "MATIC", "ATOM", "NEAR",
 })
 
 # Strategy-specific stop/target percentages
@@ -169,7 +169,7 @@ def _score_signal(
         strategy_type = "listing_pump"
 
     # FGI extreme fear — contrarian BTC/ETH buy
-    if fgi < 15 and symbol in ("BTCUSDT", "ETHUSDT"):
+    if fgi < 15 and symbol in ("BTC", "ETH"):
         score += 30
         factors.append(f"FGI={fgi} extreme fear on {symbol} +30")
         strategy_type = "fgi_contrarian"
@@ -292,15 +292,15 @@ class RuleBrain:
 
         Called every 60 seconds by the runner. Zero API cost.
         """
+        # Always check for choppy positions, even when no new signals
+        close_decisions = self._check_chop_exits()
+
         if not self.pending_signals:
-            return []
+            return close_decisions
 
         total_deployed = sum(
             float(p.get("size_usd", 0)) for p in self.open_positions
         )
-
-        # Also check for choppy positions that should be closed
-        close_decisions = self._check_chop_exits()
 
         # Filter out avoided symbols from memory
         signals_to_score = list(self.pending_signals)

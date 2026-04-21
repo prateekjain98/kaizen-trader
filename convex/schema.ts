@@ -42,7 +42,9 @@ export default defineSchema({
     .index("by_status", ["status"])
     .index("by_positionId", ["positionId"])
     .index("by_symbol", ["symbol"])
-    .index("by_closed_at", ["closedAt"]),
+    .index("by_closed_at", ["closedAt"])
+    .index("by_status_and_paperTrading", ["status", "paperTrading"])
+    .index("by_strategy", ["strategy"]),
 
   trades: defineTable({
     tradeId: v.string(),
@@ -57,7 +59,9 @@ export default defineSchema({
     error: v.optional(v.string()),
     paperTrading: v.boolean(),
     placedAt: v.float64(),
-  }).index("by_position", ["positionId"]),
+  })
+    .index("by_position", ["positionId"])
+    .index("by_status", ["status"]),
 
   logs: defineTable({
     logId: v.string(),

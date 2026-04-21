@@ -103,7 +103,7 @@ class ConvexStorage:
                     break
                 except Exception as exc:
                     if attempt < retries - 1:
-                        time.sleep(0.5 * (attempt + 1))
+                        time.sleep(min(0.5 * (2 ** attempt), 10))
                     else:
                         logger.error(f"Failed to call {mutation_name} "
                                      f"after {retries} attempt(s): {exc}")

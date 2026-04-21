@@ -28,7 +28,7 @@ from urllib.request import urlopen, Request
 
 from src.engine.acceleration_tracker import AccelerationTracker
 from src.engine.brain_memory import BrainMemory
-from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices, fetch_binance_top_movers, fetch_reddit_crypto_sentiment, fetch_crypto_news
+from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices, fetch_binance_top_movers
 from src.engine.signal_detector import SignalDetector, SignalPacket
 from src.engine.claude_brain import ClaudeBrain
 from src.engine.executor import Executor
@@ -170,28 +170,26 @@ class TradingEngine:
         self.brain.trending_tokens = snapshot.trending_tokens
         self.brain.recent_listings = snapshot.recent_listings
 
-        # Sync social and news signals (FREE data sources)
-        try:
-            reddit_posts = fetch_reddit_crypto_sentiment()
-            bullish = sum(1 for p in reddit_posts if any(kw in p['title'].lower() for kw in ['bull', 'pump', 'rally', 'gain', 'moon', 'surge']))
-            bearish = sum(1 for p in reddit_posts if any(kw in p['title'].lower() for kw in ['bear', 'crash', 'dump', 'loss', 'tank']))
-            sentiment = (bullish - bearish) / max(1, bullish + bearish) if (bullish + bearish) > 0 else 0
-            self.brain.reddit_sentiment = sentiment
-            self.brain.reddit_post_count = len(reddit_posts)
+        # Use cached social/news data from DataStreams (avoids blocking HTTP in brain tick)
+        if hasattr(snapshot, 'reddit_posts'):
+            reddit_posts = getattr(snapshot, 'reddit_posts', [])
             if reddit_posts:
-                log("info", f"📱 Reddit sentiment: {sentiment:+.2f} ({bullish} bullish, {bearish} bearish)")
-        except Exception as e:
-            log("warn", f"Reddit fetch failed: {e}")
+                bullish = sum(1 for p in reddit_posts if any(kw in p.get('title', '').lower() for kw in ['bull', 'pump', 'rally', 'gain', 'moon', 'surge']))
+                bearish = sum(1 for p in reddit_posts if any(kw in p.get('title', '').lower() for kw in ['bear', 'crash', 'dump', 'loss', 'tank']))
+                sentiment = (bullish - bearish) / max(1, bullish + bearish) if (bullish + bearish) > 0 else 0
+                self.brain.reddit_sentiment = sentiment
+                self.brain.reddit_post_count = len(reddit_posts)
+            else:
+                self.brain.reddit_sentiment = 0
+                self.brain.reddit_post_count = 0
+        else:
             self.brain.reddit_sentiment = 0
             self.brain.reddit_post_count = 0
 
-        try:
-            news_items = fetch_crypto_news()
+        if hasattr(snapshot, 'news_items'):
+            news_items = getattr(snapshot, 'news_items', [])
             self.brain.latest_news = news_items[:5] if news_items else []
-            if news_items:
-                log("info", f"📰 Latest news: {news_items[0]['title'][:60]}")
-        except Exception as e:
-            log("warn", f"News fetch failed: {e}")
+        else:
             self.brain.latest_news = []
 
         # Get 1h acceleration from WS-based tracker (all symbols, zero API calls)
