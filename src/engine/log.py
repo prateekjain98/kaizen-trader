@@ -27,9 +27,14 @@ def log(level: str, message: str, **kwargs):
     else:
         _logger.info(f"{prefix}{message}")
 
-    # Try forwarding to Convex if available (non-blocking)
+    # Try forwarding to Convex if available (non-blocking).
+    # Surface failures to stderr so Convex outages don't go unnoticed; only
+    # the very first failure is logged loudly to avoid log spam if Convex
+    # is down for an extended period.
     try:
         from src.storage.database import log as convex_log
         convex_log(level, message, **kwargs)
-    except Exception:
-        pass  # Convex not available — that's fine
+    except Exception as e:
+        if not getattr(log, "_convex_warned", False):
+            _logger.error(f"Convex forward FAILED (suppressing further): {type(e).__name__}: {e}")
+            log._convex_warned = True
