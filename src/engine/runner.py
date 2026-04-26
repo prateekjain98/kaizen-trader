@@ -128,6 +128,24 @@ class TradingEngine:
         self.accel_tracker = AccelerationTracker()
         self.corr_scanner = CorrelationScanner()
 
+        # OKX WS: only meaningful in live mode against an OKX account.
+        # Public WS gets dynamic ticker subs for open positions (sub-second stop checks).
+        # Private WS pushes order/position/balance events (replaces REST polling latency).
+        self.okx_public_ws = None
+        self.okx_private_ws = None
+        from src.config import env as _env
+        if not paper and _env.exchange == "okx" and _env.okx_api_key:
+            from src.engine.okx_ws import OKXPublicWS, OKXPrivateWS
+            self.okx_public_ws = OKXPublicWS(on_ticker=self._on_okx_ticker)
+            self.okx_private_ws = OKXPrivateWS(
+                on_order=self._on_okx_order,
+                on_position=self._on_okx_position,
+                on_balance=self._on_okx_balance,
+            )
+        # Track which symbols we've subscribed for OKX public ticks, so we can
+        # diff against current open positions each tick and sub/unsub accordingly.
+        self._okx_subbed: set[str] = set()
+
         # Stats
         self.signals_received = 0
         self.ticks_run = 0
@@ -143,6 +161,58 @@ class TradingEngine:
         if packet:
             # Queue for next brain tick
             self.brain.add_signal(packet)
+
+    # ── OKX WS callbacks ───────────────────────────────────────────────
+
+    def _on_okx_ticker(self, symbol: str, last: float, bid: float, ask: float):
+        """Real-time OKX price for an open position. Drives stop/target checks
+        immediately instead of waiting for the 5s polled price update.
+
+        Note: we still update the same executor.update_price path so trailing
+        stops + thesis checks all run identically — just on fresher data.
+        """
+        if last > 0:
+            self.executor.update_price(symbol, last)
+
+    def _on_okx_order(self, order: dict):
+        """OKX order state change pushed to us. Useful for fill confirmation
+        without polling. Just log + delegate; the executor doesn't currently
+        track order IDs in-process so we don't reconcile here.
+        """
+        state = order.get("state", "")
+        inst = order.get("instId", "")
+        if state in ("filled", "canceled", "partially_filled"):
+            log("trade", f"OKX order push {inst} state={state} avgPx={order.get('avgPx')} "
+                         f"fillSz={order.get('fillSz')}", symbol=inst.split("-")[0] if inst else None)
+
+    def _on_okx_position(self, position: dict):
+        """OKX position update. Currently advisory — executor maintains its own
+        in-memory position state. If we later move to OKX-as-source-of-truth,
+        this is the hook to reconcile.
+        """
+        pass
+
+    def _on_okx_balance(self, usdt_avail: float):
+        """OKX USDT availBal pushed to us. Refresh executor balance so brain
+        decisions size against current truth instead of last polled value.
+        """
+        if usdt_avail > 0:
+            self.executor.balance = usdt_avail
+
+    def _sync_okx_subs(self):
+        """Diff open positions against current OKX public-WS subscriptions
+        and sub/unsub the delta. Called from the price-update loop each tick.
+        """
+        if not self.okx_public_ws:
+            return
+        wanted: set[str] = {p.symbol for p in self.executor.positions}
+        new = wanted - self._okx_subbed
+        gone = self._okx_subbed - wanted
+        if new:
+            self.okx_public_ws.subscribe(list(new))
+        if gone:
+            self.okx_public_ws.unsubscribe(list(gone))
+        self._okx_subbed = wanted
 
     def _sync_brain_state(self):
         """Sync executor state into brain so Claude sees current portfolio."""
@@ -405,6 +475,14 @@ class TradingEngine:
         # Start data streams
         self.streams.start()
 
+        # Start OKX WS (live mode + okx exchange only)
+        if self.okx_public_ws:
+            self.okx_public_ws.connect()
+            log("info", "OKX public WS started (dynamic ticker subs for open positions)")
+        if self.okx_private_ws:
+            self.okx_private_ws.connect()
+            log("info", "OKX private WS started (real-time orders/positions/balance)")
+
         # Start processing threads
         threads = [
             ("brain-tick", self._brain_tick_loop),
@@ -424,6 +502,10 @@ class TradingEngine:
         log("info", "Stopping engine...")
         self._stop.set()
         self.streams.stop()
+        if self.okx_public_ws:
+            self.okx_public_ws.disconnect()
+        if self.okx_private_ws:
+            self.okx_private_ws.disconnect()
         if self.memory:
             self.memory.save()
 
