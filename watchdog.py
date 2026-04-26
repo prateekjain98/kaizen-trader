@@ -37,7 +37,11 @@ _REPO_ROOT = Path(__file__).resolve().parent
 STOPS_FILE = _REPO_ROOT / "data" / "watchdog_stops.json"
 DEFAULT_STOP = 0.15   # 15% stop loss
 DEFAULT_TARGET = 0.40  # 40% take profit
-POLL_INTERVAL = 30.0
+# 10s tightened from 30s. Crypto perp flash crashes (small-cap alts) can move
+# 10-20% in seconds; with -4120 rejecting server-side stops, the watchdog is
+# the only safety net and needs to react fast. Binance positionRisk is cheap
+# (1 req every 10s = 6 req/min, well under any rate limit).
+POLL_INTERVAL = 10.0
 
 
 def _log(msg: str) -> None:

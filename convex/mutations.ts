@@ -7,7 +7,7 @@ export const insertPosition = mutation({
     symbol: v.string(),
     productId: v.string(),
     strategy: v.string(),
-    side: v.string(),
+    side: v.union(v.literal("long"), v.literal("short")),
     tier: v.string(),
     entryPrice: v.float64(),
     quantity: v.float64(),
@@ -21,7 +21,7 @@ export const insertPosition = mutation({
     maxHoldMs: v.float64(),
     qualScore: v.float64(),
     signalId: v.string(),
-    status: v.string(),
+    status: v.union(v.literal("open"), v.literal("closing"), v.literal("closed")),
     exitPrice: v.optional(v.float64()),
     closedAt: v.optional(v.float64()),
     pnlUsd: v.optional(v.float64()),
@@ -147,7 +147,8 @@ export const insertTrade = mutation({
   args: {
     tradeId: v.string(),
     positionId: v.string(),
-    side: v.string(),
+    side: v.union(v.literal("long"), v.literal("short"),
+                  v.literal("buy"), v.literal("sell")),
     symbol: v.string(),
     quantity: v.float64(),
     sizeUsd: v.float64(),
@@ -166,7 +167,10 @@ export const insertTrade = mutation({
 export const insertLog = mutation({
   args: {
     logId: v.string(),
-    level: v.string(),
+    level: v.union(
+      v.literal("info"), v.literal("warn"), v.literal("error"),
+      v.literal("trade"), v.literal("debug"), v.literal("critical"),
+    ),
     message: v.string(),
     symbol: v.optional(v.string()),
     strategy: v.optional(v.string()),
@@ -185,7 +189,10 @@ export const insertLogsBatch = mutation({
   args: {
     logs: v.array(v.object({
       logId: v.string(),
-      level: v.string(),
+      level: v.union(
+        v.literal("info"), v.literal("warn"), v.literal("error"),
+        v.literal("trade"), v.literal("debug"), v.literal("critical"),
+      ),
       message: v.string(),
       symbol: v.optional(v.string()),
       strategy: v.optional(v.string()),

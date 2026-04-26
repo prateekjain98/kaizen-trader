@@ -84,6 +84,8 @@ class BinanceProvider:
     def __init__(self) -> None:
         self._leverage_set: set[str] = set()
         self._step_sizes: dict[str, float] = {}
+        self._min_qty: dict[str, float] = {}
+        self._min_notional: dict[str, float] = {}
         self._exchange_info_loaded: bool = False
         self._load_exchange_info()
 
@@ -101,9 +103,12 @@ class BinanceProvider:
                 if not symbol.endswith("USDT"):
                     continue
                 for f in sym_info.get("filters", []):
-                    if f.get("filterType") == "LOT_SIZE":
+                    ftype = f.get("filterType")
+                    if ftype == "LOT_SIZE":
                         self._step_sizes[symbol] = float(f["stepSize"])
-                        break
+                        self._min_qty[symbol] = float(f.get("minQty", 0))
+                    elif ftype == "MIN_NOTIONAL":
+                        self._min_notional[symbol] = float(f.get("notional", 0))
             self._exchange_info_loaded = True
             log("info", f"Binance exchange info cached: {len(self._step_sizes)} USDT pairs")
         except Exception as exc:
@@ -264,6 +269,19 @@ class BinanceProvider:
         if quantity <= 0:
             return _failed_trade(position_id, symbol, side.lower(), f"Invalid quantity after rounding: {quantity}")
 
+        # Enforce LOT_SIZE.minQty and MIN_NOTIONAL.notional client-side so we
+        # don't waste an API call (and a possible -1013 rate-limit hit) on an
+        # order Binance will reject. Also catches sizing bugs where stop_pct
+        # math produces too-small fragments on high-priced symbols.
+        min_qty = self._min_qty.get(binance_symbol, 0)
+        min_notional = self._min_notional.get(binance_symbol, 0)
+        if min_qty and quantity < min_qty:
+            return _failed_trade(position_id, symbol, side.lower(),
+                f"qty {quantity} below minQty {min_qty} for {binance_symbol}")
+        if min_notional and (quantity * market_price) < min_notional:
+            return _failed_trade(position_id, symbol, side.lower(),
+                f"notional ${quantity * market_price:.2f} below MIN_NOTIONAL ${min_notional} for {binance_symbol}")
+
         timestamp = int(time.time() * 1000)
         # newClientOrderId acts as idempotency key — replays of the same params
         # within a session are safely deduped by Binance (returns -2010/4015).
@@ -364,9 +382,14 @@ class BinanceProvider:
         return self._place_order(symbol, position_id, "SELL", quantity, market_price,
                                  reduce_only=reduce_only)
 
-    def get_balances(self) -> dict[str, float]:
+    def get_balances(self) -> dict[str, float] | None:
+        """Return availableBalance per asset, or None if the fetch failed.
+        Callers MUST distinguish None (transient error → keep stale balance)
+        from {} (no positive balances). Previously returned {} on both, which
+        could let _reconcile_balance silently overwrite a real balance with 0
+        if a future caller did `balances.get('USDT', 0)`."""
         if not env.binance_api_key or not env.binance_api_secret:
-            return {}
+            return None
 
         timestamp = int(time.time() * 1000)
         params = f"timestamp={timestamp}"
@@ -391,7 +414,7 @@ class BinanceProvider:
             }
         except Exception as exc:
             log("warn", f"Binance balance fetch failed: {exc}")
-            return {}
+            return None
 
 
 class OKXProvider:
@@ -842,9 +865,11 @@ class OKXProvider:
         return self._place_order(symbol, position_id, "sell", quantity, market_price,
                                  reduce_only=reduce_only)
 
-    def get_balances(self) -> dict[str, float]:
+    def get_balances(self) -> dict[str, float] | None:
+        """Return availBal per ccy, or None on fetch failure (so callers can
+        keep their last known value instead of treating an error as zero)."""
         if not env.okx_api_key or not env.okx_api_secret:
-            return {}
+            return None
 
         request_path = "/api/v5/account/balance"
         timestamp = self._timestamp()
@@ -860,7 +885,7 @@ class OKXProvider:
             result = resp.json()
             if result.get("code") != "0":
                 log("warn", f"OKX balance request returned code {result.get('code')}: {result.get('msg')}")
-                return {}
+                return None
             balances: dict[str, float] = {}
             for account in result.get("data", []):
                 for detail in account.get("details", []):
@@ -871,4 +896,4 @@ class OKXProvider:
             return balances
         except Exception as exc:
             log("warn", f"OKX balance fetch failed: {exc}")
-            return {}
+            return None

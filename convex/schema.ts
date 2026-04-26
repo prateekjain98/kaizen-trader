@@ -7,7 +7,7 @@ export default defineSchema({
     symbol: v.string(),
     productId: v.string(),
     strategy: v.string(),
-    side: v.string(),
+    side: v.union(v.literal("long"), v.literal("short")),
     tier: v.string(),
     entryPrice: v.float64(),
     quantity: v.float64(),
@@ -21,7 +21,7 @@ export default defineSchema({
     maxHoldMs: v.float64(),
     qualScore: v.float64(),
     signalId: v.string(),
-    status: v.string(), // "open" | "closing" | "closed"
+    status: v.union(v.literal("open"), v.literal("closing"), v.literal("closed")),
     exitPrice: v.optional(v.float64()),
     closedAt: v.optional(v.float64()),
     pnlUsd: v.optional(v.float64()),
@@ -47,12 +47,16 @@ export default defineSchema({
     .index("by_strategy", ["strategy"])
     // Compound index for getClosedTrades: avoids scanning unbounded "open"
     // rows where closedAt is undefined, and pre-filters by paperTrading.
-    .index("by_paperTrading_and_closed_at", ["paperTrading", "closedAt"]),
+    .index("by_paperTrading_and_closed_at", ["paperTrading", "closedAt"])
+    // For getWinRateByStrategy and similar — avoids scanning open rows where
+    // closedAt is undefined.
+    .index("by_status_and_closed_at", ["status", "closedAt"]),
 
   trades: defineTable({
     tradeId: v.string(),
     positionId: v.string(),
-    side: v.string(),
+    side: v.union(v.literal("long"), v.literal("short"),
+                  v.literal("buy"), v.literal("sell")),
     symbol: v.string(),
     quantity: v.float64(),
     sizeUsd: v.float64(),
@@ -69,7 +73,10 @@ export default defineSchema({
 
   logs: defineTable({
     logId: v.string(),
-    level: v.string(),
+    level: v.union(
+      v.literal("info"), v.literal("warn"), v.literal("error"),
+      v.literal("trade"), v.literal("debug"), v.literal("critical"),
+    ),
     message: v.string(),
     symbol: v.optional(v.string()),
     strategy: v.optional(v.string()),

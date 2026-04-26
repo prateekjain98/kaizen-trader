@@ -1,4 +1,4 @@
-import { query } from "./_generated/server";
+import { query, internalQuery } from "./_generated/server";
 import { v } from "convex/values";
 
 export const getOpenPositions = query({
@@ -92,7 +92,9 @@ export const getRecentDiagnoses = query({
   },
 });
 
-export const getConfigHistory = query({
+// Locked behind internalQuery — exposes the entire bot strategy config
+// (thresholds, sizing rules, etc.) which a competitor could exploit.
+export const getConfigHistory = internalQuery({
   args: { limit: v.optional(v.float64()) },
   handler: async (ctx, args) => {
     const limit = args.limit ?? 20;

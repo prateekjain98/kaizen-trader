@@ -228,7 +228,13 @@ class Executor:
         except Exception as e:
             log("warn", f"Balance reconcile fetch failed ({reason}): {e}")
             return
-        # Provider returns USDT availableBalance for Binance; OKX returns USDT too.
+        # Provider returns None on fetch failure (keep stale balance), or {}
+        # on no positive balances (genuinely zero — but for a live trading bot
+        # that means something's wrong, so still skip the overwrite to avoid
+        # stomping a non-zero internal value with a possibly-incomplete API
+        # snapshot).
+        if balances is None:
+            return
         live = balances.get("USDT")
         if live is None or live <= 0:
             return
