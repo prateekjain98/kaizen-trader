@@ -396,7 +396,7 @@ class Executor:
             open_position_count=len(self.positions),
             timestamp_ms=time.time() * 1000,
         )
-        verdict = self._protections.check(ctx)
+        verdict = self._protections.can_open(ctx)
         if not verdict.allowed:
             log("info", f"Trade blocked by protection: {verdict.rule_name} — {verdict.reason}")
             return False
