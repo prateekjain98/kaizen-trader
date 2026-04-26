@@ -14,6 +14,8 @@ import os
 import threading
 import time
 import uuid
+
+import requests
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,6 +213,10 @@ class Executor:
 
     def _reconcile_balance(self, reason: str = "periodic") -> None:
         """Overwrite self.balance with the exchange's reported availableBalance.
+        Also reconciles position list — any local position that disappeared
+        from the exchange (watchdog-closed, manual close, liquidation) is
+        force-removed from self.positions so daily_pnl, has_position, and
+        capital tracking don't go stale.
         No-op in paper mode or when no provider is configured. Logs drifts > $1
         so silent divergence is visible."""
         if self.paper or self._binance is None:
@@ -230,6 +236,51 @@ class Executor:
             self.balance = live
         if abs(drift) >= 1:
             log("info", f"Balance reconciled ({reason}): ${old:.2f} → ${live:.2f} (drift ${drift:+.2f})")
+        # Position-state reconcile (Binance only — OKX private WS handles its own).
+        if self._binance.name == "binance":
+            self._reconcile_positions(reason)
+
+    def _reconcile_positions(self, reason: str) -> None:
+        """Drop any local position that no longer exists on the exchange.
+        This catches watchdog-closed, manually-closed, or liquidated positions
+        that the bot would otherwise still track in self.positions.
+        Without this, has_position() blocks re-entry and daily_pnl/protections
+        stay blind to the loss."""
+        try:
+            timestamp = int(time.time() * 1000)
+            params = f"timestamp={timestamp}"
+            sig = hmac.new(
+                env.binance_api_secret.encode(), params.encode(), "sha256"
+            ).hexdigest()
+            resp = requests.get(
+                f"{self._binance.FAPI_BASE}/fapi/v2/positionRisk",
+                headers={"X-MBX-APIKEY": env.binance_api_key},
+                params={"timestamp": timestamp, "signature": sig},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            live_symbols = {
+                p["symbol"].replace("USDT", "")
+                for p in resp.json() if abs(float(p.get("positionAmt", 0))) > 0
+            }
+        except Exception as e:
+            log("warn", f"Position reconcile fetch failed ({reason}): {e}")
+            return
+
+        with self._lock:
+            ghosts = [p for p in self.positions if p.symbol not in live_symbols]
+            self.positions = [p for p in self.positions if p.symbol in live_symbols]
+
+        for pos in ghosts:
+            # We don't know the exit price/PnL — log loudly and clear the
+            # watchdog stop entry. Daily PnL stays blind to this trade (better
+            # than crediting wrong PnL). Operator should investigate via
+            # journal/exchange UI.
+            log("warn", f"Position reconcile ({reason}): {pos.symbol} disappeared from exchange "
+                f"— removed locally; PnL not credited (check exchange for actual close)")
+            self._clear_watchdog_stop(pos.symbol)
+        if ghosts:
+            self._save_state()
 
     def _load_state(self):
         """Load portfolio state from JSON if it exists."""
@@ -377,14 +428,22 @@ class Executor:
                     return None
                 entry_price = trade.price if trade.price > 0 else entry_price
                 quantity = trade.quantity if trade.quantity > 0 else quantity
-
-                # Binance: separate server-side SL+TP call. (OKX's were attached above.)
-                if self._binance.name != "okx":
-                    self._place_server_side_stops(decision.symbol, decision.side,
-                                                   quantity, entry_price, decision.stop_pct, decision.target_pct)
             except Exception as e:
                 log("error", f"Execution error: {decision.symbol}: {e}")
                 return None
+
+            # Stop placement is best-effort — if it raises, the position is
+            # ALREADY filled on the exchange; we MUST still record it locally
+            # (otherwise it becomes a ghost position with no bot tracking and
+            # no watchdog stop entry). The watchdog file written below is the
+            # safety net when -4120 rejects server-side stops.
+            if self._binance.name != "okx":
+                try:
+                    self._place_server_side_stops(decision.symbol, decision.side,
+                                                   quantity, entry_price, decision.stop_pct, decision.target_pct)
+                except Exception as e:
+                    log("error", f"Server-side stops failed for {decision.symbol}: {e} "
+                        f"— position will be tracked locally; watchdog handles risk")
 
         with self._lock:
             self.balance -= (size + entry_commission)

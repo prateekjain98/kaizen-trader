@@ -180,6 +180,30 @@ class BinanceProvider:
         resp.raise_for_status()
         return resp.json()
 
+    def _query_order_by_cl_ord_id(self, binance_symbol: str, cl_ord_id: str) -> dict:
+        """GET a single order's state from Binance using the client order ID
+        (origClientOrderId). Used for orphan recovery after network timeouts."""
+        if not env.binance_api_secret or not env.binance_api_key:
+            return {}
+        time.sleep(0.1)
+        timestamp = int(time.time() * 1000)
+        params = f"symbol={binance_symbol}&origClientOrderId={cl_ord_id}&timestamp={timestamp}"
+        signature = hmac.new(
+            env.binance_api_secret.encode(), params.encode(), "sha256"
+        ).hexdigest()
+        resp = requests.get(
+            f"{self.FAPI_BASE}/fapi/v1/order",
+            headers={"X-MBX-APIKEY": env.binance_api_key},
+            params={"symbol": binance_symbol, "origClientOrderId": cl_ord_id,
+                    "timestamp": timestamp, "signature": signature},
+            timeout=10,
+        )
+        # 404 with -2013 means the order was never accepted — return empty.
+        if resp.status_code == 400 and "-2013" in resp.text:
+            return {}
+        resp.raise_for_status()
+        return resp.json()
+
     def _query_order(self, binance_symbol: str, order_id: int) -> dict:
         """GET a single order's current state from Binance Futures."""
         if not env.binance_api_secret or not env.binance_api_key:
@@ -291,6 +315,31 @@ class BinanceProvider:
         except requests.exceptions.HTTPError as exc:
             body = exc.response.text if exc.response is not None else "no response"
             safe_msg = f"Binance {side} order failed: {exc.response.status_code if exc.response else '?'} {body}"
+            log("error", safe_msg, symbol=symbol)
+            return _failed_trade(position_id, symbol, side.lower(), safe_msg)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            # Critical: the request may have reached Binance and filled. Query
+            # by clientOrderId (= position_id[:36], the idempotency key) before
+            # declaring failure — otherwise we orphan a live position.
+            cl_ord_id = position_id[:36]
+            log("warn", f"Binance {side} {symbol}: {type(exc).__name__} — querying order by clOrdId for orphan check")
+            try:
+                recovered = self._query_order_by_cl_ord_id(binance_symbol, cl_ord_id)
+                if recovered and recovered.get("status") in ("FILLED", "PARTIALLY_FILLED"):
+                    avg_price = float(recovered.get("avgPrice") or market_price)
+                    filled_qty = float(recovered.get("executedQty") or quantity)
+                    log("trade", f"Recovered orphaned fill: {symbol} {filled_qty} @ {avg_price}",
+                        symbol=symbol)
+                    return Trade(
+                        id=str(uuid.uuid4()), position_id=position_id, side=side.lower(),
+                        symbol=symbol, quantity=filled_qty, size_usd=filled_qty * avg_price,
+                        price=avg_price, order_id=str(recovered.get("orderId", "")),
+                        status="filled", paper_trading=False,
+                        placed_at=time.time() * 1000,
+                    )
+            except Exception as recover_exc:
+                log("error", f"Orphan-recovery query failed for {symbol}: {recover_exc}")
+            safe_msg = f"Binance {side} order failed ({type(exc).__name__}: {exc})"
             log("error", safe_msg, symbol=symbol)
             return _failed_trade(position_id, symbol, side.lower(), safe_msg)
         except Exception as exc:
@@ -442,10 +491,17 @@ class OKXProvider:
     # ── Quantity helpers ───────────────────────────────────────────────
 
     def _round_contracts(self, inst_id: str, contracts: float) -> float:
-        """Round contract count down to the instrument's lot size."""
+        """Round contract count down to the instrument's lot size.
+        Strip trailing float-precision artifacts (e.g. 2.0000000000000004) by
+        rounding to the lotSz's implied decimal count — same fix as
+        BinanceProvider._round_step. Without this OKX rejects on micro-lot
+        instruments (lotSz < 1) with precision errors."""
         info = self._instruments.get(inst_id)
         if info and info["lotSz"] > 0:
-            return math.floor(contracts / info["lotSz"]) * info["lotSz"]
+            lot = info["lotSz"]
+            raw = math.floor(contracts / lot) * lot
+            decimals = max(0, -int(math.floor(math.log10(lot)))) if lot < 1 else 0
+            return round(raw, decimals)
         return math.floor(contracts)
 
     def _usd_to_contracts(self, inst_id: str, size_usd: float, market_price: float) -> float:
