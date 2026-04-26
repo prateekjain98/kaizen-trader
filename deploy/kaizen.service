@@ -7,7 +7,10 @@ Wants=network-online.target
 Type=simple
 User=prateekjain
 WorkingDirectory=/home/prateekjain/kaizen-trader
-ExecStart=/home/prateekjain/kaizen-trader/.venv/bin/python -m src.engine.runner --live --auto-balance --tick 60 --confirm
+ExecStart=/home/prateekjain/kaizen-trader/.venv/bin/python -m src.engine.runner ${KAIZEN_RUNNER_FLAGS} --auto-balance --tick 60 --confirm
+# KAIZEN_RUNNER_FLAGS goes in the .env file. Use `--live` for live trading;
+# leave empty for paper mode. This makes the unit identical across modes
+# and lets you flip with a one-line env change + systemctl restart.
 Restart=on-failure
 RestartSec=10
 EnvironmentFile=-/home/prateekjain/kaizen-trader/.env
