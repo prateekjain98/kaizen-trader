@@ -104,7 +104,8 @@ class TradingEngine:
     Cost: ~$0.50/day at 60s ticks.
     """
 
-    def __init__(self, paper: bool = True, balance: float = 10_000, tick_interval: int = 60):
+    def __init__(self, paper: bool = True, balance: float = 10_000, tick_interval: int = 60,
+                 trust_initial_balance: bool = False):
         self.paper = paper
         self.tick_interval = tick_interval
         self._stop = threading.Event()
@@ -121,7 +122,8 @@ class TradingEngine:
             self.brain = RuleBrain(balance=balance)
             log("info", "Brain: RuleBrain (no ANTHROPIC_API_KEY — zero API cost)")
 
-        self.executor = Executor(paper=paper, initial_balance=balance)
+        self.executor = Executor(paper=paper, initial_balance=balance,
+                                 trust_initial_balance=trust_initial_balance)
         self.streams = DataStreams(on_signal=self._on_raw_signal)
         self.memory = BrainMemory()
         self.memory.load()
@@ -573,12 +575,8 @@ def main():
     # If --auto-balance pulled fresh from the exchange, mark the balance as
     # trusted so the executor's state-restore doesn't clobber it with a stale
     # value from disk. Without this, mid-session deposits go unnoticed.
-    engine = TradingEngine(paper=paper_mode, balance=args.balance, tick_interval=args.tick)
-    engine.executor._trust_initial_balance = bool(args.auto_balance)
-    # Re-load state now that the trust flag is set, so the balance restoration
-    # logic respects it. (Constructor already loaded once with trust=False default.)
-    engine.executor.balance = args.balance
-    engine.executor._load_state()
+    engine = TradingEngine(paper=paper_mode, balance=args.balance, tick_interval=args.tick,
+                           trust_initial_balance=bool(args.auto_balance))
     try:
         engine.run_forever()
     finally:
