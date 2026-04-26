@@ -110,11 +110,23 @@ class BinanceProvider:
             log("warn", f"Failed to load Binance exchange info: {exc}")
 
     def _round_step(self, binance_symbol: str, qty: float) -> float:
-        """Round quantity down to the symbol's LOT_SIZE step size."""
+        """Round quantity down to the symbol's LOT_SIZE step size.
+
+        Float arithmetic can leave trailing precision drift even after flooring
+        to step (e.g. math.floor(46.1/0.1)*0.1 = 46.10000000000001), which
+        Binance rejects with -1111 "Precision is over the maximum". Round to
+        the decimal count implied by step to scrub it.
+        """
         step = self._step_sizes.get(binance_symbol)
-        if step and step > 0:
-            return math.floor(qty / step) * step
-        return qty
+        if not step or step <= 0:
+            return qty
+        rounded = math.floor(qty / step) * step
+        # Decimals from step: 0.001 -> 3, 1.0 -> 0, 0.5 -> 1.
+        if step >= 1:
+            decimals = 0
+        else:
+            decimals = max(0, -int(math.floor(math.log10(step))))
+        return round(rounded, decimals)
 
     @property
     def name(self) -> str:
