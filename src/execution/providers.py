@@ -185,6 +185,25 @@ class BinanceProvider:
         resp.raise_for_status()
         return resp.json()
 
+    def _cancel_order(self, binance_symbol: str, order_id) -> None:
+        """DELETE a resting order. Used to clean up partial-fill remainders."""
+        if not env.binance_api_secret or not env.binance_api_key:
+            return
+        timestamp = int(time.time() * 1000)
+        params = f"symbol={binance_symbol}&orderId={order_id}&timestamp={timestamp}"
+        sig = hmac.new(env.binance_api_secret.encode(), params.encode(), "sha256").hexdigest()
+        resp = requests.delete(
+            f"{self.FAPI_BASE}/fapi/v1/order",
+            headers={"X-MBX-APIKEY": env.binance_api_key},
+            params={"symbol": binance_symbol, "orderId": order_id,
+                    "timestamp": timestamp, "signature": sig},
+            timeout=10,
+        )
+        # -2011 = unknown order (already filled/cancelled) — not an error.
+        if resp.status_code == 400 and "-2011" in resp.text:
+            return
+        resp.raise_for_status()
+
     def _query_order_by_cl_ord_id(self, binance_symbol: str, cl_ord_id: str) -> dict:
         """GET a single order's state from Binance using the client order ID
         (origClientOrderId). Used for orphan recovery after network timeouts."""
@@ -318,6 +337,19 @@ class BinanceProvider:
 
             if status not in ("FILLED", ""):
                 log("warn", f"Order {order_id} final status: {status}", symbol=symbol)
+
+            # PARTIALLY_FILLED at poll exhaustion means the remainder is still
+            # a live resting order. We must cancel it before returning, or the
+            # bot records a fully-closed position while a fragment hangs on
+            # the exchange.
+            if status == "PARTIALLY_FILLED" and order_id:
+                try:
+                    self._cancel_order(binance_symbol, order_id)
+                    log("warn", f"Cancelled remainder of partially-filled order {order_id} "
+                        f"(filled {filled_qty}/{quantity})", symbol=symbol)
+                except Exception as cancel_exc:
+                    log("error", f"Failed to cancel partial-fill remainder for {order_id}: "
+                        f"{cancel_exc} — manual cleanup needed", symbol=symbol)
 
             log("trade", f"Binance {side} filled: {binance_symbol} {filled_qty} @ {avg_price}",
                 symbol=symbol, data={"order_id": order_id, "avg_price": avg_price})

@@ -127,8 +127,15 @@ class Executor:
         the local state file is manually edited.
         """
         from collections import deque
+        from src.risk.protections import ProtectionChain, DEFAULT_PROTECTIONS
         self.paper = paper
         self.balance = initial_balance
+        # Layered protections: cooldown after consecutive stops, daily loss
+        # cap, max drawdown, rapid-DD halt. Without this only MAX_DAILY_LOSS
+        # was enforced (in can_trade) — the engine path bypassed
+        # src/risk/portfolio.py entirely. The bot would happily keep entering
+        # after 3 consecutive -10% stops with no cooldown.
+        self._protections = ProtectionChain.from_config(DEFAULT_PROTECTIONS)
         self._trust_initial_balance = trust_initial_balance
         self.positions: list[Position] = []
         # Bounded so the in-process list cannot grow without limit on a long-running bot.
@@ -376,6 +383,19 @@ class Executor:
         if self.daily_pnl <= -self.MAX_DAILY_LOSS:
             return False
         if self.balance < 5:  # Allow trading on small accounts
+            return False
+        # Run the full protection chain (cooldown after stops, drawdown halt,
+        # rapid-DD halt). Logs the rule that blocked entry so behavior is
+        # auditable.
+        from src.risk.protections import ProtectionContext
+        ctx = ProtectionContext(
+            realized_pnl_today=self.daily_pnl,
+            open_position_count=len(self.positions),
+            timestamp_ms=time.time() * 1000,
+        )
+        verdict = self._protections.check(ctx)
+        if not verdict.allowed:
+            log("info", f"Trade blocked by protection: {verdict.rule_name} — {verdict.reason}")
             return False
         return True
 
@@ -679,6 +699,15 @@ class Executor:
         # Drop watchdog stop entry so it doesn't fire on a re-opened symbol
         # using the previous trade's parameters.
         self._clear_watchdog_stop(pos.symbol)
+
+        # Feed the protection chain so StoplossGuard / Cooldown / Drawdown
+        # rules update their state. Without this they never fire on the
+        # engine path.
+        try:
+            pos.exit_reason = reason  # ensure StoplossGuard sees the reason
+            self._protections.notify_close(pos, pnl_usd)
+        except Exception as e:
+            log("warn", f"Protection chain notify_close failed: {e}")
 
         trail_info = f" (trailed from ${pos.entry_price*(1-pos.stop_pct):.4f} to ${pos.trailing_stop_price:.4f})" if pos.trailing_stop_price > 0 else ""
         log("trade", f"CLOSE {pos.symbol} {reason} ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%) "
