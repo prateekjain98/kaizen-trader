@@ -30,14 +30,20 @@ jobs:
             --tunnel-through-iap \
             --command='
               set -euo pipefail
-              cd /home/prateekjain/kaizen-trader
-              git fetch origin main
-              git reset --hard origin/main
-              source .venv/bin/activate
-              pip install -q -r requirements.txt 2>&1 | tail -3
-              # Reinstall systemd units in case they changed
-              sudo cp deploy/kaizen.service /etc/systemd/system/kaizen.service
-              sudo cp deploy/kaizen-watchdog.service /etc/systemd/system/kaizen-watchdog.service
+              # WIF SSH lands as an ephemeral OS-Login user (sa_<uid>), not the
+              # repo owner (prateekjain). git refuses to operate on a repo it
+              # doesn'\''t own; sudo -u flips us to the owning user for git
+              # commands and pip install. systemctl needs sudo separately.
+              sudo -u prateekjain -H bash -c "
+                set -euo pipefail
+                cd /home/prateekjain/kaizen-trader
+                git fetch origin main
+                git reset --hard origin/main
+                source .venv/bin/activate
+                pip install -q -r requirements.txt 2>&1 | tail -3
+              "
+              sudo cp /home/prateekjain/kaizen-trader/deploy/kaizen.service /etc/systemd/system/kaizen.service
+              sudo cp /home/prateekjain/kaizen-trader/deploy/kaizen-watchdog.service /etc/systemd/system/kaizen-watchdog.service
               sudo systemctl daemon-reload
               sudo systemctl restart kaizen kaizen-watchdog
               sleep 8
