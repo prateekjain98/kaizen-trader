@@ -115,10 +115,18 @@ class Executor:
     COMMISSION_PCT = 0.00075    # Binance with BNB discount
     TRAIL_ACTIVATION = 1.5      # Start trailing after 1.5x stop distance profit
 
-    def __init__(self, paper: bool = True, initial_balance: float = 10_000):
+    def __init__(self, paper: bool = True, initial_balance: float = 10_000,
+                 trust_initial_balance: bool = False):
+        """trust_initial_balance: when True (set by --auto-balance path), the
+        balance passed in is fresh from the exchange, so don't let _load_state
+        clobber it with a stale value from disk. Open positions still restore.
+        Without this, depositing funds during a session has no effect until
+        the local state file is manually edited.
+        """
         from collections import deque
         self.paper = paper
         self.balance = initial_balance
+        self._trust_initial_balance = trust_initial_balance
         self.positions: list[Position] = []
         # Bounded so the in-process list cannot grow without limit on a long-running bot.
         # 500 closed trades = ~6+ months at 2-3 trades/day. _save_state still keeps the
@@ -158,7 +166,10 @@ class Executor:
                 with open(_PORTFOLIO_FILE) as f:
                     state = json.load(f)
                 with self._lock:
-                    self.balance = state.get("balance", self.balance)
+                    # Skip restoring balance when caller already fetched it live
+                    # from the exchange (--auto-balance) — disk state would be stale.
+                    if not self._trust_initial_balance:
+                        self.balance = state.get("balance", self.balance)
                     self.total_commissions = state.get("total_commissions", 0)
                     # Restore positions
                     for p in state.get("positions", []):

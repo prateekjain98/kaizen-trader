@@ -570,7 +570,15 @@ def main():
     else:
         paper_env = os.environ.get("PAPER_TRADING", "true").lower()
         paper_mode = paper_env not in ("false", "0", "no", "off")
+    # If --auto-balance pulled fresh from the exchange, mark the balance as
+    # trusted so the executor's state-restore doesn't clobber it with a stale
+    # value from disk. Without this, mid-session deposits go unnoticed.
     engine = TradingEngine(paper=paper_mode, balance=args.balance, tick_interval=args.tick)
+    engine.executor._trust_initial_balance = bool(args.auto_balance)
+    # Re-load state now that the trust flag is set, so the balance restoration
+    # logic respects it. (Constructor already loaded once with trust=False default.)
+    engine.executor.balance = args.balance
+    engine.executor._load_state()
     try:
         engine.run_forever()
     finally:
