@@ -206,7 +206,7 @@ class Executor:
                         "reason": t.exit_reason, "closed_at": t.closed_at,
                         "commissions": t.position.entry_commission + t.exit_commission,
                     }
-                    for t in self.closed_trades[-50:]  # keep last 50
+                    for t in list(self.closed_trades)[-50:]  # deque needs list() before slicing
                 ],
                 "total_pnl": sum(t.pnl_usd for t in self.closed_trades),
                 "total_commissions": self.total_commissions,
