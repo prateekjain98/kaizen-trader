@@ -1,4 +1,4 @@
-import { mutation } from "./_generated/server";
+import { mutation, internalMutation } from "./_generated/server";
 import { v } from "convex/values";
 
 export const insertPosition = mutation({
@@ -104,7 +104,9 @@ export const updatePositionClose = mutation({
   },
 });
 
-export const deletePositionById = mutation({
+// Admin-only: locked behind internalMutation so it cannot be called over
+// the public HTTP API. Run via Convex dashboard or scheduled jobs.
+export const deletePositionById = internalMutation({
   args: { positionId: v.string() },
   handler: async (ctx, args) => {
     const existing = await ctx.db
@@ -119,7 +121,8 @@ export const deletePositionById = mutation({
   },
 });
 
-export const deduplicateOpenPositions = mutation({
+// Admin-only.
+export const deduplicateOpenPositions = internalMutation({
   args: {},
   handler: async (ctx) => {
     const open = await ctx.db
@@ -304,7 +307,9 @@ export const insertTradeJournal = mutation({
   },
 });
 
-export const clearAllData = mutation({
+// Admin-only — wipes the entire trading database. Convert kept here for
+// emergency use only via the Convex dashboard.
+export const clearAllData = internalMutation({
   args: {},
   handler: async (ctx) => {
     const tables = [
@@ -380,7 +385,8 @@ export const insertMetrics = mutation({
   },
 });
 
-export const deleteByExitReason = mutation({
+// Admin-only.
+export const deleteByExitReason = internalMutation({
   args: { exitReason: v.string() },
   handler: async (ctx, args) => {
     const positions = await ctx.db.query("positions").take(500);
@@ -395,7 +401,8 @@ export const deleteByExitReason = mutation({
   },
 });
 
-export const deleteClosedPositions = mutation({
+// Admin-only.
+export const deleteClosedPositions = internalMutation({
   args: {},
   handler: async (ctx) => {
     const closed = await ctx.db

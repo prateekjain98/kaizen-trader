@@ -10,6 +10,7 @@ Fixes applied:
 
 import hmac
 import json
+import os
 import threading
 import time
 import uuid
@@ -163,6 +164,50 @@ class Executor:
         # +/- accounting drifts from reality due to fee tier mismatches, fill
         # slippage, and cross-margin model differences. Trust the exchange.
         self._reconcile_balance(reason="startup")
+
+        # Re-emit watchdog stop file from any restored open positions, so a
+        # crash/redeploy doesn't leave the watchdog firing at default 15% on
+        # positions intended to stop at 5-8%.
+        if not self.paper:
+            for pos in self.positions:
+                self._sync_watchdog_stop(pos)
+
+    # Watchdog stop sync — writes per-symbol stop/target to /tmp/watchdog_stops.json
+    # so the watchdog uses the SAME percentages as the bot, not its 15%/40% defaults.
+    # Without this, watchdog would only fire 3x past intended stop on -4120-rejected
+    # server-side stops (the failure mode currently in production).
+    _WATCHDOG_STOPS_FILE = "/tmp/watchdog_stops.json"
+
+    def _read_watchdog_stops(self) -> dict:
+        try:
+            with open(self._WATCHDOG_STOPS_FILE) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _write_watchdog_stops_atomic(self, data: dict) -> None:
+        tmp = f"{self._WATCHDOG_STOPS_FILE}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._WATCHDOG_STOPS_FILE)
+        except Exception as e:
+            log("warn", f"Failed to write watchdog stops file: {e}")
+
+    def _sync_watchdog_stop(self, pos: Position) -> None:
+        if self.paper:
+            return
+        data = self._read_watchdog_stops()
+        data[pos.symbol] = {"stop": pos.stop_pct, "target": pos.target_pct}
+        self._write_watchdog_stops_atomic(data)
+
+    def _clear_watchdog_stop(self, symbol: str) -> None:
+        if self.paper:
+            return
+        data = self._read_watchdog_stops()
+        if symbol in data:
+            del data[symbol]
+            self._write_watchdog_stops_atomic(data)
 
     def _reconcile_balance(self, reason: str = "periodic") -> None:
         """Overwrite self.balance with the exchange's reported availableBalance.
@@ -360,6 +405,9 @@ class Executor:
             self.positions.append(pos)
 
         self._save_state()
+        # Sync per-symbol stop/target into watchdog file so the watchdog uses
+        # the SAME thresholds as the bot (not its 15%/40% defaults).
+        self._sync_watchdog_stop(pos)
         log("trade", f"OPEN {pos.side.upper()} {pos.symbol} ${size:.0f} @ ${entry_price:.4f} "
             f"stop=${pos.stop_price:.4f} target=${pos.target_price:.4f} fee=${entry_commission:.3f}")
         return pos
@@ -561,6 +609,9 @@ class Executor:
         # Reconcile after settle so the next sizing call uses the real
         # post-close exchange balance, not our rough internal math.
         self._reconcile_balance(reason="post-close")
+        # Drop watchdog stop entry so it doesn't fire on a re-opened symbol
+        # using the previous trade's parameters.
+        self._clear_watchdog_stop(pos.symbol)
 
         trail_info = f" (trailed from ${pos.entry_price*(1-pos.stop_pct):.4f} to ${pos.trailing_stop_price:.4f})" if pos.trailing_stop_price > 0 else ""
         log("trade", f"CLOSE {pos.symbol} {reason} ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%) "
