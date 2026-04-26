@@ -24,4 +24,33 @@ crons.interval(
   internal.aggregations.cleanupOldMetrics
 );
 
+// Daily cleanups for the previously-unbounded tables. Each cleanup is bounded
+// to 500 rows per call; if a backlog exists, repeated cron fires drain it
+// gradually instead of OOMing the mutation.
+crons.interval(
+  "cleanup_closed_positions",
+  { hours: 24 },
+  internal.aggregations.cleanupOldClosedPositions
+);
+crons.interval(
+  "cleanup_old_trades",
+  { hours: 24 },
+  internal.aggregations.cleanupOldTrades
+);
+crons.interval(
+  "cleanup_old_diagnoses",
+  { hours: 24 },
+  internal.aggregations.cleanupOldDiagnoses
+);
+crons.interval(
+  "cleanup_old_journal",
+  { hours: 24 },
+  internal.aggregations.cleanupOldJournal
+);
+crons.interval(
+  "cleanup_old_config_history",
+  { hours: 24 },
+  internal.aggregations.cleanupOldConfigHistory
+);
+
 export default crons;

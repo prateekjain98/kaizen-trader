@@ -64,7 +64,8 @@ export default defineSchema({
     placedAt: v.float64(),
   })
     .index("by_position", ["positionId"])
-    .index("by_status", ["status"]),
+    .index("by_status", ["status"])
+    .index("by_placedAt", ["placedAt"]),
 
   logs: defineTable({
     logId: v.string(),

@@ -208,11 +208,17 @@ class BinanceWebSocket:
 
     def disconnect(self):
         self._stop.set()
-        if self._ws:
+        # websocket-client occasionally throws AttributeError ('NoneType' has no
+        # attribute 'sock') if close() races with the socket being torn down by
+        # run_forever's teardown. Swallow it; the connection is already going
+        # away and we don't care about a clean farewell handshake here.
+        if self._ws is not None:
             try:
+                self._ws.keep_running = False
                 self._ws.close()
-            except Exception:
+            except (AttributeError, OSError, Exception):
                 pass
+        self._ws = None
         self._status = "disconnected"
 
     def is_connected(self) -> bool:

@@ -100,3 +100,94 @@ export const cleanupOldMetrics = internalMutation({
     }
   },
 });
+
+/**
+ * Delete closed positions older than 90 days. Recent trades stay queryable;
+ * historical analytics should already be aggregated into metrics by then.
+ * Uses by_paperTrading_and_closed_at when filtering, here scans full table
+ * because we don't filter by paperTrading.
+ */
+export const cleanupOldClosedPositions = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    const old = await ctx.db
+      .query("positions")
+      .withIndex("by_closed_at", (q) => q.lt("closedAt", cutoff))
+      .take(500);
+    for (const p of old) {
+      await ctx.db.delete(p._id);
+    }
+  },
+});
+
+/**
+ * Delete trades older than 90 days. Trade rows are entry/exit records linked
+ * to positions; once the position is gone, the trade row has no reader.
+ */
+export const cleanupOldTrades = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    const old = await ctx.db
+      .query("trades")
+      .withIndex("by_placedAt", (q) => q.lt("placedAt", cutoff))
+      .take(500);
+    for (const t of old) {
+      await ctx.db.delete(t._id);
+    }
+  },
+});
+
+/**
+ * Delete diagnoses older than 90 days. Self-healer learning history.
+ * Recent ones drive parameter adaptation; older ones are pure storage cost.
+ */
+export const cleanupOldDiagnoses = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    const old = await ctx.db
+      .query("diagnoses")
+      .withIndex("by_timestamp", (q) => q.lt("timestamp", cutoff))
+      .take(500);
+    for (const d of old) {
+      await ctx.db.delete(d._id);
+    }
+  },
+});
+
+/**
+ * Delete journal entries older than 90 days.
+ */
+export const cleanupOldJournal = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    const old = await ctx.db
+      .query("tradeJournal")
+      .withIndex("by_timestamp", (q) => q.lt("timestamp", cutoff))
+      .take(500);
+    for (const j of old) {
+      await ctx.db.delete(j._id);
+    }
+  },
+});
+
+/**
+ * Delete config-history snapshots older than 30 days. Each healing event
+ * snapshots the full config; at high healing frequencies this grows fast.
+ */
+export const cleanupOldConfigHistory = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const old = await ctx.db
+      .query("scannerConfigHistory")
+      .withIndex("by_timestamp", (q) => q.lt("timestamp", cutoff))
+      .take(500);
+    for (const c of old) {
+      await ctx.db.delete(c._id);
+    }
+  },
+});

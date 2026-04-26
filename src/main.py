@@ -1552,11 +1552,14 @@ def main() -> None:
             register_open(pos)
             if pos.strategy == "fear_greed_contrarian":
                 fgi_on_position_opened(pos.symbol)
+        # Bumped to "warn" so position-restore lifecycle events make it into Convex
+        # (info-level is now stdout-only). Restoration is a critical event we want
+        # in audit history if it ever fails or restores an unexpected count.
         if existing_open:
-            log("info", f"Restored {len(existing_open)} open positions into in-memory tracking",
+            log("warn", f"Restored {len(existing_open)} open positions into in-memory tracking",
                 data={"symbols": [p.symbol for p in existing_open]})
         else:
-            log("info", "No open positions to restore")
+            log("warn", "No open positions to restore")
     except Exception as e:
         log("warn", f"Failed to restore open positions: {e}")
 

@@ -347,12 +347,15 @@ export const closeOrphanedPositions = mutation({
       .take(BATCH);
     let closed = 0;
     for (const pos of open) {
+      // Do NOT write pnlUsd/pnlPct: these positions were orphaned (we don't
+      // know the actual exit price). Writing 0 polluted win-rate / Sharpe /
+      // metrics queries by counting them as breakeven. Leave fields undefined
+      // and require analytics queries to filter exit_reason="orphaned_restart"
+      // (or any future synthetic close reason).
       await ctx.db.patch(pos._id, {
         status: "closed",
         exitReason: args.exitReason,
         closedAt: args.closedAt,
-        pnlUsd: 0,
-        pnlPct: 0,
       });
       closed++;
     }

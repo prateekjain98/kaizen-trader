@@ -47,18 +47,24 @@ class Position:
 
     @property
     def stop_price(self) -> float:
-        """Current stop — uses trailing stop if it's been moved up."""
+        """Current stop — uses trailing stop if it's been moved up.
+
+        Rounded to 10 dp to remove float-precision drift in the multiplication
+        (e.g. 100.0 * 1.10 = 110.00000000000001). At real exchange tick sizes
+        this is invisible, but it removes a class of off-by-an-epsilon
+        comparison bugs in the trigger conditions.
+        """
         if self.trailing_stop_price > 0:
-            return self.trailing_stop_price
+            return round(self.trailing_stop_price, 10)
         if self.side == "long":
-            return self.entry_price * (1 - self.stop_pct)
-        return self.entry_price * (1 + self.stop_pct)
+            return round(self.entry_price * (1 - self.stop_pct), 10)
+        return round(self.entry_price * (1 + self.stop_pct), 10)
 
     @property
     def target_price(self) -> float:
         if self.side == "long":
-            return self.entry_price * (1 + self.target_pct)
-        return self.entry_price * (1 - self.target_pct)
+            return round(self.entry_price * (1 + self.target_pct), 10)
+        return round(self.entry_price * (1 - self.target_pct), 10)
 
     @property
     def unrealized_pnl_pct(self) -> float:
@@ -256,22 +262,40 @@ class Executor:
 
             quantity = size / entry_price
 
-        # Execute on Binance (live mode) — outside lock to avoid blocking
+        # Execute on exchange (live mode) — outside lock to avoid blocking
         if not self.paper and self._binance:
             try:
                 side_str = "BUY" if decision.side == "long" else "SELL"
-                trade = self._binance._place_order(
-                    decision.symbol, decision.signal_id, side_str, quantity, entry_price
-                )
+                # OKX supports attached server-side OCO (SL+TP) on the entry order
+                # itself, atomic with the fill. Binance requires a separate call
+                # after the entry — handled below via _place_server_side_stops.
+                attach_sl = attach_tp = None
+                if self._binance.name == "okx":
+                    if decision.side == "long":
+                        attach_sl = entry_price * (1 - decision.stop_pct)
+                        attach_tp = entry_price * (1 + decision.target_pct)
+                    else:
+                        attach_sl = entry_price * (1 + decision.stop_pct)
+                        attach_tp = entry_price * (1 - decision.target_pct)
+                    trade = self._binance._place_order(
+                        decision.symbol, decision.signal_id, side_str.lower(),
+                        quantity, entry_price,
+                        attach_sl_px=attach_sl, attach_tp_px=attach_tp,
+                    )
+                else:
+                    trade = self._binance._place_order(
+                        decision.symbol, decision.signal_id, side_str, quantity, entry_price
+                    )
                 if trade.status == "failed":
-                    log("warn", f"Binance order failed: {decision.symbol}: {trade.error}")
+                    log("warn", f"{self._binance.name} order failed: {decision.symbol}: {trade.error}")
                     return None
                 entry_price = trade.price if trade.price > 0 else entry_price
                 quantity = trade.quantity if trade.quantity > 0 else quantity
 
-                # Place server-side stop loss + take profit (OCO)
-                self._place_server_side_stops(decision.symbol, decision.side,
-                                               quantity, entry_price, decision.stop_pct, decision.target_pct)
+                # Binance: separate server-side SL+TP call. (OKX's were attached above.)
+                if self._binance.name != "okx":
+                    self._place_server_side_stops(decision.symbol, decision.side,
+                                                   quantity, entry_price, decision.stop_pct, decision.target_pct)
             except Exception as e:
                 log("error", f"Execution error: {decision.symbol}: {e}")
                 return None

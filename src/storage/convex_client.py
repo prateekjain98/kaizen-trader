@@ -137,8 +137,11 @@ class ConvexStorage:
                 else:
                     logger.error(f"Failed to call {mutation_name} "
                                  f"after {retries} attempt(s): {exc}")
-                    if mutation_name in self._CRITICAL_MUTATIONS:
-                        self._write_dead_letter(mutation_name, args, str(exc))
+                    # Dead-letter EVERY failed mutation, not just CRITICAL ones.
+                    # Convex blips would otherwise silently lose diagnoses,
+                    # config snapshots, journal entries, metrics, and batched logs.
+                    # The 50MB cap on the dead-letter file prevents disk exhaustion.
+                    self._write_dead_letter(mutation_name, args, str(exc))
 
     _dead_letter_path = None
 

@@ -562,7 +562,9 @@ class OKXProvider:
 
     def _place_order(self, symbol: str, position_id: str, side: str,
                      quantity: float, market_price: float,
-                     reduce_only: bool = False) -> Trade:
+                     reduce_only: bool = False,
+                     attach_sl_px: float | None = None,
+                     attach_tp_px: float | None = None) -> Trade:
         """Place a market order on OKX and return a Trade.
 
         Accepts quantity in base currency (same signature as BinanceProvider),
@@ -572,6 +574,12 @@ class OKXProvider:
         reduces an existing position. In net mode this sets reduceOnly=true.
         In hedge mode (long_short_mode), the correct posSide is set instead
         (OKX rejects reduceOnly with posSide together).
+
+        attach_sl_px / attach_tp_px: when both are provided on an OPENING order,
+        attach server-side SL+TP triggers (OCO) via attachAlgoOrds. OKX fires
+        these atomically with the entry — they survive engine crashes / VM
+        reboots. Both order prices are set to -1 (market on trigger). Trigger
+        type is "last" (last-traded price). Pass None on closes.
         """
         import json
 
@@ -618,6 +626,21 @@ class OKXProvider:
             # Net mode: reduceOnly prevents flipping to opposite side on partial fills.
             if reduce_only:
                 order_body["reduceOnly"] = True
+
+        # Attach OCO SL/TP if this is an opening order with both prices supplied.
+        # OKX places these atomically with the entry — server-side guarantees
+        # SL/TP survive engine crashes. Skipped on closes (reduce_only=True).
+        if not reduce_only and attach_sl_px is not None and attach_tp_px is not None \
+                and attach_sl_px > 0 and attach_tp_px > 0:
+            order_body["attachAlgoOrds"] = [{
+                "attachAlgoClOrdId": f"sl{cl_ord_id}"[:32],
+                "tpTriggerPx": f"{attach_tp_px:.8f}",
+                "tpOrdPx": "-1",  # market on trigger
+                "tpTriggerPxType": "last",
+                "slTriggerPx": f"{attach_sl_px:.8f}",
+                "slOrdPx": "-1",
+                "slTriggerPxType": "last",
+            }]
 
         body = json.dumps(order_body)
         request_path = "/api/v5/trade/order"
@@ -731,12 +754,15 @@ class OKXProvider:
         return "okx"
 
     def buy(self, symbol: str, product_id: str, size_usd: float,
-            position_id: str, market_price: float) -> Trade:
+            position_id: str, market_price: float,
+            attach_sl_px: float | None = None,
+            attach_tp_px: float | None = None) -> Trade:
         if market_price <= 0 or size_usd <= 0:
             return _failed_trade(position_id, symbol, "buy", "Invalid price or size")
         quantity = size_usd / market_price
         return self._place_order(symbol, position_id, "buy", quantity, market_price,
-                                 reduce_only=False)
+                                 reduce_only=False,
+                                 attach_sl_px=attach_sl_px, attach_tp_px=attach_tp_px)
 
     def sell(self, symbol: str, product_id: str, quantity: float,
              position_id: str, market_price: float,
