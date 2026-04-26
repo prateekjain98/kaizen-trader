@@ -443,7 +443,15 @@ class TradingEngine:
 
     def _stats_loop(self):
         """Print stats periodically."""
+        reconcile_counter = 0
         while not self._stop.is_set():
+            # Reconcile balance with exchange every 5 heartbeats (~5 min) so
+            # funding fees, mark-PnL, and any other untracked debits/credits
+            # don't let the displayed balance drift from reality.
+            if not self.paper and reconcile_counter % 5 == 0:
+                self.executor._reconcile_balance(reason="heartbeat")
+            reconcile_counter += 1
+
             stats = self.executor.get_stats()
             api_cost = self.brain.get_daily_cost_estimate()
 

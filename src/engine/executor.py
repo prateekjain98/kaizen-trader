@@ -159,6 +159,33 @@ class Executor:
         # Load saved state
         self._load_state()
 
+        # Reconcile internal balance with exchange truth at startup. Internal
+        # +/- accounting drifts from reality due to fee tier mismatches, fill
+        # slippage, and cross-margin model differences. Trust the exchange.
+        self._reconcile_balance(reason="startup")
+
+    def _reconcile_balance(self, reason: str = "periodic") -> None:
+        """Overwrite self.balance with the exchange's reported availableBalance.
+        No-op in paper mode or when no provider is configured. Logs drifts > $1
+        so silent divergence is visible."""
+        if self.paper or self._binance is None:
+            return
+        try:
+            balances = self._binance.get_balances()
+        except Exception as e:
+            log("warn", f"Balance reconcile fetch failed ({reason}): {e}")
+            return
+        # Provider returns USDT availableBalance for Binance; OKX returns USDT too.
+        live = balances.get("USDT")
+        if live is None or live <= 0:
+            return
+        with self._lock:
+            drift = live - self.balance
+            old = self.balance
+            self.balance = live
+        if abs(drift) >= 1:
+            log("info", f"Balance reconciled ({reason}): ${old:.2f} → ${live:.2f} (drift ${drift:+.2f})")
+
     def _load_state(self):
         """Load portfolio state from JSON if it exists."""
         if _PORTFOLIO_FILE.exists():
@@ -253,6 +280,9 @@ class Executor:
 
     def open_position(self, decision: TradeDecision) -> Optional[Position]:
         """Open a new position with commission tracking."""
+        # Reconcile before sizing so we never undersize/oversize against a
+        # stale internal balance.
+        self._reconcile_balance(reason="pre-open")
         with self._lock:
             if not self.can_trade():
                 return None
@@ -527,6 +557,10 @@ class Executor:
         finally:
             with self._lock:
                 self._closing.discard(pos.id)
+
+        # Reconcile after settle so the next sizing call uses the real
+        # post-close exchange balance, not our rough internal math.
+        self._reconcile_balance(reason="post-close")
 
         trail_info = f" (trailed from ${pos.entry_price*(1-pos.stop_pct):.4f} to ${pos.trailing_stop_price:.4f})" if pos.trailing_stop_price > 0 else ""
         log("trade", f"CLOSE {pos.symbol} {reason} ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%) "
