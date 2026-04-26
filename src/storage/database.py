@@ -6,13 +6,23 @@ All state is stored in Convex. There is no local database.
 
 from __future__ import annotations
 
+import logging
+import sys
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.types import Position, Trade, LogEntry, TradeDiagnosis
 from src.storage.convex_client import ConvexStorage
 
 _storage: Optional[ConvexStorage] = None
+_stdout_logger = logging.getLogger("kaizen.fallback")
+if not _stdout_logger.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(message)s"))
+    _stdout_logger.addHandler(h)
+    _stdout_logger.setLevel(logging.INFO)
+    _stdout_logger.propagate = False
 
 
 def init(convex_url: str) -> None:
@@ -74,7 +84,21 @@ def insert_trade(t: Trade) -> None:
 
 def log(level: str, message: str, symbol: str | None = None,
         strategy: str | None = None, data: dict | None = None) -> None:
-    _get().log(level, message, symbol=symbol, strategy=strategy, data=data)
+    """Log to Convex when initialized; fall back to stdout otherwise.
+
+    Logging is best-effort — never let a logging failure crash the trading
+    process. Constructor-time logs (e.g. OKXProvider's exchange-info load)
+    can fire before database.init() runs in some test/dev paths.
+    """
+    if _storage is not None:
+        try:
+            _storage.log(level, message, symbol=symbol, strategy=strategy, data=data)
+            return
+        except Exception:
+            pass  # fall through to stdout
+    ts = datetime.now(timezone.utc).isoformat()
+    sym = f" [{symbol}]" if symbol else ""
+    _stdout_logger.info("[%s] [%s]%s %s", ts, level.upper(), sym, message)
 
 
 def insert_diagnosis(d: TradeDiagnosis) -> None:
