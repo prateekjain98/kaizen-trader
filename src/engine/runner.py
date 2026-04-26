@@ -480,7 +480,15 @@ def main():
         from src.storage import database
         database.init(env.convex_url)
 
-    engine = TradingEngine(paper=not args.live, balance=args.balance, tick_interval=args.tick)
+    # Paper vs live: --live flag wins; otherwise PAPER_TRADING env var; default paper.
+    # PAPER_TRADING=false in .env gives live without needing the CLI flag, so the
+    # systemd unit can be identical across modes.
+    if args.live:
+        paper_mode = False
+    else:
+        paper_env = os.environ.get("PAPER_TRADING", "true").lower()
+        paper_mode = paper_env not in ("false", "0", "no", "off")
+    engine = TradingEngine(paper=paper_mode, balance=args.balance, tick_interval=args.tick)
     try:
         engine.run_forever()
     finally:
