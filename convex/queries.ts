@@ -4,18 +4,29 @@ import { v } from "convex/values";
 export const getOpenPositions = query({
   args: { paperTrading: v.optional(v.boolean()) },
   handler: async (ctx, args) => {
-    let open = await ctx.db
+    // Use the compound index when paperTrading is specified — avoids loading
+    // both paper and live rows into memory only to filter half of them out.
+    if (args.paperTrading !== undefined) {
+      const open = await ctx.db
+        .query("positions")
+        .withIndex("by_status_and_paperTrading", (q) =>
+          q.eq("status", "open").eq("paperTrading", args.paperTrading!))
+        .collect();
+      const closing = await ctx.db
+        .query("positions")
+        .withIndex("by_status_and_paperTrading", (q) =>
+          q.eq("status", "closing").eq("paperTrading", args.paperTrading!))
+        .collect();
+      return [...open, ...closing];
+    }
+    const open = await ctx.db
       .query("positions")
       .withIndex("by_status", (q) => q.eq("status", "open"))
       .collect();
-    let closing = await ctx.db
+    const closing = await ctx.db
       .query("positions")
       .withIndex("by_status", (q) => q.eq("status", "closing"))
       .collect();
-    if (args.paperTrading !== undefined) {
-      open = open.filter((p) => p.paperTrading === args.paperTrading);
-      closing = closing.filter((p) => p.paperTrading === args.paperTrading);
-    }
     return [...open, ...closing];
   },
 });
@@ -27,14 +38,23 @@ export const getClosedTrades = query({
   },
   handler: async (ctx, args) => {
     const limit = args.limit ?? 200;
-    let q = ctx.db
+    // The previous query walked by_closed_at without a range, then ordered
+    // desc and took N. With paperTrading filter applied client-side, Convex
+    // had to scan past every non-matching row — unbounded as the table grows.
+    // Using by_paperTrading_and_closed_at lets the index pre-filter both.
+    if (args.paperTrading !== undefined) {
+      return await ctx.db
+        .query("positions")
+        .withIndex("by_paperTrading_and_closed_at", (q) =>
+          q.eq("paperTrading", args.paperTrading!))
+        .order("desc")
+        .take(limit);
+    }
+    return await ctx.db
       .query("positions")
       .withIndex("by_closed_at")
-      .order("desc");
-    if (args.paperTrading !== undefined) {
-      q = q.filter((f) => f.eq(f.field("paperTrading"), args.paperTrading!));
-    }
-    return await q.take(limit);
+      .order("desc")
+      .take(limit);
   },
 });
 

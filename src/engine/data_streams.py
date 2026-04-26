@@ -48,6 +48,7 @@ class MarketSnapshot:
     trending_tokens: list[str] = field(default_factory=list)
     dex_volume_spikes: list[dict] = field(default_factory=list)
     recent_listings: list[dict] = field(default_factory=list)
+    news_items: list[dict] = field(default_factory=list)
     last_updated: float = 0
 
 
@@ -299,17 +300,36 @@ def fetch_crypto_news() -> list[dict]:
         return []
 
 
-def fetch_binance_prices(symbols: list[str]) -> dict[str, float]:
-    """Fetch current prices for multiple symbols from Binance."""
-    data = _fetch_json("https://api.binance.com/api/v3/ticker/price")
-    if not data:
-        return {}
-    prices = {}
-    sym_set = {s.upper() + "USDT" for s in symbols}
-    for item in data:
-        if item["symbol"] in sym_set:
-            base = item["symbol"].replace("USDT", "")
-            prices[base] = float(item["price"])
+def fetch_binance_prices(symbols: list[str], snapshot=None) -> dict[str, float]:
+    """Fetch current prices for symbols.
+
+    If a MarketSnapshot is provided, prefer its in-memory prices (populated by
+    the WS feed every ~1s) — saves a ~80KB REST round-trip per call. Falls back
+    to single-symbol REST endpoints only for symbols not in the snapshot.
+    The previous implementation pulled ALL ~2000 Binance spot prices on every
+    call regardless of how few symbols were needed.
+    """
+    prices: dict[str, float] = {}
+    missing: list[str] = []
+    if snapshot is not None:
+        for s in symbols:
+            su = s.upper()
+            p = snapshot.prices.get(su)
+            if p and p > 0:
+                prices[su] = p
+            else:
+                missing.append(su)
+    else:
+        missing = [s.upper() for s in symbols]
+
+    # Per-symbol fallback for what's still missing (cheap: 1 small JSON each).
+    for s in missing:
+        item = _fetch_json(f"https://api.binance.com/api/v3/ticker/price?symbol={s}USDT")
+        if item and "price" in item:
+            try:
+                prices[s] = float(item["price"])
+            except (ValueError, TypeError):
+                pass
     return prices
 
 
@@ -335,6 +355,17 @@ class DataStreams:
         self._lock = threading.Lock()
         self._binance_ws = None
         self._ws_tick_count = 0
+
+    def get_prices_snapshot(self) -> dict[str, float]:
+        """Return a shallow copy of the current prices dict, taken under lock.
+
+        WS thread mutates self.snapshot.prices under self._lock, and pollers
+        sometimes replace whole dicts (e.g. funding_rates). Reading the live
+        dict from another thread can yield torn reads or stale references after
+        a poller swap. Always copy under lock for cross-thread reads.
+        """
+        with self._lock:
+            return dict(self.snapshot.prices)
 
     def _on_ws_tick(self, symbol: str, price: float, volume_24h: float, change_pct: float):
         """Called by BinanceWebSocket on every tick (~1s for all symbols)."""
@@ -608,6 +639,11 @@ class DataStreams:
         """Fetch crypto news from CoinTelegraph RSS."""
         articles = fetch_crypto_news()
         now = time.time() * 1000
+
+        # Persist to snapshot so the brain's tick prompt actually sees them.
+        # Without this, runner.py reads snapshot.news_items and always gets [].
+        with self._lock:
+            self.snapshot.news_items = articles[:10]
 
         # Look for market-moving keywords in headlines
         _URGENT_KEYWORDS = ["hack", "exploit", "SEC", "ban", "crash", "surge", "listing",

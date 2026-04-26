@@ -206,8 +206,15 @@ class BinanceProvider:
         return None
 
     def _place_order(self, symbol: str, position_id: str, side: str,
-                     quantity: float, market_price: float) -> Trade:
-        """Shared order execution for both buy and sell."""
+                     quantity: float, market_price: float,
+                     reduce_only: bool = False) -> Trade:
+        """Shared order execution for both buy and sell.
+
+        reduce_only: when True (i.e. closing a position), Binance Futures will
+        guarantee the order only reduces an existing position rather than
+        opening a new opposite-side position. Critical to prevent flipping net
+        short after a partial server-side stop fill.
+        """
         binance_symbol = self._get_binance_symbol(symbol)
         self._ensure_leverage(binance_symbol)
 
@@ -222,11 +229,15 @@ class BinanceProvider:
             return _failed_trade(position_id, symbol, side.lower(), f"Invalid quantity after rounding: {quantity}")
 
         timestamp = int(time.time() * 1000)
+        # newClientOrderId acts as idempotency key — replays of the same params
+        # within a session are safely deduped by Binance (returns -2010/4015).
         params = (
             f"symbol={binance_symbol}&side={side}&type=MARKET"
             f"&quantity={quantity}&timestamp={timestamp}"
             f"&newClientOrderId={position_id[:36]}"
         )
+        if reduce_only:
+            params += "&reduceOnly=true"
 
         try:
             data = self._sign_and_post(params)
@@ -283,10 +294,14 @@ class BinanceProvider:
         return self._place_order(symbol, position_id, "BUY", quantity, market_price)
 
     def sell(self, symbol: str, product_id: str, quantity: float,
-             position_id: str, market_price: float) -> Trade:
+             position_id: str, market_price: float,
+             reduce_only: bool = True) -> Trade:
+        # Default reduce_only=True for sells: this provider only opens longs,
+        # so a sell is always a close. Callers opening a real short can pass False.
         if quantity <= 0:
             return _failed_trade(position_id, symbol, "sell", "Invalid quantity")
-        return self._place_order(symbol, position_id, "SELL", quantity, market_price)
+        return self._place_order(symbol, position_id, "SELL", quantity, market_price,
+                                 reduce_only=reduce_only)
 
     def get_balances(self) -> dict[str, float]:
         if not env.binance_api_key or not env.binance_api_secret:
@@ -323,14 +338,18 @@ class OKXProvider:
 
     Uses OKX V5 API for perpetual contracts.
     Requires OKX_API_KEY, OKX_API_SECRET, and OKX_PASSPHRASE in env.
+    BASE_URL is env-configurable (OKX_BASE_URL) — licensed-jurisdiction accounts
+    (e.g. SG entity) live on https://my.okx.com instead of www.okx.com.
     """
 
-    BASE_URL = "https://www.okx.com"
-
     def __init__(self) -> None:
+        self.BASE_URL = env.okx_base_url
         self._leverage_set: set[str] = set()
         self._instruments: dict[str, dict] = {}
         self._exchange_info_loaded: bool = False
+        # Position mode: "net_mode" or "long_short_mode" (hedge). Detected on
+        # first authenticated call; affects whether we send reduceOnly or posSide.
+        self._pos_mode: str | None = None
         self._load_exchange_info()
 
     # ── Exchange info ──────────────────────────────────────────────────
@@ -467,6 +486,41 @@ class OKXProvider:
         except Exception as exc:
             log("warn", f"Failed to set OKX leverage for {inst_id}: {exc}")
 
+    # ── Position mode detection (cached) ───────────────────────────────
+
+    def _ensure_pos_mode(self) -> str:
+        """Fetch and cache the account's position mode.
+
+        Returns "net_mode" or "long_short_mode". Determines whether closes use
+        reduceOnly (net) or posSide (hedge). Falls back to net_mode on error.
+        """
+        if self._pos_mode is not None:
+            return self._pos_mode
+        if not env.okx_api_key or not env.okx_api_secret:
+            self._pos_mode = "net_mode"
+            return self._pos_mode
+        path = "/api/v5/account/config"
+        try:
+            time.sleep(0.1)
+            t = self._timestamp()
+            resp = requests.get(
+                f"{self.BASE_URL}{path}",
+                headers=self._headers(t, "GET", path),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            r = resp.json()
+            if r.get("code") == "0" and r.get("data"):
+                self._pos_mode = r["data"][0].get("posMode") or "net_mode"
+                log("info", f"OKX posMode detected: {self._pos_mode}")
+            else:
+                self._pos_mode = "net_mode"
+                log("warn", f"OKX posMode fetch returned code {r.get('code')}: {r.get('msg')} — defaulting to net_mode")
+        except Exception as exc:
+            self._pos_mode = "net_mode"
+            log("warn", f"OKX posMode fetch failed ({exc}) — defaulting to net_mode")
+        return self._pos_mode
+
     # ── Order query / polling ──────────────────────────────────────────
 
     def _query_order(self, inst_id: str, order_id: str) -> dict:
@@ -507,16 +561,23 @@ class OKXProvider:
     # ── Core order placement ───────────────────────────────────────────
 
     def _place_order(self, symbol: str, position_id: str, side: str,
-                     quantity: float, market_price: float) -> Trade:
+                     quantity: float, market_price: float,
+                     reduce_only: bool = False) -> Trade:
         """Place a market order on OKX and return a Trade.
 
         Accepts quantity in base currency (same signature as BinanceProvider),
         converts to OKX contracts internally.
+
+        reduce_only: when True (closing a position), guarantees the order only
+        reduces an existing position. In net mode this sets reduceOnly=true.
+        In hedge mode (long_short_mode), the correct posSide is set instead
+        (OKX rejects reduceOnly with posSide together).
         """
         import json
 
         inst_id = self._to_okx_inst_id(symbol)
         self._ensure_leverage(inst_id)
+        pos_mode = self._ensure_pos_mode()
 
         if not env.okx_api_key or not env.okx_api_secret:
             log("error", f"OKX API keys not configured for {symbol}", symbol=symbol)
@@ -531,13 +592,34 @@ class OKXProvider:
                                  f"Invalid contract count after rounding: {contracts}")
         sz = str(contracts)
 
-        body = json.dumps({
+        # clOrdId acts as idempotency key — replays of the same params return
+        # error 51000 ("duplicate clOrdId"), which is safe to treat as already-filled.
+        # OKX clOrdId max length is 32 chars, alphanumeric only.
+        cl_ord_id = "".join(c for c in position_id if c.isalnum())[:32]
+
+        order_body: dict = {
             "instId": inst_id,
             "tdMode": "cross",
             "side": side.lower(),
             "ordType": "market",
             "sz": sz,
-        })
+            "clOrdId": cl_ord_id,
+        }
+
+        if pos_mode == "long_short_mode":
+            # Hedge mode: posSide tells OKX which side this order targets. For a
+            # close, posSide must match the side being reduced (long for sell-to-close,
+            # short for buy-to-close). For an open, it matches the new direction.
+            if reduce_only:
+                order_body["posSide"] = "long" if side.lower() == "sell" else "short"
+            else:
+                order_body["posSide"] = "long" if side.lower() == "buy" else "short"
+        else:
+            # Net mode: reduceOnly prevents flipping to opposite side on partial fills.
+            if reduce_only:
+                order_body["reduceOnly"] = True
+
+        body = json.dumps(order_body)
         request_path = "/api/v5/trade/order"
         timestamp = self._timestamp()
 
@@ -553,12 +635,26 @@ class OKXProvider:
             result = resp.json()
 
             if result.get("code") != "0":
-                msg = result.get("data", [{}])[0].get("sMsg", result.get("msg", "unknown error"))
-                safe_msg = f"OKX {side} order rejected: {msg}"
-                log("error", safe_msg, symbol=symbol)
-                return _failed_trade(position_id, symbol, side.lower(), safe_msg)
-
-            order_id = result["data"][0].get("ordId", "")
+                first = result.get("data", [{}])[0]
+                err_code = first.get("sCode", result.get("code", ""))
+                msg = first.get("sMsg", result.get("msg", "unknown error"))
+                # Idempotency: 51000 = duplicate clOrdId. Means a previous attempt
+                # already placed this order — query it instead of failing.
+                if err_code == "51000":
+                    log("warn", f"OKX duplicate clOrdId {cl_ord_id} — querying existing order", symbol=symbol)
+                    existing = self._query_order_by_cl_ord_id(inst_id, cl_ord_id)
+                    if existing.get("ordId"):
+                        order_id = existing["ordId"]
+                        # Fall through to fill polling below
+                    else:
+                        return _failed_trade(position_id, symbol, side.lower(),
+                                             f"OKX clOrdId conflict but no order found: {msg}")
+                else:
+                    safe_msg = f"OKX {side} order rejected ({err_code}): {msg}"
+                    log("error", safe_msg, symbol=symbol)
+                    return _failed_trade(position_id, symbol, side.lower(), safe_msg)
+            else:
+                order_id = result["data"][0].get("ordId", "")
 
             # Query fill details
             fill_data = self._query_order(inst_id, order_id) if order_id else {}
@@ -608,6 +704,26 @@ class OKXProvider:
             log("error", safe_msg, symbol=symbol)
             return _failed_trade(position_id, symbol, side.lower(), safe_msg)
 
+    def _query_order_by_cl_ord_id(self, inst_id: str, cl_ord_id: str) -> dict:
+        """Look up an order by client order ID (used for idempotency recovery)."""
+        if not env.okx_api_key or not env.okx_api_secret:
+            return {}
+        time.sleep(0.1)
+        path = f"/api/v5/trade/order?instId={inst_id}&clOrdId={cl_ord_id}"
+        try:
+            resp = requests.get(
+                f"{self.BASE_URL}{path}",
+                headers=self._headers(self._timestamp(), "GET", path),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            r = resp.json()
+            if r.get("code") == "0" and r.get("data"):
+                return r["data"][0]
+        except Exception as exc:
+            log("warn", f"OKX clOrdId lookup failed: {exc}")
+        return {}
+
     # ── Public interface ───────────────────────────────────────────────
 
     @property
@@ -619,13 +735,18 @@ class OKXProvider:
         if market_price <= 0 or size_usd <= 0:
             return _failed_trade(position_id, symbol, "buy", "Invalid price or size")
         quantity = size_usd / market_price
-        return self._place_order(symbol, position_id, "buy", quantity, market_price)
+        return self._place_order(symbol, position_id, "buy", quantity, market_price,
+                                 reduce_only=False)
 
     def sell(self, symbol: str, product_id: str, quantity: float,
-             position_id: str, market_price: float) -> Trade:
+             position_id: str, market_price: float,
+             reduce_only: bool = True) -> Trade:
+        # Default reduce_only=True for sells: this provider only opens longs,
+        # so a sell is always a close. Callers opening a real short can pass False.
         if quantity <= 0:
             return _failed_trade(position_id, symbol, "sell", "Invalid quantity")
-        return self._place_order(symbol, position_id, "sell", quantity, market_price)
+        return self._place_order(symbol, position_id, "sell", quantity, market_price,
+                                 reduce_only=reduce_only)
 
     def get_balances(self) -> dict[str, float]:
         if not env.okx_api_key or not env.okx_api_secret:

@@ -1,0 +1,26 @@
+[Unit]
+Description=Kaizen Watchdog — stop-loss safety net
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prateekjain
+WorkingDirectory=/home/prateekjain/kaizen-trader
+ExecStart=/home/prateekjain/kaizen-trader/.venv/bin/python watchdog.py
+Restart=always
+RestartSec=10
+EnvironmentFile=-/home/prateekjain/kaizen-trader/.env
+
+TimeoutStopSec=10
+KillMode=mixed
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/prateekjain/kaizen-trader /tmp
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

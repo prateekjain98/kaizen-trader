@@ -1,0 +1,29 @@
+[Unit]
+Description=Kaizen Trading Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prateekjain
+WorkingDirectory=/home/prateekjain/kaizen-trader
+ExecStart=/home/prateekjain/kaizen-trader/.venv/bin/python -m src.engine.runner --live --auto-balance --tick 60 --confirm
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=-/home/prateekjain/kaizen-trader/.env
+
+# Fast shutdown — SIGTERM then SIGKILL after 10s. Without this, systemd waits
+# 90s for graceful shutdown during deploys, which blocks the auto-deploy pipeline.
+TimeoutStopSec=10
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/prateekjain/kaizen-trader /tmp
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -175,6 +175,28 @@ export const insertLog = mutation({
   },
 });
 
+// Batched log insert — collapses up to ~500 log writes into a single function
+// call, drastically cutting Convex function-call cost. The Python client
+// queues logs and ships them via this mutation in chunks.
+export const insertLogsBatch = mutation({
+  args: {
+    logs: v.array(v.object({
+      logId: v.string(),
+      level: v.string(),
+      message: v.string(),
+      symbol: v.optional(v.string()),
+      strategy: v.optional(v.string()),
+      data: v.optional(v.string()),
+      ts: v.float64(),
+    })),
+  },
+  handler: async (ctx, args) => {
+    for (const log of args.logs) {
+      await ctx.db.insert("logs", log);
+    }
+  },
+});
+
 export const insertDiagnosis = mutation({
   args: {
     positionId: v.string(),
@@ -314,10 +336,15 @@ export const closeOrphanedPositions = mutation({
     closedAt: v.float64(),
   },
   handler: async (ctx, args) => {
+    // Bounded: Convex caps mutations at ~8k document reads / 1MB writes.
+    // If there's a backlog of orphans, the caller (Python) re-invokes until
+    // `closed === 0`. Without this cap a runaway watchdog state could OOM
+    // the mutation and silently leave orphans.
+    const BATCH = 200;
     const open = await ctx.db
       .query("positions")
       .withIndex("by_status", (q) => q.eq("status", "open"))
-      .collect();
+      .take(BATCH);
     let closed = 0;
     for (const pos of open) {
       await ctx.db.patch(pos._id, {

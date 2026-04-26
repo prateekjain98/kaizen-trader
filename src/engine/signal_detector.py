@@ -50,7 +50,12 @@ class SignalDetector:
     """
 
     def __init__(self):
-        self._seen_signals: set[str] = set()  # dedup within 1h window
+        # Insertion-ordered dedup: an OrderedDict guarantees we evict the OLDEST
+        # keys first when we prune. The previous `set(list(...)[-500:])` evicted
+        # arbitrary keys (set iteration order is implementation-defined), letting
+        # stale signals re-fire and recent ones get dropped.
+        from collections import OrderedDict
+        self._seen_signals: OrderedDict[str, None] = OrderedDict()
         self._signal_count = 0
 
     def process(self, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
@@ -59,12 +64,13 @@ class SignalDetector:
         # Dedup: don't process same signal within 1 hour
         dedup_key = f"{signal.symbol}:{signal.event_type}:{int(signal.timestamp / 3_600_000)}"
         if dedup_key in self._seen_signals:
+            self._seen_signals.move_to_end(dedup_key)  # refresh recency
             return None
-        self._seen_signals.add(dedup_key)
+        self._seen_signals[dedup_key] = None
 
-        # Prune old dedup keys (keep last 1000)
-        if len(self._seen_signals) > 1000:
-            self._seen_signals = set(list(self._seen_signals)[-500:])
+        # Prune oldest entries (FIFO) once we exceed the cap.
+        while len(self._seen_signals) > 1000:
+            self._seen_signals.popitem(last=False)
 
         self._signal_count += 1
         sid = f"sig-{self._signal_count:06d}"

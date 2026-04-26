@@ -44,7 +44,10 @@ export default defineSchema({
     .index("by_symbol", ["symbol"])
     .index("by_closed_at", ["closedAt"])
     .index("by_status_and_paperTrading", ["status", "paperTrading"])
-    .index("by_strategy", ["strategy"]),
+    .index("by_strategy", ["strategy"])
+    // Compound index for getClosedTrades: avoids scanning unbounded "open"
+    // rows where closedAt is undefined, and pre-filters by paperTrading.
+    .index("by_paperTrading_and_closed_at", ["paperTrading", "closedAt"]),
 
   trades: defineTable({
     tradeId: v.string(),

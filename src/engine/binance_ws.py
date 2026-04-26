@@ -43,6 +43,7 @@ class BinanceWebSocket:
         self._status = "disconnected"
         self._tick_count = 0
         self._last_tick_time = time.time()
+        self._connected_at: float = 0.0
 
     def connect(self):
         """Start WebSocket connection in background thread."""
@@ -90,6 +91,9 @@ class BinanceWebSocket:
 
     def _on_ws_open(self, ws):
         self._status = "connected"
+        self._connected_at = time.time()
+        # Reset last_tick_time so health check uses post-connect window, not pre-connect drift
+        self._last_tick_time = time.time()
         log("info", "Binance Futures WS connected — receiving all tickers + funding")
 
     def _on_ws_message(self, ws, message):
@@ -215,12 +219,21 @@ class BinanceWebSocket:
         return self._status == "connected"
 
     def check_health(self, max_silence_s: float = 30.0) -> bool:
-        """Check if WS is receiving ticks. Force-reconnect if stale."""
+        """Check if WS is receiving ticks. Force-reconnect if stale.
+
+        Cold-start protection: for the first 60s after connecting we use a tighter
+        silence threshold (10s) because Binance occasionally accepts the upgrade
+        but never delivers messages on the first connect. Without this, the bot
+        trades on stale data for up to max_silence_s on cold start.
+        """
         if self._status != "connected":
             return False
         silence = time.time() - self._last_tick_time
-        if silence > max_silence_s:
-            log("warn", f"Binance WS tick silence for {silence:.0f}s — force reconnecting")
+        since_connect = time.time() - self._connected_at if self._connected_at else 0
+        threshold = 10.0 if since_connect < 60.0 else max_silence_s
+        if silence > threshold:
+            log("warn", f"Binance WS tick silence for {silence:.0f}s "
+                f"(connected {since_connect:.0f}s ago, threshold {threshold:.0f}s) — force reconnecting")
             self.disconnect()
             self.connect()
             return False

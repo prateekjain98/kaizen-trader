@@ -12,6 +12,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 import os
 import queue
+import random
 import threading
 import time
 import uuid
@@ -83,6 +84,10 @@ class ConvexStorage:
         "mutations:insertTrade",
     })
 
+    # Max logs per batched mutation. Convex per-mutation limits cap us well
+    # below 500; 200 keeps individual mutations fast and recoverable.
+    _LOG_BATCH_SIZE = 200
+
     def _drain_queue(self) -> None:
         items: list[tuple[str, dict]] = []
         while True:
@@ -94,22 +99,46 @@ class ConvexStorage:
         if not items:
             return
 
-        client = self._get_client()
+        # Group consecutive insertLog calls so we ship them via insertLogsBatch
+        # in a single function call instead of one HTTP round trip per log.
+        # 346 log() call sites at 60s tick can produce 30+ logs/min — without
+        # batching this dominates the Convex cost surface.
+        grouped: list[tuple[str, list[dict]]] = []
         for mutation_name, args in items:
+            if mutation_name == "mutations:insertLog":
+                if grouped and grouped[-1][0] == "mutations:insertLogsBatch":
+                    grouped[-1][1].append(args)
+                else:
+                    grouped.append(("mutations:insertLogsBatch", [args]))
+            else:
+                grouped.append((mutation_name, [args]))
+
+        client = self._get_client()
+        for mutation_name, args_list in grouped:
             retries = 3 if mutation_name in self._CRITICAL_MUTATIONS else 1
-            for attempt in range(retries):
-                try:
-                    client.mutation(mutation_name, args)
-                    break
-                except Exception as exc:
-                    if attempt < retries - 1:
-                        time.sleep(min(0.5 * (2 ** attempt), 10))
-                    else:
-                        logger.error(f"Failed to call {mutation_name} "
-                                     f"after {retries} attempt(s): {exc}")
-                        # Dead-letter queue: persist failed critical mutations to disk
-                        if mutation_name in self._CRITICAL_MUTATIONS:
-                            self._write_dead_letter(mutation_name, args, str(exc))
+            # Build the actual call args. Batched logs go inside a "logs" array;
+            # everything else uses the single args dict as before.
+            if mutation_name == "mutations:insertLogsBatch":
+                # Chunk to avoid oversized mutations
+                for i in range(0, len(args_list), self._LOG_BATCH_SIZE):
+                    chunk = args_list[i:i + self._LOG_BATCH_SIZE]
+                    self._call_with_retry(client, mutation_name, {"logs": chunk}, retries)
+            else:
+                self._call_with_retry(client, mutation_name, args_list[0], retries)
+
+    def _call_with_retry(self, client, mutation_name: str, args: dict, retries: int) -> None:
+        for attempt in range(retries):
+            try:
+                client.mutation(mutation_name, args)
+                return
+            except Exception as exc:
+                if attempt < retries - 1:
+                    time.sleep(min(0.5 * (2 ** attempt), 10) + random.uniform(0, 0.3))
+                else:
+                    logger.error(f"Failed to call {mutation_name} "
+                                 f"after {retries} attempt(s): {exc}")
+                    if mutation_name in self._CRITICAL_MUTATIONS:
+                        self._write_dead_letter(mutation_name, args, str(exc))
 
     _dead_letter_path = None
 
@@ -234,18 +263,25 @@ class ConvexStorage:
             "placedAt": t.placed_at,
         })
 
+    # Levels that get persisted to Convex. Info/debug stay on stdout only —
+    # at 30+ logs/min, shipping every info to Convex was projected to cost
+    # $20-200/mo. journalctl + `gcloud compute ssh ... journalctl -u kaizen`
+    # remains the source of truth for routine logs.
+    _CONVEX_LOG_LEVELS = frozenset({"warn", "error", "trade"})
+
     def log(self, level: str, message: str, symbol: str | None = None,
             strategy: str | None = None, data: dict | None = None) -> None:
         now = int(time.time() * 1000)
-        self._enqueue("mutations:insertLog", {
-            "logId": str(uuid.uuid4()),
-            "level": level,
-            "message": message,
-            "symbol": symbol,
-            "strategy": strategy,
-            "data": json.dumps(data) if data else None,
-            "ts": now,
-        })
+        if level in self._CONVEX_LOG_LEVELS:
+            self._enqueue("mutations:insertLog", {
+                "logId": str(uuid.uuid4()),
+                "level": level,
+                "message": message,
+                "symbol": symbol,
+                "strategy": strategy,
+                "data": json.dumps(data) if data else None,
+                "ts": now,
+            })
 
         ts_str = datetime.fromtimestamp(now / 1000, tz=timezone.utc).isoformat()
         sym_tag = f" [{symbol}]" if symbol else ""

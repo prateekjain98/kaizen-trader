@@ -244,7 +244,7 @@ class TradingEngine:
                 for decision in decisions:
                     if decision.action in ("BUY", "SELL"):
                         # Get live price for the symbol
-                        prices = fetch_binance_prices([decision.symbol])
+                        prices = fetch_binance_prices([decision.symbol], snapshot=self.streams.snapshot)
                         price = prices.get(decision.symbol, 0)
                         if price > 0:
                             decision.entry_price = price
@@ -283,8 +283,8 @@ class TradingEngine:
         """Poll Binance prices, check stops/targets, feed correlation scanner."""
         while not self._stop.is_set():
             try:
-                # Feed prices into acceleration tracker
-                all_prices = self.streams.snapshot.prices
+                # Feed prices into acceleration tracker (copy under lock)
+                all_prices = self.streams.get_prices_snapshot()
                 for symbol, price in all_prices.items():
                     self.accel_tracker.update(symbol, price)
 
@@ -298,7 +298,7 @@ class TradingEngine:
                 # Update position prices and check stops/targets
                 symbols = [p.symbol for p in self.executor.positions]
                 if symbols:
-                    prices = fetch_binance_prices(symbols)
+                    prices = fetch_binance_prices(symbols, snapshot=self.streams.snapshot)
                     for sym, price in prices.items():
                         old_count = len(self.executor.positions)
                         self.executor.update_price(sym, price)

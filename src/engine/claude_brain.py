@@ -219,19 +219,33 @@ def _call_claude(
     model: str = "claude-haiku-4-5-20251001",
     max_tokens: int = 500,
     system: str = "",
+    cache_system: bool = True,
 ) -> Optional[str]:
-    """Call Claude API with optional system prompt."""
+    """Call Claude API with optional system prompt.
+
+    cache_system: when True (default) wraps the system prompt in an ephemeral
+    cache_control block. Cached for 5 min, ~90% cheaper on cache hits. The
+    system prompt is static across ticks, so this is essentially free savings
+    at 60s tick rate (every call is a hit after the first).
+    """
     client = _get_client()
     if not client:
         return None
     try:
-        kwargs = {
+        kwargs: dict = {
             "model": model,
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
         if system:
-            kwargs["system"] = system
+            if cache_system:
+                kwargs["system"] = [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                kwargs["system"] = system
         message = client.messages.create(**kwargs)
         return message.content[0].text if message.content else None
     except Exception as e:

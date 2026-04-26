@@ -40,6 +40,9 @@ class _Env:
     okx_api_key = _optional("OKX_API_KEY")
     okx_api_secret = _optional("OKX_API_SECRET")
     okx_passphrase = _optional("OKX_PASSPHRASE")
+    # OKX has multiple regional brand domains. Defaults to www.okx.com (global);
+    # use https://my.okx.com for licensed-jurisdiction accounts (e.g. SG entity).
+    okx_base_url = os.environ.get("OKX_BASE_URL", "https://www.okx.com").rstrip("/")
 
     exchange = os.environ.get("EXCHANGE", "binance").lower()  # "binance" or "okx"
 

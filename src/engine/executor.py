@@ -110,16 +110,23 @@ class Executor:
     TRAIL_ACTIVATION = 1.5      # Start trailing after 1.5x stop distance profit
 
     def __init__(self, paper: bool = True, initial_balance: float = 10_000):
+        from collections import deque
         self.paper = paper
         self.balance = initial_balance
         self.positions: list[Position] = []
-        self.closed_trades: list[ClosedTrade] = []
+        # Bounded so the in-process list cannot grow without limit on a long-running bot.
+        # 500 closed trades = ~6+ months at 2-3 trades/day. _save_state still keeps the
+        # last 50 on disk; the rest live in Convex.
+        self.closed_trades: deque[ClosedTrade] = deque(maxlen=500)
         self.daily_pnl: float = 0
         self.total_commissions: float = 0
         self._daily_reset_ts: float = time.time()
         self._binance = None  # generic exchange provider (binance or okx)
         self._started_at: str = datetime.now(timezone.utc).isoformat()
         self._lock = threading.Lock()
+        # Guards against double-close when stop and target both fire in the same
+        # update_price tick, or when the price-updater races a brain-driven close.
+        self._closing: set[str] = set()
 
         # Ensure data directory exists
         _PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -334,12 +341,15 @@ class Executor:
         except Exception as e:
             log("warn", f"Failed to place server stop for {symbol}: {e}")
 
-        # Take profit order
+        # Take profit order — re-capture timestamp. The original timestamp can
+        # easily fall outside Binance's recvWindow (5s default) if the SL POST
+        # took >5s, causing a silent -1021 rejection where the TP never lands.
         try:
+            tp_timestamp = int(time.time() * 1000)
             tp_params = (
                 f"symbol={binance_symbol}&side={close_side}&type=TAKE_PROFIT_MARKET"
                 f"&stopPrice={tp_price:.8f}&closePosition=true"
-                f"&timestamp={timestamp + 1}"
+                f"&timestamp={tp_timestamp}"
             )
             signature = hmac.new(
                 env.binance_api_secret.encode(), tp_params.encode(), "sha256"
@@ -404,41 +414,72 @@ class Executor:
                 self._close_position(pos, price, "timeout")
 
     def _close_position(self, pos: Position, exit_price: float, reason: str):
-        """Close position with full commission accounting."""
-        exit_commission = pos.size_usd * self.COMMISSION_PCT
+        """Close position with full commission accounting.
 
-        if pos.side == "long":
-            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
-        else:
-            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price
+        Race-safe: a position can only be closed once. Concurrent calls (e.g.
+        stop and target firing in the same tick, or brain + price-updater
+        racing) are deduped via the _closing guard set.
 
-        # Net P&L = gross P&L - entry commission - exit commission
-        gross_pnl = pos.size_usd * pnl_pct
-        pnl_usd = gross_pnl - pos.entry_commission - exit_commission
-
-        # Execute close on Binance (live mode) — outside lock to avoid blocking
-        if not self.paper and self._binance:
-            try:
-                close_side = "SELL" if pos.side == "long" else "BUY"
-                self._binance._place_order(pos.symbol, pos.id, close_side, pos.quantity, exit_price)
-            except Exception as e:
-                log("error", f"Close execution error: {pos.symbol}: {e}")
-
+        Money-safe: if the live exchange close fails, we do NOT credit P&L or
+        remove the position locally — the position is still live on the
+        exchange and the watchdog will retry. Marking it closed locally would
+        orphan the live position with no tracking.
+        """
+        # Atomic claim: only one caller proceeds past this point per pos.id.
         with self._lock:
-            self.total_commissions += exit_commission
-            self.balance += pos.size_usd + pnl_usd
-            self.daily_pnl += pnl_usd
+            if pos.id in self._closing:
+                return
+            if not any(p.id == pos.id for p in self.positions):
+                return  # already closed
+            self._closing.add(pos.id)
 
-            closed = ClosedTrade(
-                position=pos, exit_price=exit_price,
-                pnl_pct=pnl_pct, pnl_usd=pnl_usd,
-                exit_reason=reason, closed_at=time.time() * 1000,
-                exit_commission=exit_commission,
-            )
-            self.closed_trades.append(closed)
-            self.positions = [p for p in self.positions if p.id != pos.id]
+        try:
+            exit_commission = pos.size_usd * self.COMMISSION_PCT
 
-        self._save_state()
+            if pos.side == "long":
+                pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
+            else:
+                pnl_pct = (pos.entry_price - exit_price) / pos.entry_price
+
+            gross_pnl = pos.size_usd * pnl_pct
+            pnl_usd = gross_pnl - pos.entry_commission - exit_commission
+
+            # Execute close on exchange (live mode). On failure: ABORT — do not
+            # update local state, do not credit P&L. The position is still live
+            # on the exchange; the watchdog will retry the close.
+            if not self.paper and self._binance:
+                try:
+                    close_side = "SELL" if pos.side == "long" else "BUY"
+                    trade = self._binance._place_order(
+                        pos.symbol, pos.id, close_side, pos.quantity, exit_price,
+                        reduce_only=True,
+                    )
+                    if trade.status != "filled":
+                        log("error", f"Close FAILED for {pos.symbol}: {trade.error or 'unknown'} "
+                            f"— position remains open, watchdog will retry")
+                        return  # Do NOT update local state
+                except Exception as e:
+                    log("error", f"Close execution error: {pos.symbol}: {e} — position remains open")
+                    return
+
+            with self._lock:
+                self.total_commissions += exit_commission
+                self.balance += pos.size_usd + pnl_usd
+                self.daily_pnl += pnl_usd
+
+                closed = ClosedTrade(
+                    position=pos, exit_price=exit_price,
+                    pnl_pct=pnl_pct, pnl_usd=pnl_usd,
+                    exit_reason=reason, closed_at=time.time() * 1000,
+                    exit_commission=exit_commission,
+                )
+                self.closed_trades.append(closed)
+                self.positions = [p for p in self.positions if p.id != pos.id]
+
+            self._save_state()
+        finally:
+            with self._lock:
+                self._closing.discard(pos.id)
 
         trail_info = f" (trailed from ${pos.entry_price*(1-pos.stop_pct):.4f} to ${pos.trailing_stop_price:.4f})" if pos.trailing_stop_price > 0 else ""
         log("trade", f"CLOSE {pos.symbol} {reason} ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%) "

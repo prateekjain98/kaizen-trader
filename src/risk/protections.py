@@ -91,7 +91,10 @@ class StoplossGuard(ProtectionRule):
         self._consecutive = 0
 
     def on_trade_closed(self, position: Position, pnl_usd: float) -> None:
-        if position.exit_reason == "trailing_stop" and pnl_usd < 0:
+        # The executor uses exit_reason="stop" for hard stop-loss hits and
+        # "trailing_stop" only when the trailing stop fires. Counting only the
+        # latter meant 3 consecutive hard stops never tripped the cooldown.
+        if position.exit_reason in ("stop", "trailing_stop") and pnl_usd < 0:
             self._consecutive += 1
             self._recent_stops.append(time.time() * 1000)
         elif pnl_usd > 5.0:

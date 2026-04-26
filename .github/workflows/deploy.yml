@@ -1,0 +1,55 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for Workload Identity Federation
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy via IAP tunnel
+        run: |
+          gcloud compute ssh kaizen-prod \
+            --zone=asia-east2-a \
+            --tunnel-through-iap \
+            --command='
+              set -euo pipefail
+              cd /home/prateekjain/kaizen-trader
+              git fetch origin main
+              git reset --hard origin/main
+              source .venv/bin/activate
+              pip install -q -r requirements.txt 2>&1 | tail -3
+              # Reinstall systemd units in case they changed
+              sudo cp deploy/kaizen.service /etc/systemd/system/kaizen.service
+              sudo cp deploy/kaizen-watchdog.service /etc/systemd/system/kaizen-watchdog.service
+              sudo systemctl daemon-reload
+              sudo systemctl restart kaizen kaizen-watchdog
+              sleep 8
+              if sudo systemctl is-active --quiet kaizen && sudo systemctl is-active --quiet kaizen-watchdog; then
+                echo DEPLOY_OK
+                sudo journalctl -u kaizen --no-pager -n 5
+                sudo journalctl -u kaizen-watchdog --no-pager -n 5
+              else
+                echo DEPLOY_FAIL
+                echo "--- kaizen ---"
+                sudo journalctl -u kaizen --no-pager -n 30
+                echo "--- watchdog ---"
+                sudo journalctl -u kaizen-watchdog --no-pager -n 30
+                exit 1
+              fi'
