@@ -149,7 +149,11 @@ class ConvexStorage:
     def _get_dead_letter_path(cls):
         if cls._dead_letter_path is None:
             from pathlib import Path
-            cls._dead_letter_path = Path(__file__).resolve().parents[2] / ".dead_letters.jsonl"
+            # Inside data/ (already gitignored) instead of the repo root, so a
+            # stray `git add -A` can't accidentally commit live trade payloads.
+            data_dir = Path(__file__).resolve().parents[2] / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cls._dead_letter_path = data_dir / ".dead_letters.jsonl"
         return cls._dead_letter_path
 
     def _write_dead_letter(self, mutation_name: str, args: dict, error: str) -> None:

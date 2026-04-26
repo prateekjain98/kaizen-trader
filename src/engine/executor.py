@@ -251,6 +251,9 @@ class Executor:
             self.balance = live
         if abs(drift) >= 1:
             log("info", f"Balance reconciled ({reason}): ${old:.2f} → ${live:.2f} (drift ${drift:+.2f})")
+            # Persist so a crash within the 5-min window doesn't lose the
+            # corrected balance to the disk's stale value.
+            self._save_state()
         # Position-state reconcile (Binance only — OKX private WS handles its own).
         if self._binance.name == "binance":
             self._reconcile_positions(reason)

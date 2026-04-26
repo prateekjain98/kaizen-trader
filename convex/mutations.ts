@@ -330,13 +330,24 @@ export const clearAllData = internalMutation({
       "tradeJournal",
       "metrics",
     ] as const;
+    // Loop until table is empty (or we hit the Convex per-mutation read cap).
+    // Previous .take(1000) silently left partial state if any table had >1000
+    // rows. The 8000-read soft cap means each invocation can clear up to ~8k
+    // rows total across all tables; caller should re-invoke until counts are 0.
     const counts: Record<string, number> = {};
+    let totalReads = 0;
+    const READ_BUDGET = 7000;  // leave headroom for Convex internal accounting
     for (const table of tables) {
-      const rows = await ctx.db.query(table).take(1000);
-      for (const row of rows) {
-        await ctx.db.delete(row._id);
+      counts[table] = 0;
+      while (totalReads < READ_BUDGET) {
+        const rows = await ctx.db.query(table).take(500);
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          await ctx.db.delete(row._id);
+        }
+        counts[table] += rows.length;
+        totalReads += rows.length;
       }
-      counts[table] = rows.length;
     }
     return counts;
   },

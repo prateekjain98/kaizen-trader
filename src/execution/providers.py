@@ -173,6 +173,11 @@ class BinanceProvider:
         if not env.binance_api_secret or not env.binance_api_key:
             raise ValueError("Binance API keys not configured")
         time.sleep(0.1)  # rate-limit guard
+        # Add recvWindow=10000 to absorb up to 10s of clock drift / network
+        # latency. Default Binance window is 5000ms; orders that POST during
+        # API hiccups can otherwise get -1021 "Timestamp outside recvWindow".
+        if "recvWindow=" not in params:
+            params = f"{params}&recvWindow=10000"
         signature = hmac.new(
             env.binance_api_secret.encode(), params.encode(), "sha256"
         ).hexdigest()
@@ -759,10 +764,12 @@ class OKXProvider:
                 "attachAlgoClOrdId": f"sl{cl_ord_id}"[:32],
                 "tpTriggerPx": f"{attach_tp_px:.8f}",
                 "tpOrdPx": "-1",  # market on trigger
-                "tpTriggerPxType": "last",
+                # mark price avoids false triggers from last-trade wicks during
+                # illiquid hours; OKX recommends mark for stop-losses on perps.
+                "tpTriggerPxType": "mark",
                 "slTriggerPx": f"{attach_sl_px:.8f}",
                 "slOrdPx": "-1",
-                "slTriggerPxType": "last",
+                "slTriggerPxType": "mark",
             }]
 
         body = json.dumps(order_body)
