@@ -178,7 +178,9 @@ class Executor:
     # so the watchdog uses the SAME percentages as the bot, not its 15%/40% defaults.
     # Without this, watchdog would only fire 3x past intended stop on -4120-rejected
     # server-side stops (the failure mode currently in production).
-    _WATCHDOG_STOPS_FILE = "/tmp/watchdog_stops.json"
+    # Shared file readable by the watchdog process. /tmp is isolated per-service
+    # (PrivateTmp=true) so a /tmp path would never reach the watchdog.
+    _WATCHDOG_STOPS_FILE = str(_PORTFOLIO_FILE.parent / "watchdog_stops.json")
 
     def _read_watchdog_stops(self) -> dict:
         try:

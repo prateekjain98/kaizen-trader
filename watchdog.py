@@ -31,7 +31,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 EXCHANGE = os.environ.get("EXCHANGE", "binance").lower()
-STOPS_FILE = Path("/tmp/watchdog_stops.json")
+# Must match Executor._WATCHDOG_STOPS_FILE. Shared via the bot's data dir
+# (not /tmp — systemd PrivateTmp isolates /tmp per service).
+_REPO_ROOT = Path(__file__).resolve().parent
+STOPS_FILE = _REPO_ROOT / "data" / "watchdog_stops.json"
 DEFAULT_STOP = 0.15   # 15% stop loss
 DEFAULT_TARGET = 0.40  # 40% take profit
 POLL_INTERVAL = 30.0
