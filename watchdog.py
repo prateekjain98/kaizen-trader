@@ -83,16 +83,21 @@ class BinanceWatchdog:
         ts = int(time.time() * 1000)
         params = f"timestamp={ts}"
         sig = self._signed(params)
+        # /fapi/v2/positionRisk has markPrice in the response (per-symbol position risk).
+        # /fapi/v2/account does NOT include markPrice, only entryPrice + unrealizedProfit.
+        # The previous code queried /fapi/v2/account and required mark>0, which always
+        # failed silently and made the watchdog blind to every open position.
         r = requests.get(
-            f"{self.BASE}/fapi/v2/account",
+            f"{self.BASE}/fapi/v2/positionRisk",
             headers={"X-MBX-APIKEY": self.key},
             params=params + "&signature=" + sig,
             timeout=10,
         )
         if r.status_code != 200:
+            _log(f"binance positionRisk fetch failed: {r.status_code} {r.text[:200]}")
             return []
         out = []
-        for p in r.json().get("positions", []):
+        for p in r.json():
             amt = float(p.get("positionAmt", 0))
             if amt == 0:
                 continue
@@ -106,7 +111,7 @@ class BinanceWatchdog:
             out.append({
                 "symbol": symbol, "qty": abs(amt), "entry": entry,
                 "mark": mark, "side": side, "pnl_pct": pnl_pct,
-                "upnl": float(p.get("unrealizedProfit", 0)),
+                "upnl": float(p.get("unRealizedProfit", 0)),  # note: positionRisk uses unRealizedProfit (capital R)
             })
         return out
 

@@ -356,25 +356,33 @@ class Executor:
 
         timestamp = int(time.time() * 1000)
 
-        # Stop loss order
+        # Stop loss order. Binance India accounts now reject closePosition=true with
+        # STOP_MARKET on /fapi/v1/order with -4120; use explicit quantity + reduceOnly
+        # which is the supported pattern across Binance Futures regions.
         try:
             sl_params = (
                 f"symbol={binance_symbol}&side={close_side}&type=STOP_MARKET"
-                f"&stopPrice={stop_price:.8f}&closePosition=true"
+                f"&stopPrice={stop_price:.8f}&quantity={quantity}&reduceOnly=true"
+                f"&workingType=MARK_PRICE&timeInForce=GTC"
                 f"&timestamp={timestamp}"
             )
             signature = hmac.new(
                 env.binance_api_secret.encode(), sl_params.encode(), "sha256"
             ).hexdigest()
-            requests.post(
+            r = requests.post(
                 f"{self._binance.FAPI_BASE}/fapi/v1/order",
                 headers={"X-MBX-APIKEY": env.binance_api_key},
                 data=f"{sl_params}&signature={signature}",
                 timeout=10,
             )
-            log("info", f"Server-side stop placed: {symbol} @ ${stop_price:.4f}")
+            # Binance returns 4xx for rejected orders without raising — must check status.
+            # Previous code logged success unconditionally, which masked silent failures.
+            if r.status_code == 200:
+                log("info", f"Server-side stop placed: {symbol} @ ${stop_price:.4f} orderId={r.json().get('orderId')}")
+            else:
+                log("error", f"Server-side stop REJECTED for {symbol}: {r.status_code} {r.text[:300]}")
         except Exception as e:
-            log("warn", f"Failed to place server stop for {symbol}: {e}")
+            log("error", f"Server-side stop EXCEPTION for {symbol}: {e}")
 
         # Take profit order — re-capture timestamp. The original timestamp can
         # easily fall outside Binance's recvWindow (5s default) if the SL POST
@@ -383,21 +391,25 @@ class Executor:
             tp_timestamp = int(time.time() * 1000)
             tp_params = (
                 f"symbol={binance_symbol}&side={close_side}&type=TAKE_PROFIT_MARKET"
-                f"&stopPrice={tp_price:.8f}&closePosition=true"
+                f"&stopPrice={tp_price:.8f}&quantity={quantity}&reduceOnly=true"
+                f"&workingType=MARK_PRICE&timeInForce=GTC"
                 f"&timestamp={tp_timestamp}"
             )
             signature = hmac.new(
                 env.binance_api_secret.encode(), tp_params.encode(), "sha256"
             ).hexdigest()
-            requests.post(
+            r = requests.post(
                 f"{self._binance.FAPI_BASE}/fapi/v1/order",
                 headers={"X-MBX-APIKEY": env.binance_api_key},
                 data=f"{tp_params}&signature={signature}",
                 timeout=10,
             )
-            log("info", f"Server-side TP placed: {symbol} @ ${tp_price:.4f}")
+            if r.status_code == 200:
+                log("info", f"Server-side TP placed: {symbol} @ ${tp_price:.4f} orderId={r.json().get('orderId')}")
+            else:
+                log("error", f"Server-side TP REJECTED for {symbol}: {r.status_code} {r.text[:300]}")
         except Exception as e:
-            log("warn", f"Failed to place server TP for {symbol}: {e}")
+            log("error", f"Server-side TP EXCEPTION for {symbol}: {e}")
 
     def update_price(self, symbol: str, price: float):
         """Update price, check stops/targets, and manage trailing stops.
