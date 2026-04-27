@@ -14,6 +14,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 
 import requests
 from dataclasses import dataclass, field
@@ -47,6 +48,38 @@ class Position:
     low_watermark: float = float("inf")
     entry_commission: float = 0  # fee paid on entry
     trailing_stop_price: float = 0  # moves up with price
+    # Rolling 5-min price snapshots for velocity / fast-cut decisions.
+    # Bounded deque (CPython append/iterate are GIL-atomic so no append+prune
+    # race vs the previous list+del approach). maxlen=600 covers 5min at up
+    # to ~2 samples/sec/symbol.
+    recent_prices: deque = field(default_factory=lambda: deque(maxlen=600))
+    exit_reason: Optional[str] = None  # set just before close so guards can read
+
+    def record_price(self, price: float, ts: Optional[float] = None) -> None:
+        """Append a price sample. deque maxlen handles bounding; we filter
+        by timestamp at read time, not write time."""
+        self.recent_prices.append((ts if ts is not None else time.time(), price))
+
+    def velocity_5min(self) -> Optional[float]:
+        """% change between oldest-in-window and newest sample over the last
+        5 min. Returns **None** when there's insufficient or stale data so
+        the caller can refuse to act on noise (matters at restart and during
+        WS feed stalls — without this we'd cut positions spuriously).
+        Otherwise: positive = rising, negative = falling."""
+        now = time.time()
+        cutoff = now - 300
+        # Snapshot the deque to a list so concurrent appends don't disturb
+        # the iteration's view. CPython's GIL makes this safe.
+        samples = [(t, p) for t, p in list(self.recent_prices) if t >= cutoff]
+        if len(samples) < 3:
+            return None  # not enough data yet (just opened or just restarted)
+        if now - samples[-1][0] > 60:
+            return None  # stalest sample > 1min old → feed dead, don't decide
+        t0, p0 = samples[0]
+        t1, p1 = samples[-1]
+        if p0 <= 0 or t1 - t0 < 60:
+            return None
+        return (p1 - p0) / p0
 
     @property
     def stop_price(self) -> float:
@@ -605,6 +638,30 @@ class Executor:
         except Exception as e:
             log("error", f"Server-side TP EXCEPTION for {symbol}: {e}")
 
+    # Symbols exempt from fast-cut (slower-base majors).
+    _FAST_CUT_EXEMPT = frozenset({"BTC", "ETH", "SOL", "BNB", "XRP"})
+
+    def _fast_cut_allowed(self, pos: Position) -> bool:
+        """Returns True if the asymmetric fast-cut rule should fire on `pos`.
+        Pure check — does not close. Caller closes if True.
+        Refuses to fire without recent data (velocity_5min returning None),
+        which protects against spurious cuts at restart and during WS stalls."""
+        if pos.symbol in self._FAST_CUT_EXEMPT:
+            return False
+        if pos.hold_hours < 0.5:    # need 30min to form a thesis
+            return False
+        if pos.unrealized_pnl_pct > -0.02:   # not far enough underwater
+            return False
+        v = pos.velocity_5min()
+        if v is None:
+            return False     # insufficient data → don't decide
+        # Direction-aware: longs need rising price (v>0); shorts need falling (v<0).
+        if pos.side == "long" and v > 0:
+            return False     # recovering
+        if pos.side == "short" and v < 0:
+            return False     # recovering for the short
+        return True
+
     def update_price(self, symbol: str, price: float):
         """Update price, check stops/targets, and manage trailing stops.
 
@@ -620,6 +677,7 @@ class Executor:
             pos.current_price = price
             pos.high_watermark = max(pos.high_watermark, price)
             pos.low_watermark = min(pos.low_watermark, price)
+            pos.record_price(price)
 
             # --- Trailing stop logic ---
             # Activate trailing after price moves 1.5x the stop distance in our favor
@@ -653,6 +711,18 @@ class Executor:
             # Max hold time (48h)
             elif pos.hold_hours > 48:
                 self._close_position(pos, price, "timeout")
+
+            # Asymmetric fast-cut: if held ≥30min and underwater ≥2% with no
+            # upward velocity in the last 5min, give up. Empirically, today's
+            # big winners (AGT +24%, ZBT +14% peak) were positive at the 30min
+            # mark; the big losers (HIGH -10%, ORCA -10%) were already
+            # underwater at 30min with no recovery. Convex strategy: cut
+            # losers fast, let winners run to ATR-based targets.
+            #
+            # Excludes majors (BTC/ETH/SOL/BNB/XRP) which often base for
+            # longer before moving. Velocity threshold: <= 0 (not recovering).
+            elif self._fast_cut_allowed(pos):
+                self._close_position(pos, price, "fast_cut")
 
     def _close_position(self, pos: Position, exit_price: float, reason: str):
         """Close position with full commission accounting.
