@@ -195,3 +195,83 @@ def test_closed_trades_is_bounded_deque(executor):
     from collections import deque
     assert isinstance(executor.closed_trades, deque)
     assert executor.closed_trades.maxlen == 500
+
+
+# ─── Progressive trailing-stop tier tests ──────────────────────────────────
+
+
+def test_trail_factor_returns_none_below_activation():
+    """Below 1.5x stop_pct profit, no trailing yet."""
+    from src.engine.executor import Executor
+    assert Executor._trail_factor(0.0, 0.05) is None
+    assert Executor._trail_factor(0.07, 0.05) is None  # 1.4x stop, just under
+
+
+def test_trail_factor_tier_initial():
+    """Initial activation tier: 1.5x stop ≤ profit < 3x stop → factor 1.0"""
+    from src.engine.executor import Executor
+    assert Executor._trail_factor(0.076, 0.05) == 1.0   # just over 1.5x (FP-safe)
+    assert Executor._trail_factor(0.10, 0.05) == 1.0    # 2x stop
+    assert Executor._trail_factor(0.149, 0.05) == 1.0   # just under 3x
+
+
+def test_trail_factor_tier_mid():
+    """Mid tier: 3x stop ≤ profit < 5x stop → factor 0.5"""
+    from src.engine.executor import Executor
+    assert Executor._trail_factor(0.151, 0.05) == 0.5   # just over 3x (FP-safe)
+    assert Executor._trail_factor(0.20, 0.05) == 0.5    # 4x stop
+    assert Executor._trail_factor(0.249, 0.05) == 0.5   # just under 5x
+
+
+def test_trail_factor_tier_tight():
+    """Tight tier: profit ≥ 5x stop → factor 0.25"""
+    from src.engine.executor import Executor
+    assert Executor._trail_factor(0.251, 0.05) == 0.25  # just over 5x (FP-safe)
+    assert Executor._trail_factor(0.50, 0.05) == 0.25   # 10x stop
+
+
+def test_progressive_trail_locks_more_at_higher_profit(executor):
+    """A long that runs deep into profit should have trail close to current
+    price (per the 0.25 tight tier), not the old constant-1.0 trail."""
+    pos = executor.open_position(_decision(symbol="MEGA", side="long",
+                                            entry=100.0, stop_pct=0.05, target_pct=0.50))
+    # Step the price up: +5%, +20%, +30%
+    executor.update_price("MEGA", 105.0)   # 1x stop profit, no trail
+    assert pos.trailing_stop_price == 0
+    executor.update_price("MEGA", 108.0)   # 1.6x stop profit → factor 1.0
+    # trail = 108 * (1 - 0.05*1.0) = 102.6
+    assert pos.trailing_stop_price == pytest.approx(102.6, rel=1e-3)
+    executor.update_price("MEGA", 120.0)   # 4x stop profit → factor 0.5
+    # trail = 120 * (1 - 0.05*0.5) = 117.0
+    assert pos.trailing_stop_price == pytest.approx(117.0, rel=1e-3)
+    executor.update_price("MEGA", 130.0)   # 6x stop profit → factor 0.25
+    # trail = 130 * (1 - 0.05*0.25) = 128.375
+    assert pos.trailing_stop_price == pytest.approx(128.375, rel=1e-3)
+
+
+def test_progressive_trail_never_decreases_when_profit_retraces(executor):
+    """If price retraces from a tight tier back to a looser tier, the trail
+    must not move down — the new_trail > existing guard prevents it."""
+    pos = executor.open_position(_decision(symbol="ZIG", side="long",
+                                            entry=100.0, stop_pct=0.05, target_pct=0.50))
+    executor.update_price("ZIG", 130.0)      # tight tier → trail 128.375
+    assert pos.trailing_stop_price == pytest.approx(128.375, rel=1e-3)
+    executor.update_price("ZIG", 110.0)      # retrace into initial tier
+    # New computed trail at 110 with factor 1.0 = 110*0.95 = 104.5 — LOWER
+    # than existing 128.375. Must be rejected (trail stays at 128.375).
+    assert pos.trailing_stop_price == pytest.approx(128.375, rel=1e-3)
+
+
+def test_progressive_trail_short_side(executor):
+    """Mirror test for shorts: trailing tightens as profit grows."""
+    pos = executor.open_position(_decision(symbol="DOWN", side="short",
+                                            entry=100.0, stop_pct=0.05, target_pct=0.50))
+    executor.update_price("DOWN", 92.0)   # 8% profit (1.6x stop) → factor 1.0
+    # trail = 92 * (1 + 0.05*1.0) = 96.6
+    assert pos.trailing_stop_price == pytest.approx(96.6, rel=1e-3)
+    executor.update_price("DOWN", 80.0)   # 20% profit (4x stop) → factor 0.5
+    # trail = 80 * (1 + 0.05*0.5) = 82.0
+    assert pos.trailing_stop_price == pytest.approx(82.0, rel=1e-3)
+    executor.update_price("DOWN", 70.0)   # 30% profit (6x stop) → factor 0.25
+    # trail = 70 * (1 + 0.05*0.25) = 70.875
+    assert pos.trailing_stop_price == pytest.approx(70.875, rel=1e-3)

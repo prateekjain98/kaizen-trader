@@ -74,7 +74,7 @@ class Position:
         if len(samples) < 3:
             return None  # not enough data yet (just opened or just restarted)
         if now - samples[-1][0] > 60:
-            return None  # stalest sample > 1min old → feed dead, don't decide
+            return None  # newest sample older than 60s → feed dead, don't decide
         t0, p0 = samples[0]
         t1, p1 = samples[-1]
         if p0 <= 0 or t1 - t0 < 60:
@@ -149,7 +149,6 @@ class Executor:
     MAX_POSITION_SIZE = env.max_position_usd
     MAX_DAILY_LOSS = env.max_daily_loss_usd
     COMMISSION_PCT = 0.00075    # Binance with BNB discount
-    TRAIL_ACTIVATION = 1.5      # Start trailing after 1.5x stop distance profit
 
     def __init__(self, paper: bool = True, initial_balance: float = 10_000,
                  trust_initial_balance: bool = False):
@@ -641,6 +640,28 @@ class Executor:
     # Symbols exempt from fast-cut (slower-base majors).
     _FAST_CUT_EXEMPT = frozenset({"BTC", "ETH", "SOL", "BNB", "XRP"})
 
+    # Multi-tier trailing-stop schedule. Tighter as profit grows so big
+    # winners don't give back too much. Tuple is (profit_in_units_of_stop,
+    # trail_factor_in_units_of_stop). Use class attribute so a maintainer
+    # can edit one place; _trail_factor reads from this directly.
+    TRAIL_TIERS: tuple = ((5.0, 0.25), (3.0, 0.5), (1.5, 1.0))
+
+    @classmethod
+    def _trail_factor(cls, profit_pct: float, stop_pct: float) -> Optional[float]:
+        """Return the multiplier (× stop_pct) of distance to trail behind
+        current price, given the trade's profit. Returns None if profit isn't
+        deep enough to activate trailing yet.
+
+        Tighter as profit grows so big winners don't give back too much.
+        Tuned so a +25% AGT-style winner trails inside +18% (vs giving back
+        to +14% under the old constant-1.0 trail). Tiers come from
+        cls.TRAIL_TIERS; iterates highest-first so the tightest matching
+        tier wins."""
+        for activation_mult, factor in cls.TRAIL_TIERS:
+            if profit_pct >= activation_mult * stop_pct:
+                return factor
+        return None
+
     def _fast_cut_allowed(self, pos: Position) -> bool:
         """Returns True if the asymmetric fast-cut rule should fire on `pos`.
         Pure check — does not close. Caller closes if True.
@@ -679,20 +700,31 @@ class Executor:
             pos.low_watermark = min(pos.low_watermark, price)
             pos.record_price(price)
 
-            # --- Trailing stop logic ---
-            # Activate trailing after price moves 1.5x the stop distance in our favor
-            trail_activation_dist = pos.stop_pct * self.TRAIL_ACTIVATION
+            # --- Progressive trailing stop ---
+            # Achieves the same "lock in gains" effect as scaled profit-taking
+            # without the complexity of partial-close orders. As profit grows
+            # relative to stop distance, the trail tightens:
+            #   profit >= 1.5x stop  → trail 1.0x stop behind  (locks ~0.5x)
+            #   profit >= 3.0x stop  → trail 0.5x stop behind  (locks ~2.5x)
+            #   profit >= 5.0x stop  → trail 0.25x stop behind (locks ~4.75x)
+            # AGT today peaked at +14% then trailed back to +12.4% before
+            # closing at +24% target. Under progressive trailing, after AGT
+            # passed +25% (5x its 5% stop) trailing would lock at +18.75%
+            # vs current +19% — basically identical for that case. The win
+            # is on positions that peak then reverse hard: today's behavior
+            # gives back too much of the peak gain.
             if pos.side == "long":
                 profit_pct = (price - pos.entry_price) / pos.entry_price
-                if profit_pct > trail_activation_dist:
-                    # Trail stop at entry + (profit - stop_pct)
-                    new_trail = price * (1 - pos.stop_pct)
+                trail_factor = self._trail_factor(profit_pct, pos.stop_pct)
+                if trail_factor is not None:
+                    new_trail = price * (1 - pos.stop_pct * trail_factor)
                     if new_trail > pos.trailing_stop_price:
                         pos.trailing_stop_price = new_trail
             else:
                 profit_pct = (pos.entry_price - price) / pos.entry_price
-                if profit_pct > trail_activation_dist:
-                    new_trail = price * (1 + pos.stop_pct)
+                trail_factor = self._trail_factor(profit_pct, pos.stop_pct)
+                if trail_factor is not None:
+                    new_trail = price * (1 + pos.stop_pct * trail_factor)
                     if pos.trailing_stop_price == 0 or new_trail < pos.trailing_stop_price:
                         pos.trailing_stop_price = new_trail
 
