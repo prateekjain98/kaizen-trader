@@ -292,6 +292,57 @@ def volatility_filter(decision, ctx: dict) -> FilterVerdict:
     )
 
 
+# ─── 6. Liquidation cascade gate ────────────────────────────────────────────
+
+# The strongest 5-30min directional signal in crypto perps: when shorts get
+# liquidated en masse, longs ride the forced-buy follow-through. Conversely,
+# a long-liquidation cascade fuels short continuation.
+#
+# Requirement: at least $50k of opposite-side liquidations in the last 5min,
+# and the dominant side must align with our direction. Numbers tuned for
+# small/mid-cap alts; majors typically see 10-100x larger cascades.
+
+_LIQ_USD_MIN = 50_000           # minimum cascade size to consider
+_LIQ_DOMINANCE_RATIO = 1.5      # dominant side must be 1.5x the other
+
+
+def liquidation_cascade_filter(decision, ctx: dict) -> FilterVerdict:
+    """For longs: require recent SHORT liquidations (squeeze fuel).
+    For shorts: require recent LONG liquidations (capitulation fuel).
+    Falls open if tracker isn't running yet (first 5 min after restart)."""
+    try:
+        from src.engine.liquidation_tracker import get_tracker
+        tracker = get_tracker()
+    except Exception:
+        return FilterVerdict(allowed=True, rule="liq_cascade", reason="tracker unavailable")
+    if tracker.status != "connected":
+        return FilterVerdict(allowed=True, rule="liq_cascade", reason="tracker not connected")
+    summary = tracker.cascade_score(decision.symbol, window_seconds=300)
+    long_usd = summary["long_liq_usd_5m"]
+    short_usd = summary["short_liq_usd_5m"]
+    total = long_usd + short_usd
+    if total < _LIQ_USD_MIN:
+        return FilterVerdict(
+            allowed=False, rule="liq_cascade",
+            reason=f"{decision.symbol} low liq activity 5m (${total:,.0f}) — no cascade to ride",
+        )
+    needed_side = "short" if decision.side == "long" else "long"
+    needed_usd = short_usd if needed_side == "short" else long_usd
+    other_usd = long_usd if needed_side == "short" else short_usd
+    if needed_usd < other_usd * _LIQ_DOMINANCE_RATIO:
+        return FilterVerdict(
+            allowed=False, rule="liq_cascade",
+            reason=f"{decision.symbol} {decision.side}: need {needed_side}-liqs to dominate, "
+                   f"got long=${long_usd:,.0f} short=${short_usd:,.0f}",
+        )
+    # Stash for downstream sizing/exits
+    ctx["liq_cascade_usd"] = needed_usd
+    return FilterVerdict(
+        allowed=True, rule="liq_cascade",
+        reason=f"{decision.symbol} {needed_side}-liqs ${needed_usd:,.0f}/5m supports {decision.side}",
+    )
+
+
 # ─── Filter chain runner ────────────────────────────────────────────────────
 
 # Order = cheapest-first: time_of_day (no API), then 4 API-bound checks.
@@ -300,6 +351,7 @@ DEFAULT_FILTERS: list[Callable] = [
     time_of_day_filter,
     correlation_filter,
     volatility_filter,
+    liquidation_cascade_filter,   # WS-fed, sub-second; high-edge
     basis_filter,
     oi_delta_filter,
 ]

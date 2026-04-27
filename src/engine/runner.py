@@ -485,6 +485,14 @@ class TradingEngine:
         # Start data streams
         self.streams.start()
 
+        # Start liquidation tracker (Binance !forceOrder@arr) — feeds the
+        # liquidation_cascade entry filter and is queryable by the brain via
+        # ctx['liquidations']. Cheap to run; ~30 events/sec normal load.
+        if not self.paper:
+            from src.engine.liquidation_tracker import get_tracker
+            get_tracker().start()
+            log("info", "Liquidation tracker started")
+
         # Start OKX WS (live mode + okx exchange only)
         if self.okx_public_ws:
             self.okx_public_ws.connect()
