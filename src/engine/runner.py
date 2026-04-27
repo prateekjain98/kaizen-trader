@@ -450,6 +450,10 @@ class TradingEngine:
             # don't let the displayed balance drift from reality.
             if not self.paper and reconcile_counter % 5 == 0:
                 self.executor._reconcile_balance(reason="heartbeat")
+                # Refresh funding-fee accounting same cadence (5 min). The
+                # method internally rate-limits to 5 min so calling more
+                # often is safe but redundant.
+                self.executor.refresh_funding_paid_24h()
             reconcile_counter += 1
 
             stats = self.executor.get_stats()
@@ -461,11 +465,13 @@ class TradingEngine:
             ) or "none"
 
             mode = "PAPER" if self.paper else "LIVE"
+            funding = self.executor.funding_paid_24h
+            funding_str = f" | Fund24h:${funding:+.2f}" if funding is not None else ""
             log("info",
                 f"[{mode}] Bal:${stats['balance']:,.0f} | "
                 f"Pos:{stats['open_positions']} [{positions_str}] | "
                 f"Trades:{stats['total_trades']} ({stats['win_rate']:.0f}%WR) | "
-                f"PnL:${stats['total_pnl']:+,.2f} | "
+                f"PnL:${stats['total_pnl']:+,.2f}{funding_str} | "
                 f"Ticks:{self.ticks_run} Sigs:{self.signals_received} | "
                 f"API:${api_cost:.3f}/day")
 

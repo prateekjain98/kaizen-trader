@@ -419,6 +419,59 @@ class BinanceProvider:
         return self._place_order(symbol, position_id, "SELL", quantity, market_price,
                                  reduce_only=reduce_only)
 
+    def get_funding_income(self, start_ms: int, end_ms: Optional[int] = None) -> Optional[float]:
+        """Sum of FUNDING_FEE income (USDT) over the time window. Positive
+        means net received, negative means net paid. Returns None on error
+        so the caller can keep stale value rather than zeroing it out.
+
+        Binance weight: 30. Don't poll faster than every 5 min.
+
+        Income history is capped at 3 months and limit=1000 per page;
+        a 24h window with active perps almost never exceeds 1000 funding
+        events (3 events/symbol/day × ~5 symbols = 15 events typical)."""
+        if not env.binance_api_key or not env.binance_api_secret:
+            return None
+        if end_ms is None:
+            end_ms = int(time.time() * 1000)
+        timestamp = int(time.time() * 1000)
+        # Build the params dict ONCE and derive the HMAC string from the
+        # same source. Avoids the latent bug of two-place authoring (manual
+        # query string + requests.params dict) where a future edit to one
+        # side silently invalidates the signature.
+        from urllib.parse import urlencode
+        params_dict = {
+            "incomeType": "FUNDING_FEE",
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": 1000,
+            "timestamp": timestamp,
+        }
+        signature = hmac.new(
+            env.binance_api_secret.encode(),
+            urlencode(params_dict).encode(),
+            "sha256",
+        ).hexdigest()
+        params_dict["signature"] = signature
+        try:
+            time.sleep(0.1)
+            resp = requests.get(
+                f"{self.FAPI_BASE}/fapi/v1/income",
+                headers={"X-MBX-APIKEY": env.binance_api_key},
+                params=params_dict,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if len(rows) >= 1000:
+                # Hit the page cap — under-reporting funding. Log so the
+                # operator can size up before the value goes stale silently.
+                log("warn", "get_funding_income: 1000-row page cap hit; "
+                            "consider implementing pagination")
+            return sum(float(r.get("income", 0)) for r in rows if r.get("asset") == "USDT")
+        except Exception as e:
+            log("warn", f"Binance funding-income fetch failed: {e}")
+            return None
+
     def get_balances(self) -> dict[str, float] | None:
         """Return availableBalance per asset, or None if the fetch failed.
         Callers MUST distinguish None (transient error → keep stale balance)

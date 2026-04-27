@@ -168,6 +168,11 @@ class Executor:
         # src/risk/portfolio.py entirely. The bot would happily keep entering
         # after 3 consecutive -10% stops with no cooldown.
         self._protections = ProtectionChain.from_config(DEFAULT_PROTECTIONS)
+        # Funding-fee accounting: net of FUNDING_FEE income over last 24h.
+        # Positive = received, negative = paid. Refreshed periodically by
+        # the heartbeat loop. None until first fetch lands.
+        self.funding_paid_24h: Optional[float] = None
+        self._funding_last_refresh: float = 0.0
         self._trust_initial_balance = trust_initial_balance
         self.positions: list[Position] = []
         # Bounded so the in-process list cannot grow without limit on a long-running bot.
@@ -251,6 +256,37 @@ class Executor:
         if symbol in data:
             del data[symbol]
             self._write_watchdog_stops_atomic(data)
+
+    def refresh_funding_paid_24h(self) -> None:
+        """Pull the last 24h of FUNDING_FEE income from Binance. Net positive
+        = received, negative = paid. No-op in paper mode or if it's been
+        less than 5 min since the last refresh (rate-limit hygiene; this
+        endpoint costs 30 weight)."""
+        if self.paper or self._binance is None:
+            return
+        if not hasattr(self._binance, "get_funding_income"):
+            # OKX provider doesn't expose this — log once so the operator
+            # knows funding accounting is intentionally disabled, not broken.
+            if not getattr(self, "_funding_skip_logged", False):
+                log("info", f"Funding-fee accounting unavailable for "
+                            f"{self._binance.name} provider — Fund24h will not appear in heartbeats")
+                self._funding_skip_logged = True
+            return
+        now = time.time()
+        if now - self._funding_last_refresh < 300:
+            return
+        start_ms = int((now - 86400) * 1000)
+        try:
+            net = self._binance.get_funding_income(start_ms)
+        except Exception as e:
+            log("warn", f"refresh_funding_paid_24h failed: {e}")
+            return
+        if net is None:
+            return  # error already logged in provider
+        self.funding_paid_24h = net
+        self._funding_last_refresh = now
+        if abs(net) >= 0.10:  # only log notable changes
+            log("info", f"Funding 24h: ${net:+.3f} (paid <0, received >0)")
 
     def _reconcile_balance(self, reason: str = "periodic") -> None:
         """Overwrite self.balance with the exchange's reported availableBalance.
