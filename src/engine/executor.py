@@ -556,6 +556,14 @@ class Executor:
         # Sync per-symbol stop/target into watchdog file so the watchdog uses
         # the SAME thresholds as the bot (not its 15%/40% defaults).
         self._sync_watchdog_stop(pos)
+        # Subscribe to per-symbol aggTrade for CVD tracking. No-op in paper
+        # mode (tracker not started). Idempotent if already subscribed.
+        if not self.paper:
+            try:
+                from src.engine.cvd_tracker import get_tracker as _cvd
+                _cvd().subscribe(pos.symbol)
+            except Exception as e:
+                log("warn", f"CVD subscribe failed for {pos.symbol}: {e}")
         log("trade", f"OPEN {pos.side.upper()} {pos.symbol} ${size:.0f} @ ${entry_price:.4f} "
             f"stop=${pos.stop_price:.4f} target=${pos.target_price:.4f} fee=${entry_commission:.3f}")
         return pos
@@ -830,6 +838,15 @@ class Executor:
         # Drop watchdog stop entry so it doesn't fire on a re-opened symbol
         # using the previous trade's parameters.
         self._clear_watchdog_stop(pos.symbol)
+        # Unsubscribe CVD aggTrade — only cared while position was open.
+        # Don't unsub if other open positions still need it (rare with
+        # MAX_POSITIONS=10 but cheap to check).
+        if not self.paper and not any(p.symbol == pos.symbol for p in self.positions):
+            try:
+                from src.engine.cvd_tracker import get_tracker as _cvd
+                _cvd().unsubscribe(pos.symbol)
+            except Exception as e:
+                log("warn", f"CVD unsubscribe failed for {pos.symbol}: {e}")
 
         # Feed the protection chain so StoplossGuard / Cooldown / Drawdown
         # rules update their state. Without this they never fire on the

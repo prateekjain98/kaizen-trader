@@ -489,9 +489,20 @@ class TradingEngine:
         # liquidation_cascade entry filter and is queryable by the brain via
         # ctx['liquidations']. Cheap to run; ~30 events/sec normal load.
         if not self.paper:
-            from src.engine.liquidation_tracker import get_tracker
-            get_tracker().start()
+            from src.engine.liquidation_tracker import get_tracker as _liq_tracker
+            _liq_tracker().start()
             log("info", "Liquidation tracker started")
+
+            # Start CVD tracker — per-symbol cumulative volume delta from
+            # aggTrade. Subscribed dynamically when positions open; provides
+            # divergence signal for entry filter. Pre-subscribe to current
+            # open positions so velocity has data after restart.
+            from src.engine.cvd_tracker import get_tracker as _cvd_tracker
+            cvd = _cvd_tracker()
+            cvd.start()
+            for pos in self.executor.positions:
+                cvd.subscribe(pos.symbol)
+            log("info", f"CVD tracker started ({len(self.executor.positions)} pre-subs)")
 
         # Start OKX WS (live mode + okx exchange only)
         if self.okx_public_ws:
