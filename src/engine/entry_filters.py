@@ -292,7 +292,92 @@ def volatility_filter(decision, ctx: dict) -> FilterVerdict:
     )
 
 
-# ─── 6. CVD divergence gate ────────────────────────────────────────────────
+# ─── 6. Top-trader long/short crowding gate ────────────────────────────────
+
+# Binance publishes the long/short position ratio of the top 20% of traders
+# by margin balance. Extreme crowding is a contrarian signal: when smart
+# money is 70%+ one direction, a squeeze/reversal is more likely than
+# continuation. Don't ADD to the crowd; let it unwind instead.
+#
+# Endpoint: GET /futures/data/topLongShortPositionRatio?symbol=...&period=5m
+# Returns: longShortRatio (long/short), longAccount (% long), shortAccount.
+# Free, no auth, ~50ms latency. 5min update cadence.
+#
+# Thresholds: longShortRatio > 2.5 → top traders are 71%+ long (refuse adds)
+#             longShortRatio < 0.5 → top traders are 67%+ short (refuse adds)
+
+_TOP_RATIO_URL = "https://fapi.binance.com/futures/data/topLongShortPositionRatio"
+_TOP_RATIO_LONG_BLOCK = 2.5
+_TOP_RATIO_SHORT_BLOCK = 0.5
+# Per-symbol cache so we don't hit the endpoint on every brain decision.
+# 5min TTL — matches the endpoint's update cadence.
+_top_ratio_cache: dict = {}  # symbol → (timestamp, ratio)
+_TOP_RATIO_TTL_SEC = 300
+
+
+def _fetch_top_ls_ratio(binance_symbol: str) -> Optional[float]:
+    """Return the latest top-trader long/short position ratio, or None on
+    error. Cached for 5 minutes per symbol."""
+    now = time.time()
+    cached = _top_ratio_cache.get(binance_symbol)
+    if cached and now - cached[0] < _TOP_RATIO_TTL_SEC:
+        return cached[1]
+    try:
+        # 2s timeout — this runs on the brain-tick thread which has a 60s
+        # interval. With up to 10 symbols per tick, 5s × 10 = 50s worst case
+        # consumes nearly the entire tick window. 2s caps the worst case to
+        # 20s and the 5-min TTL means the next tick will hit cache anyway.
+        resp = requests.get(
+            _TOP_RATIO_URL,
+            params={"symbol": binance_symbol, "period": "5m", "limit": 1},
+            timeout=2,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            return None
+        ratio = float(rows[0].get("longShortRatio", 0))
+        if ratio <= 0:
+            return None
+        _top_ratio_cache[binance_symbol] = (now, ratio)
+        return ratio
+    except Exception as e:
+        log("warn", f"top L/S ratio fetch failed for {binance_symbol}: {e}")
+        # Defensive: evict any stale entry so we can't accidentally serve it
+        # back during the same brain tick if a TTL race ever exposed one.
+        _top_ratio_cache.pop(binance_symbol, None)
+        return None
+
+
+def top_trader_crowding_filter(decision, ctx: dict) -> FilterVerdict:
+    """Block entries that would add to an already-crowded top-trader
+    position. Refuses longs when top traders are >71% long; refuses shorts
+    when >67% short. Falls open on fetch error so a Binance hiccup doesn't
+    block all trades."""
+    sym = (decision.symbol or "").upper()
+    binance_sym = f"{sym}USDT"
+    ratio = _fetch_top_ls_ratio(binance_sym)
+    if ratio is None:
+        return FilterVerdict(allowed=True, rule="top_crowding", reason="fetch unavailable")
+    ctx["top_long_short_ratio"] = ratio
+    long_pct = ratio / (1 + ratio) * 100  # proportion long
+    if decision.side == "long" and ratio > _TOP_RATIO_LONG_BLOCK:
+        return FilterVerdict(
+            allowed=False, rule="top_crowding",
+            reason=f"{sym} top traders {long_pct:.0f}% long (ratio {ratio:.2f}) — refuse to add to crowd",
+        )
+    if decision.side == "short" and ratio < _TOP_RATIO_SHORT_BLOCK:
+        return FilterVerdict(
+            allowed=False, rule="top_crowding",
+            reason=f"{sym} top traders {100-long_pct:.0f}% short (ratio {ratio:.2f}) — refuse to add to crowd",
+        )
+    return FilterVerdict(
+        allowed=True, rule="top_crowding",
+        reason=f"{sym} top L/S ratio {ratio:.2f} — {decision.side} OK",
+    )
+
+
+# ─── 7. CVD divergence gate ────────────────────────────────────────────────
 
 # CVD = cumulative volume delta (buyer-initiated minus seller-initiated $).
 # For longs we don't want to enter into a sell tape (CVD strongly negative);
@@ -409,6 +494,7 @@ DEFAULT_FILTERS: list[Callable] = [
     volatility_filter,
     cvd_flow_filter,              # WS-fed, sub-second; "don't fight flow"
     liquidation_cascade_filter,   # WS-fed, sub-second; high-edge
+    top_trader_crowding_filter,   # cached HTTP; 5min TTL; contrarian gate
     basis_filter,
     oi_delta_filter,
 ]
