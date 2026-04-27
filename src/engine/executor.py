@@ -447,6 +447,36 @@ class Executor:
             self.daily_pnl = 0
             self._daily_reset_ts = now
 
+    # Cross-symbol max-drawdown circuit breaker. Existing protections see
+    # ONLY realized daily_pnl. If 3 positions are sitting at -8% unrealized,
+    # that's real exposure the protection chain is blind to. Block new
+    # entries when (realized + unrealized) drawdown vs session-peak equity
+    # exceeds this fraction. Existing positions close normally.
+    _MAX_TOTAL_DRAWDOWN_PCT = 0.15  # 15% of session-peak equity
+
+    def _equity_drawdown_pct(self) -> float:
+        """Return current drawdown as a positive fraction of session-peak
+        equity. 0 = at peak; 0.15 = down 15% from peak.
+
+        SESSION semantics: peak resets at restart so a -10% deploy doesn't
+        leave the bot permanently in halt mode. Logged at startup for
+        operator visibility (see Executor.__init__).
+
+        Thread safety: snapshots balance + positions + unrealized inside
+        self._lock to prevent torn reads against the price-updater and
+        _close_position threads."""
+        with self._lock:
+            balance = self.balance
+            unrealized = sum(p.unrealized_pnl_usd for p in self.positions)
+        equity = balance + unrealized
+        peak = getattr(self, "_peak_equity", 0)
+        if equity > peak:
+            self._peak_equity = equity
+            return 0.0
+        if peak <= 0:
+            return 0.0
+        return max(0.0, (peak - equity) / peak)
+
     def can_trade(self) -> bool:
         self._reset_daily()
         if len(self.positions) >= self.MAX_POSITIONS:
@@ -454,6 +484,20 @@ class Executor:
         if self.daily_pnl <= -self.MAX_DAILY_LOSS:
             return False
         if self.balance < 5:  # Allow trading on small accounts
+            return False
+        # Cross-symbol drawdown gate (sees unrealized PnL too — blind spot
+        # of the realized-only daily_pnl check above).
+        dd = self._equity_drawdown_pct()
+        if dd >= self._MAX_TOTAL_DRAWDOWN_PCT:
+            # Log at most once per 5 min to avoid filling structured-log
+            # sinks during sustained drawdown events (brain ticks every 60s).
+            now = time.time()
+            last = getattr(self, "_drawdown_log_ts", 0)
+            if now - last >= 300:
+                log("info", f"Trade blocked: total drawdown {dd*100:.1f}% from session peak "
+                    f"exceeds {self._MAX_TOTAL_DRAWDOWN_PCT*100:.0f}% — close existing positions before reopening "
+                    f"(suppressing further log spam for 5 min)")
+                self._drawdown_log_ts = now
             return False
         # Run the full protection chain (cooldown after stops, drawdown halt,
         # rapid-DD halt). Logs the rule that blocked entry so behavior is

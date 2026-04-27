@@ -275,3 +275,25 @@ def test_progressive_trail_short_side(executor):
     executor.update_price("DOWN", 70.0)   # 30% profit (6x stop) → factor 0.25
     # trail = 70 * (1 + 0.05*0.25) = 70.875
     assert pos.trailing_stop_price == pytest.approx(70.875, rel=1e-3)
+
+
+# ─── Cross-symbol drawdown circuit breaker tests ──────────────────────────
+
+
+def test_equity_drawdown_returns_zero_at_peak(executor):
+    """No positions, balance untouched → drawdown 0."""
+    assert executor._equity_drawdown_pct() == 0.0
+
+
+def test_drawdown_blocks_can_trade_at_threshold(executor):
+    """When equity drops 15%+ from peak, can_trade refuses."""
+    # Establish a peak
+    executor._equity_drawdown_pct()
+    initial = executor.balance
+    # Simulate a 20% loss by directly reducing balance (no positions to model).
+    executor.balance = initial * 0.80
+    assert executor.can_trade() is False
+    # Restore — drawdown clears as new peak forms on the next equity rise.
+    executor.balance = initial
+    executor._peak_equity = initial  # explicit so test is deterministic
+    assert executor._equity_drawdown_pct() == 0.0
