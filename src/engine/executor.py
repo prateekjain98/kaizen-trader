@@ -508,10 +508,27 @@ class Executor:
                 decision.stop_pct = atr_stop
                 decision.target_pct = atr_target
 
+        # Funding-rate-aware sizing: scale position by how favorable funding
+        # is to the trade direction. Longs on negative funding receive money
+        # every 8h; longs on positive funding pay. Same inverted for shorts.
+        # Multiplier: 1.25× when strongly favorable, 0.5× when strongly
+        # unfavorable, 1.0× otherwise. Applied AFTER the base size is
+        # computed so MAX_POSITION_SIZE is still the absolute ceiling.
+        size_mult = 1.0
+        if not self.paper:
+            size_mult = self._funding_size_multiplier(decision.symbol, decision.side)
+            if size_mult != 1.0:
+                log("info", f"Funding-aware sizing for {decision.symbol} {decision.side}: "
+                    f"multiplier ×{size_mult:.2f}")
+
         with self._lock:
 
-            size = min(decision.size_usd, self.MAX_POSITION_SIZE, self.balance * 0.4)
+            base_size = min(decision.size_usd, self.MAX_POSITION_SIZE, self.balance * 0.4)
+            size = min(base_size * size_mult, self.MAX_POSITION_SIZE, self.balance * 0.4)
             if size < 10:
+                if size_mult < 1.0:
+                    log("info", f"Funding penalty reduced {decision.symbol} size to "
+                        f"${size:.2f} (×{size_mult:.2f}) — below $10 minimum, skipping")
                 return None
 
             entry_commission = size * self.COMMISSION_PCT
@@ -683,6 +700,46 @@ class Executor:
 
     # Symbols exempt from fast-cut (slower-base majors).
     _FAST_CUT_EXEMPT = frozenset({"BTC", "ETH", "SOL", "BNB", "XRP"})
+
+    # Funding-rate alignment thresholds (per 8h period).
+    _FUNDING_FAVORABLE_THRESHOLD = 0.001   # |rate| > 0.1% per 8h is significant
+    _FUNDING_BOOST_MULT = 1.25
+    _FUNDING_PENALTY_MULT = 0.5
+
+    def _funding_size_multiplier(self, symbol: str, side: str) -> float:
+        """Return a sizing multiplier based on whether current funding favors
+        the trade direction. Reuses the basis_filter's premiumIndex cache
+        path (cheap per-tick GET to /fapi/v1/premiumIndex).
+
+        Long + negative funding = receive funding every 8h → boost
+        Long + positive funding = pay funding every 8h → penalty
+        Short + positive funding = receive → boost
+        Short + negative funding = pay → penalty
+        Anything in the noise band → 1.0× (no adjustment)
+
+        Returns 1.0 on fetch failure so a Binance hiccup doesn't change
+        sizing in surprising ways."""
+        binance_sym = f"{symbol.upper()}USDT"
+        # Use the provider's base URL so testnet/staging configs route
+        # consistently. Fallback for non-Binance providers.
+        base = getattr(self._binance, "FAPI_BASE", "https://fapi.binance.com")
+        try:
+            resp = requests.get(
+                f"{base}/fapi/v1/premiumIndex",
+                params={"symbol": binance_sym}, timeout=2,
+            )
+            resp.raise_for_status()
+            funding_rate = float(resp.json().get("lastFundingRate", 0))
+        except Exception as e:
+            log("warn", f"funding-rate fetch failed for {symbol}: {e}")
+            return 1.0
+        if abs(funding_rate) < self._FUNDING_FAVORABLE_THRESHOLD:
+            return 1.0
+        if side == "long":
+            # negative funding → receive → boost; positive → pay → penalty
+            return self._FUNDING_BOOST_MULT if funding_rate < 0 else self._FUNDING_PENALTY_MULT
+        else:  # short
+            return self._FUNDING_BOOST_MULT if funding_rate > 0 else self._FUNDING_PENALTY_MULT
 
     # Multi-tier trailing-stop schedule. Tighter as profit grows so big
     # winners don't give back too much. Tuple is (profit_in_units_of_stop,
