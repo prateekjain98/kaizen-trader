@@ -416,6 +416,32 @@ class Executor:
             if self.has_position(decision.symbol):
                 return None
 
+        # Entry-filter chain: time-of-day, correlation, ATR sanity, basis,
+        # OI-delta. Each filter logs its own block reason so calibration is
+        # auditable. Run BEFORE the lock-bound sizing so we don't waste a
+        # balance reconcile on a trade we'll refuse anyway.
+        # Skip filters in paper mode (no live data flowing).
+        if not self.paper:
+            from src.engine.entry_filters import run_filters
+            ctx = {"open_positions": list(self.positions)}
+            verdict = run_filters(decision, ctx)
+            if not verdict.allowed:
+                return None
+            # If a filter computed ATR, use it for an ATR-based stop.
+            atr_pct = ctx.get("atr_pct_15m")
+            if atr_pct and atr_pct > 0:
+                # 1.5x ATR stop, 3x ATR target — research-recommended for crypto perps.
+                # Capped to existing decision values to prevent runaway extension.
+                atr_stop = min(decision.stop_pct, max(0.025, 1.5 * atr_pct))
+                atr_target = max(decision.target_pct, 3.0 * atr_pct)
+                if abs(atr_stop - decision.stop_pct) > 0.005:
+                    log("info", f"ATR-tightened stop for {decision.symbol}: "
+                        f"{decision.stop_pct*100:.1f}% → {atr_stop*100:.1f}% (ATR {atr_pct*100:.2f}%)")
+                decision.stop_pct = atr_stop
+                decision.target_pct = atr_target
+
+        with self._lock:
+
             size = min(decision.size_usd, self.MAX_POSITION_SIZE, self.balance * 0.4)
             if size < 10:
                 return None
