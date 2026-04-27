@@ -292,7 +292,63 @@ def volatility_filter(decision, ctx: dict) -> FilterVerdict:
     )
 
 
-# ─── 6. Liquidation cascade gate ────────────────────────────────────────────
+# ─── 6. CVD divergence gate ────────────────────────────────────────────────
+
+# CVD = cumulative volume delta (buyer-initiated minus seller-initiated $).
+# For longs we don't want to enter into a sell tape (CVD strongly negative);
+# for shorts we don't want to enter into a buy tape (CVD strongly positive).
+# This is a "don't fight the flow" filter — bullish/bearish divergence is a
+# stronger entry signal but harder to formalize as a gate, so we use the
+# weaker but reliable "flow at least neutral in our direction" rule.
+
+# Two named thresholds (one positive, one negative) to remove the
+# double-negation maintenance trap. A future maintainer can change either
+# without inverting the other's meaning.
+_CVD_LONG_BLOCK_BELOW = -25_000   # block longs when 15m CVD is more negative
+_CVD_SHORT_BLOCK_ABOVE = 25_000   # block shorts when 15m CVD exceeds
+
+
+def cvd_flow_filter(decision, ctx: dict) -> FilterVerdict:
+    """For longs: CVD over the last 15min must not be deeply negative
+    (meaning: don't long into a sustained sell tape). For shorts: must not
+    be deeply positive. Falls open if the tracker isn't yet running or has
+    no history.
+
+    Does NOT auto-subscribe on miss — that would leak subscriptions for
+    symbols the bot considers but never enters. The Executor.open_position
+    path already subscribes on actual entry, so the next time this symbol
+    appears in a decision (after history accumulates) the filter has data."""
+    try:
+        from src.engine.cvd_tracker import get_tracker
+        tracker = get_tracker()
+    except Exception:
+        return FilterVerdict(allowed=True, rule="cvd_flow", reason="tracker unavailable")
+    if tracker.status != "connected":
+        return FilterVerdict(allowed=True, rule="cvd_flow", reason="tracker not connected")
+    cvd = tracker.cvd(decision.symbol, window_seconds=900)  # 15min
+    if cvd is None:
+        return FilterVerdict(allowed=True, rule="cvd_flow",
+                             reason=f"{decision.symbol} cvd not subscribed — fail-open")
+    # Stash unconditionally so any downstream consumer (logging, analytics,
+    # sizing) can read it whether we pass or block.
+    ctx["cvd_15m_usd"] = cvd
+    if decision.side == "long" and cvd < _CVD_LONG_BLOCK_BELOW:
+        return FilterVerdict(
+            allowed=False, rule="cvd_flow",
+            reason=f"{decision.symbol} 15m CVD ${cvd:,.0f} — sell tape, refuse long entry",
+        )
+    if decision.side == "short" and cvd > _CVD_SHORT_BLOCK_ABOVE:
+        return FilterVerdict(
+            allowed=False, rule="cvd_flow",
+            reason=f"{decision.symbol} 15m CVD ${cvd:,.0f} — buy tape, refuse short entry",
+        )
+    return FilterVerdict(
+        allowed=True, rule="cvd_flow",
+        reason=f"{decision.symbol} 15m CVD ${cvd:,.0f} — {decision.side} OK",
+    )
+
+
+# ─── 7. Liquidation cascade gate ────────────────────────────────────────────
 
 # The strongest 5-30min directional signal in crypto perps: when shorts get
 # liquidated en masse, longs ride the forced-buy follow-through. Conversely,
@@ -351,6 +407,7 @@ DEFAULT_FILTERS: list[Callable] = [
     time_of_day_filter,
     correlation_filter,
     volatility_filter,
+    cvd_flow_filter,              # WS-fed, sub-second; "don't fight flow"
     liquidation_cascade_filter,   # WS-fed, sub-second; high-edge
     basis_filter,
     oi_delta_filter,
