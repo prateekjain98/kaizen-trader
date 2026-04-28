@@ -31,7 +31,7 @@ from src.engine.brain_memory import BrainMemory
 from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices, fetch_binance_top_movers
 from src.engine.signal_detector import SignalDetector, SignalPacket
 from src.engine.claude_brain import ClaudeBrain
-from src.engine.executor import Executor
+from src.engine.executor import Executor, _PORTFOLIO_FILE
 from src.engine.correlation_scanner import CorrelationScanner
 from src.engine.log import log
 
@@ -474,6 +474,17 @@ class TradingEngine:
                 f"PnL:${stats['total_pnl']:+,.2f}{funding_str} | "
                 f"Ticks:{self.ticks_run} Sigs:{self.signals_received} | "
                 f"API:${api_cost:.3f}/day")
+
+            # Liveness file: external watchdog reads this and restarts the
+            # service if the timestamp is stale (>3 min). Critical because
+            # `systemctl is-active` returns "active" for a hung process —
+            # we lost ~17h of trading yesterday to a silent hang where the
+            # bot was systemd-active but had stopped logging entirely.
+            try:
+                liveness_path = _PORTFOLIO_FILE.parent / ".heartbeat"
+                liveness_path.write_text(str(int(time.time())))
+            except Exception as e:
+                log("warn", f"liveness write failed: {e}")
 
             self._stop.wait(timeout=60)
 

@@ -406,6 +406,19 @@ def main() -> None:
                 else:
                     _log("alive: no open positions")
                 last_status_print = now
+
+            # Kaizen liveness check — log loudly if heartbeat stale. Cannot
+            # restart from this process: NoNewPrivileges=true on this systemd
+            # unit blocks sudo. Restart is handled by scripts/kaizen-liveness-
+            # check.sh installed as a 1-min root cron.
+            try:
+                hb_path = _REPO_ROOT / "data" / ".heartbeat"
+                if hb_path.exists():
+                    hb_age = now - hb_path.stat().st_mtime
+                    if hb_age > 180:
+                        _log(f"KAIZEN HUNG: heartbeat {hb_age:.0f}s stale — root-cron should restart soon")
+            except Exception as e:
+                _log(f"liveness check failed: {e}")
         except Exception as e:
             _log(f"loop error: {e}")
         time.sleep(POLL_INTERVAL)
