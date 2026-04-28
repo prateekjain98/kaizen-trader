@@ -18,6 +18,17 @@ set -euo pipefail
 HB_FILE="/home/prateekjain/kaizen-trader/data/.heartbeat"
 MAX_AGE_SEC="${KAIZEN_HB_MAX_AGE:-180}"   # 3 min default
 SERVICE="kaizen.service"
+ALERT_SCRIPT="/home/prateekjain/kaizen-trader/scripts/send-alert.py"
+
+# Send alert via send-alert.py (email + ntfy fallback). Always run as
+# the prateekjain user so the .env file is readable.
+alert() {
+  local subject="$1"; shift
+  local body="$1"; shift
+  if [[ -x "$ALERT_SCRIPT" ]]; then
+    sudo -u prateekjain "$ALERT_SCRIPT" "$subject" "$body" critical || true
+  fi
+}
 
 # If heartbeat doesn't exist yet, the bot may be in startup — give it 5 min
 # of grace from systemd's own start time before firing.
@@ -29,6 +40,8 @@ if [[ ! -f "$HB_FILE" ]]; then
   fi
   echo "kaizen-liveness: $HB_FILE missing — restarting $SERVICE"
   systemctl restart "$SERVICE"
+  alert "Bot restarted: heartbeat file missing" \
+        "kaizen-trader had no heartbeat file at $HB_FILE. Restarted $SERVICE. Verify positions on Binance and check journalctl -u kaizen for the cause."
   exit 0
 fi
 
@@ -39,4 +52,6 @@ age=$(( now - mtime ))
 if (( age > MAX_AGE_SEC )); then
   echo "kaizen-liveness: heartbeat ${age}s stale (> ${MAX_AGE_SEC}s) — restarting $SERVICE"
   systemctl restart "$SERVICE"
+  alert "Bot hung — auto-restarted" \
+        "kaizen-trader heartbeat was ${age}s stale (threshold ${MAX_AGE_SEC}s). Auto-restarted $SERVICE. Check journalctl -u kaizen --since=10min for the root cause."
 fi
