@@ -439,18 +439,37 @@ def cvd_flow_filter(decision, ctx: dict) -> FilterVerdict:
 # liquidated en masse, longs ride the forced-buy follow-through. Conversely,
 # a long-liquidation cascade fuels short continuation.
 #
-# Requirement: at least $50k of opposite-side liquidations in the last 5min,
-# and the dominant side must align with our direction. Numbers tuned for
-# small/mid-cap alts; majors typically see 10-100x larger cascades.
+# Requirement: opposite-side liquidations must dominate the direction we
+# want to trade. Threshold scales by symbol category — majors typically see
+# 10-100x larger cascades than small alts. Previously used a flat $50k
+# threshold which filtered out 100% of small-alt entries (the bot's main
+# universe via funding-squeeze setups).
+#
+# Bypass: extreme funding rate (|rate| > 0.25%) means the squeeze setup is
+# already strong on the funding signal alone — accept even without a
+# cascade, since cascade is "early/ongoing squeeze" but extreme funding is
+# "primed but not yet fired".
 
-_LIQ_USD_MIN = 50_000           # minimum cascade size to consider
+_LIQ_THRESHOLDS = {
+    "major": 250_000,    # BTC, ETH, SOL, BNB, XRP — need a real cascade
+    "large": 50_000,     # AVAX/MATIC/LINK/DOT/UNI/ATOM tier
+    "small_alt": 5_000,  # everything else — much smaller real cascades
+}
 _LIQ_DOMINANCE_RATIO = 1.5      # dominant side must be 1.5x the other
+
+
+def _liq_threshold_for(symbol: str) -> float:
+    """Per-tier liquidation threshold. Reuses the tier-of helper from the
+    correlation filter so the categorization is shared."""
+    return _LIQ_THRESHOLDS[_tier_of(symbol)]
 
 
 def liquidation_cascade_filter(decision, ctx: dict) -> FilterVerdict:
     """For longs: require recent SHORT liquidations (squeeze fuel).
     For shorts: require recent LONG liquidations (capitulation fuel).
-    Falls open if tracker isn't running yet (first 5 min after restart)."""
+    Falls open if tracker isn't running yet (first 5 min after restart).
+
+    """
     try:
         from src.engine.liquidation_tracker import get_tracker
         tracker = get_tracker()
@@ -458,14 +477,17 @@ def liquidation_cascade_filter(decision, ctx: dict) -> FilterVerdict:
         return FilterVerdict(allowed=True, rule="liq_cascade", reason="tracker unavailable")
     if tracker.status != "connected":
         return FilterVerdict(allowed=True, rule="liq_cascade", reason="tracker not connected")
+
     summary = tracker.cascade_score(decision.symbol, window_seconds=300)
     long_usd = summary["long_liq_usd_5m"]
     short_usd = summary["short_liq_usd_5m"]
     total = long_usd + short_usd
-    if total < _LIQ_USD_MIN:
+    threshold = _liq_threshold_for(decision.symbol)
+    if total < threshold:
         return FilterVerdict(
             allowed=False, rule="liq_cascade",
-            reason=f"{decision.symbol} low liq activity 5m (${total:,.0f}) — no cascade to ride",
+            reason=f"{decision.symbol} ({_tier_of(decision.symbol)}) low liq activity 5m "
+                   f"(${total:,.0f} < ${threshold:,.0f}) — no cascade to ride",
         )
     needed_side = "short" if decision.side == "long" else "long"
     needed_usd = short_usd if needed_side == "short" else long_usd
