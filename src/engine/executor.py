@@ -184,7 +184,12 @@ class Executor:
         self._daily_reset_ts: float = time.time()
         self._binance = None  # generic exchange provider (binance or okx)
         self._started_at: str = datetime.now(timezone.utc).isoformat()
-        self._lock = threading.Lock()
+        # RLock (reentrant) so same-thread re-acquisition doesn't deadlock.
+        # Required because open_position takes the lock and inside it calls
+        # can_trade -> _equity_drawdown_pct which also takes the lock for
+        # its torn-read protection. Plain Lock deadlocked the brain thread
+        # (lost ~48h of trading 2026-04-28→30 to this regression).
+        self._lock = threading.RLock()
         # Guards against double-close when stop and target both fire in the same
         # update_price tick, or when the price-updater races a brain-driven close.
         self._closing: set[str] = set()
