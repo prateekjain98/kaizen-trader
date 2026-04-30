@@ -49,12 +49,20 @@ _THIN_HOUR_END = 7     # 07:00 UTC
 
 
 def time_of_day_filter(decision, ctx: dict) -> FilterVerdict:
-    """Block alt entries during the thinnest UTC hours."""
+    """Block alt entries during the thinnest UTC hours.
+    Bypassed for extreme funding setups (|rate|>0.20%) — the squeeze edge
+    on funding is large enough to absorb the worse Asia-hours slippage."""
     now = datetime.now(timezone.utc)
     hour = now.hour
     if _THIN_HOUR_START <= hour < _THIN_HOUR_END:
         sym = (decision.symbol or "").upper()
         if sym not in _MAJOR_SYMBOLS:
+            funding = _funding_rate_from_reasoning(decision.reasoning)
+            if funding is not None and abs(funding) > 0.0020:
+                return FilterVerdict(
+                    allowed=True, rule="time_of_day",
+                    reason=f"{sym} thin-hour bypass — extreme funding {funding*100:+.3f}%",
+                )
             return FilterVerdict(
                 allowed=False, rule="time_of_day",
                 reason=f"alt {sym} skipped during thin hours {hour:02d}:00 UTC (Asia lull)",
@@ -456,6 +464,24 @@ _LIQ_THRESHOLDS = {
     "small_alt": 5_000,  # everything else — much smaller real cascades
 }
 _LIQ_DOMINANCE_RATIO = 1.5      # dominant side must be 1.5x the other
+# When funding is this extreme, the squeeze setup is strong on its own —
+# don't wait for an in-progress cascade that may never materialize on
+# obscure alts. Avoids the failure mode observed 2026-04-29→30 where 22/22
+# brain decisions on MOVR/API3/CHIP/SOLV got blocked despite -0.2% funding.
+_LIQ_BYPASS_FUNDING_PCT = 0.0020  # |rate| > 0.20% per 8h
+
+
+def _funding_rate_from_reasoning(reasoning: str) -> Optional[float]:
+    """RuleBrain emits reasoning like 'extreme neg funding -0.220% +40'.
+    Parse the % number. Returns None if not parseable."""
+    import re
+    m = re.search(r"funding\s+([+-]?\d+\.?\d*)%", reasoning or "", re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)) / 100.0
+    except ValueError:
+        return None
 
 
 def _liq_threshold_for(symbol: str) -> float:
@@ -469,6 +495,9 @@ def liquidation_cascade_filter(decision, ctx: dict) -> FilterVerdict:
     For shorts: require recent LONG liquidations (capitulation fuel).
     Falls open if tracker isn't running yet (first 5 min after restart).
 
+    Bypass: if the brain's reasoning indicates extreme funding
+    (|rate|>0.20%/8h), allow even with no cascade — the funding signal is
+    strong enough that waiting for a cascade often costs us the entry.
     """
     try:
         from src.engine.liquidation_tracker import get_tracker
@@ -477,6 +506,16 @@ def liquidation_cascade_filter(decision, ctx: dict) -> FilterVerdict:
         return FilterVerdict(allowed=True, rule="liq_cascade", reason="tracker unavailable")
     if tracker.status != "connected":
         return FilterVerdict(allowed=True, rule="liq_cascade", reason="tracker not connected")
+
+    # Extreme-funding bypass — parse from brain's reasoning string.
+    funding = _funding_rate_from_reasoning(decision.reasoning)
+    if funding is not None and abs(funding) > _LIQ_BYPASS_FUNDING_PCT:
+        ctx["funding_rate"] = funding
+        return FilterVerdict(
+            allowed=True, rule="liq_cascade",
+            reason=f"{decision.symbol} bypass — extreme funding {funding*100:+.3f}% "
+                   f"(|>{_LIQ_BYPASS_FUNDING_PCT*100:.2f}%|)",
+        )
 
     summary = tracker.cascade_score(decision.symbol, window_seconds=300)
     long_usd = summary["long_liq_usd_5m"]
