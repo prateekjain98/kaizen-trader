@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from src.backtesting.data_loader import load_klines
+from src.backtesting.data_loader import load_klines, load_futures_klines
 from src.backtesting.funding_loader import load_funding_rates
 from src.backtesting.oi_loader import load_open_interest
 from src.backtesting.replay_filters import (
@@ -226,8 +226,13 @@ def replay(
     peak_balance = initial_balance
     max_dd_pct = 0.0
     trades: list[SimTrade] = []
+    # Note: existing klines_by_symbol is loaded via load_klines() which hits
+    # the SPOT API. We now also load futures klines so basis_check can
+    # compare perp vs spot. (Entry/exit fills still simulate against
+    # klines_by_symbol = spot — small basis-noise vs prod, but baseline.)
     klines_by_symbol: dict[str, list[dict]] = {}
     klines_15m_by_symbol: dict[str, list[dict]] = {}
+    futures_klines_by_symbol: dict[str, list[dict]] = {}
     funding_by_symbol: dict[str, list[dict]] = {}
     oi_by_symbol: dict[str, list[dict]] = {}
 
@@ -243,6 +248,11 @@ def replay(
                 notes.append(f"15m klines unavailable for {sym}: {e}")
                 klines_15m_by_symbol[sym] = []
         if apply_filters:
+            try:
+                futures_klines_by_symbol[sym] = load_futures_klines(sym, KLINE_INTERVAL, start_ms, end_ms)
+            except Exception as e:
+                notes.append(f"futures klines unavailable for {sym}: {e}")
+                futures_klines_by_symbol[sym] = []
             try:
                 oi_by_symbol[sym] = load_open_interest(sym, start_ms, end_ms)
                 if not oi_by_symbol[sym]:
@@ -418,6 +428,8 @@ def replay(
                     open_position_symbols=[p["trade"].symbol for p in open_positions],
                     klines_15m=klines_15m_by_symbol.get(d.symbol, []),
                     oi_history=oi_by_symbol.get(d.symbol, []),
+                    spot_klines_1h=klines_by_symbol.get(d.symbol, []),
+                    futures_klines_1h=futures_klines_by_symbol.get(d.symbol, []),
                 )
                 if not check.allowed:
                     continue
