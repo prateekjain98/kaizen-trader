@@ -227,6 +227,7 @@ def replay(
     funding_by_symbol: dict[str, list[dict]] = {}
     oi_by_symbol: dict[str, list[dict]] = {}
 
+    oi_missing_count = 0
     for sym in symbols:
         klines_by_symbol[sym] = load_klines(sym, KLINE_INTERVAL, start_ms, end_ms)
         funding_by_symbol[sym] = load_funding_rates(sym, start_ms, end_ms)
@@ -238,9 +239,21 @@ def replay(
                 klines_15m_by_symbol[sym] = []
             try:
                 oi_by_symbol[sym] = load_open_interest(sym, start_ms, end_ms)
+                if not oi_by_symbol[sym]:
+                    oi_missing_count += 1
             except Exception as e:
                 notes.append(f"oi history unavailable for {sym}: {e}")
                 oi_by_symbol[sym] = []
+                oi_missing_count += 1
+    if apply_filters and oi_missing_count > 0:
+        # Binance's openInterestHist endpoint typically retains only ~30d of
+        # data. For windows older than that, this filter silently fail-opens.
+        # Surface this loud-and-clear so honest gating works.
+        notes.append(
+            f"⚠ oi_delta fail-open for {oi_missing_count}/{len(symbols)} "
+            f"symbols (Binance OI history retention limit, ~30d) — that "
+            f"filter effectively bypassed in this window"
+        )
 
     # Build a unified, time-ordered event stream.
     # Each event is (ts_ms, kind, symbol, payload) where kind is "funding"
