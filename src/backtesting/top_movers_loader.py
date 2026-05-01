@@ -30,6 +30,12 @@ _LARGE_MOVE_VOL = 5_000_000  # match prod _process_large_move filter
 _MAJOR_PUMP_PCT = 50.0
 _MAJOR_PUMP_VOL = 10_000_000
 
+# RuleBrain scores accel_1h ≥ 5% with +30 (or ≥10% with +50). Emitting
+# events on this directly mirrors the brain's primary scoring lever and
+# captures fresh momentum that the 24h-change-only path misses.
+_ACCEL_BREAKOUT_PCT = 5.0
+_ACCEL_BREAKOUT_VOL = 5_000_000
+
 _KLINE_INTERVAL = "1h"
 _LOOKBACK_24H = 24
 
@@ -83,14 +89,20 @@ def reconstruct(
             continue
         for idx in range(_LOOKBACK_24H, len(klines)):
             change = _change_pct_24h(klines, idx)
-            if abs(change) < move_threshold_pct:
-                continue
             vol = _volume_24h_usd(klines, idx)
-            if vol < min_volume_usd:
-                continue
+            accel = _accel_1h_pct(klines, idx)
             ts_ms = int(klines[idx]["open_time"])
             price = float(klines[idx]["close"])
-            accel = _accel_1h_pct(klines, idx)
+
+            qualifies_24h = (
+                abs(change) >= move_threshold_pct and vol >= min_volume_usd
+            )
+            qualifies_accel = (
+                abs(accel) >= _ACCEL_BREAKOUT_PCT and vol >= _ACCEL_BREAKOUT_VOL
+            )
+            if not (qualifies_24h or qualifies_accel):
+                continue
+
             event_type = "major_pump" if (
                 change > _MAJOR_PUMP_PCT and vol >= _MAJOR_PUMP_VOL
             ) else "large_move"
@@ -102,6 +114,7 @@ def reconstruct(
                 "accel_1h_pct": accel,
                 "price": price,
                 "event_type": event_type,
+                "trigger": "24h_change" if qualifies_24h else "accel_1h",
             })
     events.sort(key=lambda e: e["ts_ms"])
     return events
