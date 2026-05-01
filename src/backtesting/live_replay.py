@@ -41,7 +41,10 @@ from src.backtesting.replay_filters import (
     SKIPPED as SKIPPED_FILTERS,
     run_offline_filters,
 )
-from src.backtesting.top_movers_loader import reconstruct as reconstruct_top_movers
+from src.backtesting.top_movers_loader import (
+    reconstruct as reconstruct_top_movers,
+    accel_events_from_15m,
+)
 from src.engine.rule_brain import RuleBrain
 from src.engine.signal_detector import SignalPacket
 
@@ -228,15 +231,17 @@ def replay(
     oi_by_symbol: dict[str, list[dict]] = {}
 
     oi_missing_count = 0
+    need_15m = apply_filters or include_top_movers
     for sym in symbols:
         klines_by_symbol[sym] = load_klines(sym, KLINE_INTERVAL, start_ms, end_ms)
         funding_by_symbol[sym] = load_funding_rates(sym, start_ms, end_ms)
-        if apply_filters:
+        if need_15m:
             try:
                 klines_15m_by_symbol[sym] = load_klines(sym, "15m", start_ms, end_ms)
             except Exception as e:
                 notes.append(f"15m klines unavailable for {sym}: {e}")
                 klines_15m_by_symbol[sym] = []
+        if apply_filters:
             try:
                 oi_by_symbol[sym] = load_open_interest(sym, start_ms, end_ms)
                 if not oi_by_symbol[sym]:
@@ -270,6 +275,14 @@ def replay(
         tm_events = reconstruct_top_movers(symbols=symbols, start_ms=start_ms, end_ms=end_ms)
         for tm in tm_events:
             events.append((tm["ts_ms"], "top_mover", tm["symbol"], tm))
+
+        # Sub-hour accel detection from 15m klines (catches what 1h-base misses)
+        accel_event_count = 0
+        for sym in symbols:
+            for ev in accel_events_from_15m(sym, klines_15m_by_symbol.get(sym, [])):
+                events.append((ev["ts_ms"], "top_mover", sym, ev))
+                accel_event_count += 1
+        notes.append(f"15m sliding-1h accel events added: {accel_event_count}")
 
     events.sort(key=lambda e: e[0])
 

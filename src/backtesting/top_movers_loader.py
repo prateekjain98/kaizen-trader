@@ -120,6 +120,64 @@ def reconstruct(
     return events
 
 
+def accel_events_from_15m(
+    symbol: str,
+    klines_15m: list[dict],
+    accel_threshold_pct: float = _ACCEL_BREAKOUT_PCT,
+    min_volume_usd: float = _ACCEL_BREAKOUT_VOL,
+    cooldown_minutes: int = 30,
+) -> list[dict]:
+    """Emit large_move events from a 15m kline series whenever a sliding-1h
+    window shows |move| >= accel_threshold_pct with sufficient volume.
+
+    This catches sub-hour bursts that the 1h-kline path misses — the live
+    `AccelerationTracker` samples WS ticks continuously, so 15m is the
+    closest cached approximation we have offline.
+
+    Cooldown prevents 4 consecutive 15m bars from each emitting their own
+    event for the same underlying breakout (default 30 min between emits
+    per symbol).
+    """
+    if len(klines_15m) < 4:
+        return []
+    bars_per_hour = 4
+    bars_per_24h = 96
+    events: list[dict] = []
+    last_emit_ms = -10**18
+    cooldown_ms = cooldown_minutes * 60_000
+    for i in range(bars_per_hour, len(klines_15m)):
+        cur_close = float(klines_15m[i]["close"])
+        prev_close = float(klines_15m[i - bars_per_hour]["close"])
+        if prev_close <= 0:
+            continue
+        move_pct = (cur_close - prev_close) / prev_close * 100.0
+        if abs(move_pct) < accel_threshold_pct:
+            continue
+        # Rolling 24h vol from last 96 bars (or what's available)
+        look = min(bars_per_24h, i)
+        vol_24h = sum(
+            float(k["close"]) * float(k["volume"])
+            for k in klines_15m[i - look:i]
+        )
+        if vol_24h < min_volume_usd:
+            continue
+        ts_ms = int(klines_15m[i]["open_time"])
+        if ts_ms - last_emit_ms < cooldown_ms:
+            continue
+        last_emit_ms = ts_ms
+        events.append({
+            "ts_ms": ts_ms,
+            "symbol": symbol,
+            "change_pct": move_pct,  # this is the 1h sliding move, not 24h
+            "volume_24h_usd": vol_24h,
+            "accel_1h_pct": move_pct,
+            "price": cur_close,
+            "event_type": "large_move",
+            "trigger": "accel_1h_15m",
+        })
+    return events
+
+
 def to_signal_packet_data(event: dict) -> dict:
     """Convert reconstructed event to the `data` dict consumed by
     `SignalDetector._process_large_move` / `_process_major_pump`."""
