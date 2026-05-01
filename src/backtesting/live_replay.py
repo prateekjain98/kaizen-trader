@@ -194,6 +194,7 @@ def replay(
     initial_balance: float = 1000.0,
     apply_filters: bool = True,
     include_top_movers: bool = True,
+    include_15m_accel: bool = False,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
 
@@ -276,13 +277,18 @@ def replay(
         for tm in tm_events:
             events.append((tm["ts_ms"], "top_mover", tm["symbol"], tm))
 
-        # Sub-hour accel detection from 15m klines (catches what 1h-base misses)
-        accel_event_count = 0
-        for sym in symbols:
-            for ev in accel_events_from_15m(sym, klines_15m_by_symbol.get(sym, [])):
-                events.append((ev["ts_ms"], "top_mover", sym, ev))
-                accel_event_count += 1
-        notes.append(f"15m sliding-1h accel events added: {accel_event_count}")
+        if include_15m_accel:
+            # Sub-hour accel detection from 15m klines. EMPIRICALLY hurts
+            # PnL at all thresholds 5/8/10% (commits 1fdfe6d + this) — kept
+            # behind a flag so future tuning can revisit; off by default.
+            accel_event_count = 0
+            for sym in symbols:
+                for ev in accel_events_from_15m(sym, klines_15m_by_symbol.get(sym, [])):
+                    events.append((ev["ts_ms"], "top_mover", sym, ev))
+                    accel_event_count += 1
+            notes.append(f"15m sliding-1h accel events added: {accel_event_count} (opt-in)")
+        else:
+            notes.append("15m sliding-1h accel detection DISABLED (default — adds noise, see commit log)")
 
     events.sort(key=lambda e: e[0])
 

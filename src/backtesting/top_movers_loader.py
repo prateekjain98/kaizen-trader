@@ -33,7 +33,15 @@ _MAJOR_PUMP_VOL = 10_000_000
 # RuleBrain scores accel_1h ≥ 5% with +30 (or ≥10% with +50). Emitting
 # events on this directly mirrors the brain's primary scoring lever and
 # captures fresh momentum that the 24h-change-only path misses.
-_ACCEL_BREAKOUT_PCT = 5.0
+#
+# Threshold tuning history (kept here so the rationale survives):
+#   5%  → 175 events on 10 alts × 90d, but win rate dropped from 60→25%
+#         in W2 (commit 1fdfe6d) — too noisy, low-quality bursts displaced
+#         better trades from MAX_DECISIONS=3 budget
+#   8%  → still 4 trades W2 25% WR, agg -$0.47 (worse) — accel events
+#         at 8% still bad enough to displace winners
+#   10% → restored to original 1h-base behavior (mega-accel zone)
+_ACCEL_BREAKOUT_PCT = 10.0
 _ACCEL_BREAKOUT_VOL = 5_000_000
 
 _KLINE_INTERVAL = "1h"
