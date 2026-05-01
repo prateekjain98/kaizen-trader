@@ -91,6 +91,12 @@ def main() -> int:
         print(f"  Avg trade:    {result.avg_trade_pnl_pct:+.2f}%")
         print(f"  Sharpe proxy: {result.sharpe_proxy:.3f}")
         print(f"  Max DD:       {result.max_dd_pct:.2f}%")
+        bs = result.by_strategy()
+        if bs:
+            print(f"  By strategy:")
+            for k, v in sorted(bs.items(), key=lambda kv: -kv[1]["total_pnl_usd"]):
+                print(f"    {k:18s} n={v['num_trades']:3d} WR={v['win_rate']:.0f}% "
+                      f"pnl=${v['total_pnl_usd']:+.2f} avg={v['avg_trade_pnl_pct']:+.2f}%")
         print(f"  Elapsed:      {elapsed:.1f}s")
 
     # Aggregate

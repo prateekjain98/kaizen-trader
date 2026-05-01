@@ -90,9 +90,31 @@ class BacktestResult:
     trades: list[SimTrade] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
+    def by_strategy(self) -> dict[str, dict]:
+        """Aggregate PnL stats by strategy type for visibility into which
+        signal sources drive results. Shows whether funding_squeeze, large_move,
+        major_pump, etc. each carry their weight."""
+        groups: dict[str, list[SimTrade]] = {}
+        for t in self.trades:
+            groups.setdefault(t.strategy or "unknown", []).append(t)
+        out: dict[str, dict] = {}
+        for k, ts in groups.items():
+            n = len(ts)
+            wins = sum(1 for t in ts if t.pnl_usd > 0)
+            tot = sum(t.pnl_usd for t in ts)
+            avg_pct = sum(t.pnl_pct for t in ts) / n if n else 0.0
+            out[k] = {
+                "num_trades": n,
+                "win_rate": (wins / n * 100.0) if n else 0.0,
+                "total_pnl_usd": tot,
+                "avg_trade_pnl_pct": avg_pct,
+            }
+        return out
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["trades"] = [asdict(t) for t in self.trades]
+        d["by_strategy"] = self.by_strategy()
         return d
 
 
