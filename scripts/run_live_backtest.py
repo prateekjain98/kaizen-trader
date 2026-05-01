@@ -39,6 +39,8 @@ def main() -> int:
                    help="Disable replayable entry-filter chain (brain-only)")
     p.add_argument("--no-top-movers", action="store_true",
                    help="Disable top-movers historical reconstruction (funding-only)")
+    p.add_argument("--no-fgi", action="store_true",
+                   help="Disable fgi_contrarian event replay (alternative.me)")
     p.add_argument("--include-15m-accel", action="store_true",
                    help="Enable sub-hour accel detection from 15m klines "
                         "(opt-in; empirically hurts PnL — kept for tuning)")
@@ -86,6 +88,7 @@ def main() -> int:
                         apply_filters=not args.no_filters,
                         include_top_movers=not args.no_top_movers,
                         include_15m_accel=args.include_15m_accel,
+                        include_fgi_contrarian=not args.no_fgi,
                         min_score_override=args.min_score)
         elapsed = time.time() - t0
         all_results.append(result)

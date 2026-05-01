@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from src.backtesting.data_loader import load_klines, load_futures_klines
+from src.backtesting.fgi_loader import load_fear_greed_index, get_fgi_at_timestamp
 from src.backtesting.funding_loader import load_funding_rates
 from src.backtesting.oi_loader import load_open_interest
 from src.backtesting.replay_filters import (
@@ -217,6 +218,7 @@ def replay(
     apply_filters: bool = True,
     include_top_movers: bool = True,
     include_15m_accel: bool = False,
+    include_fgi_contrarian: bool = True,
     min_score_override: Optional[int] = None,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
@@ -240,6 +242,10 @@ def replay(
         notes.append("top-movers events reconstructed from klines (large_move/major_pump)")
     else:
         notes.append("top-movers events DISABLED")
+    if include_fgi_contrarian:
+        notes.append("fgi_contrarian events from alternative.me FGI history (BTC/ETH only)")
+    else:
+        notes.append("fgi_contrarian events DISABLED")
     notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
     if min_score_override is not None:
         # Monkeypatch the module attribute the brain reads so we can
@@ -317,6 +323,32 @@ def replay(
         tm_events = reconstruct_top_movers(symbols=symbols, start_ms=start_ms, end_ms=end_ms)
         for tm in tm_events:
             events.append((tm["ts_ms"], "top_mover", tm["symbol"], tm))
+
+    fgi_event_count = 0
+    if include_fgi_contrarian:
+        try:
+            fgi_history = load_fear_greed_index()
+        except Exception as e:
+            notes.append(f"fgi history unavailable: {e}")
+            fgi_history = []
+        # Walk daily; emit fgi_contrarian event when FGI extreme on BTC/ETH
+        # (mirrors signal_detector._process_fgi: fgi <=20 → long, >=80 → short)
+        if fgi_history:
+            day_ms = 86_400_000
+            t = (start_ms // day_ms) * day_ms
+            while t <= end_ms:
+                fgi = get_fgi_at_timestamp(fgi_history, t)
+                if fgi <= 20 or fgi >= 80:
+                    for sym in ("BTC", "ETH"):
+                        if sym not in symbols:
+                            continue
+                        side_hint = "long" if fgi <= 20 else "short"
+                        events.append((t, "fgi", sym, {
+                            "fgi": fgi, "side_hint": side_hint,
+                        }))
+                        fgi_event_count += 1
+                t += day_ms
+        notes.append(f"fgi_contrarian events emitted: {fgi_event_count}")
 
         if include_15m_accel:
             # Sub-hour accel detection from 15m klines. EMPIRICALLY hurts
@@ -397,7 +429,7 @@ def replay(
                     "mark_price": mark,
                 },
             )
-        else:  # top_mover
+        elif kind == "top_mover":
             tm_change = float(payload.get("change_pct", change_24h))
             tm_accel = float(payload.get("accel_1h_pct", accel))
             tm_vol = float(payload.get("volume_24h_usd", vol_24h))
@@ -425,10 +457,31 @@ def replay(
                     "price": mark,
                 },
             )
+        else:  # fgi
+            fgi_val = int(payload.get("fgi", 50))
+            side_hint = payload.get("side_hint", "long")
+            close_price = float(klines[idx]["close"]) if klines else 0.0
+            packet = SignalPacket(
+                signal_id=f"bt-fgi-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type="fgi_contrarian",
+                priority=2 if fgi_val <= 20 else 1,
+                timestamp=float(ts_ms),
+                price_usd=close_price,
+                fear_greed_index=fgi_val,
+                source="alternative_me",
+                reasoning=f"FGI={fgi_val} ({'extreme fear' if fgi_val<=20 else 'extreme greed'}) — contrarian {side_hint}",
+                suggested_side=side_hint,
+                suggested_stop_pct=0.12 if side_hint == "long" else 0.07,
+                suggested_target_pct=0.20 if side_hint == "long" else 0.12,
+                data={"value": fgi_val},
+            )
 
         # Refresh brain state and tick
         brain.balance = balance
         brain.funding_rates = {sym: rate}
+        if kind == "fgi":
+            brain.fgi = int(payload.get("fgi", 50))
         brain.open_positions = [
             {"symbol": p["trade"].symbol, "size_usd": p["trade"].size_usd}
             for p in open_positions
