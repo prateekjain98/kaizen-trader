@@ -39,6 +39,10 @@ def main() -> int:
                    help="Disable replayable entry-filter chain (brain-only)")
     p.add_argument("--no-top-movers", action="store_true",
                    help="Disable top-movers historical reconstruction (funding-only)")
+    p.add_argument("--split", type=int, default=1,
+                   help="Split the date range into N equal non-overlapping windows "
+                        "(out-of-sample validation). With N>1, each window runs "
+                        "independently and final verdict requires ALL windows positive.")
     args = p.parse_args()
 
     if args.days:
@@ -53,40 +57,68 @@ def main() -> int:
         end_ms = _parse_date(args.end)
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    print(f"Replaying {len(symbols)} symbols over {(end_ms-start_ms)/86400000:.0f}d (balance ${args.balance:.0f})")
-    t0 = time.time()
-    result = replay(symbols=symbols, start_ms=start_ms, end_ms=end_ms,
-                    initial_balance=args.balance,
-                    apply_filters=not args.no_filters,
-                    include_top_movers=not args.no_top_movers)
-    elapsed = time.time() - t0
+    n_splits = max(1, args.split)
+    window_ms = (end_ms - start_ms) // n_splits
+    windows: list[tuple[int, int]] = [
+        (start_ms + i * window_ms, start_ms + (i + 1) * window_ms if i < n_splits - 1 else end_ms)
+        for i in range(n_splits)
+    ]
 
-    out = result.to_dict()
-    out["elapsed_seconds"] = elapsed
-    out["generated_at"] = datetime.now(timezone.utc).isoformat()
+    print(f"Replaying {len(symbols)} symbols over {(end_ms-start_ms)/86400000:.0f}d "
+          f"(balance ${args.balance:.0f}, splits={n_splits})")
 
+    all_results = []
+    for w_idx, (w_start, w_end) in enumerate(windows, start=1):
+        if n_splits > 1:
+            print(f"\n--- Window {w_idx}/{n_splits}: "
+                  f"{datetime.fromtimestamp(w_start/1000, timezone.utc).date()} → "
+                  f"{datetime.fromtimestamp(w_end/1000, timezone.utc).date()} ---")
+        t0 = time.time()
+        result = replay(symbols=symbols, start_ms=w_start, end_ms=w_end,
+                        initial_balance=args.balance,
+                        apply_filters=not args.no_filters,
+                        include_top_movers=not args.no_top_movers)
+        elapsed = time.time() - t0
+        all_results.append(result)
+
+        print(f"  Trades:       {result.num_trades}")
+        print(f"  Win rate:     {result.win_rate:.1f}%")
+        print(f"  PnL:          ${result.total_pnl_usd:+.2f} ({result.total_pnl_pct:+.2f}%)")
+        print(f"  Avg trade:    {result.avg_trade_pnl_pct:+.2f}%")
+        print(f"  Sharpe proxy: {result.sharpe_proxy:.3f}")
+        print(f"  Max DD:       {result.max_dd_pct:.2f}%")
+        print(f"  Elapsed:      {elapsed:.1f}s")
+
+    # Aggregate
+    total_pnl = sum(r.total_pnl_usd for r in all_results)
+    total_trades = sum(r.num_trades for r in all_results)
+    all_positive = all(r.total_pnl_usd >= 0 for r in all_results)
+
+    out = {
+        "windows": [r.to_dict() for r in all_results],
+        "aggregate": {
+            "n_windows": n_splits,
+            "all_windows_non_negative": all_positive,
+            "total_pnl_usd": total_pnl,
+            "total_trades": total_trades,
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "symbols": symbols,
+    }
     out_path = args.out or f"data/backtest_{int(time.time())}.json"
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2, default=str)
 
-    print(f"\n=== BACKTEST RESULT ===")
-    print(f"  Symbols:        {len(symbols)} ({','.join(symbols)})")
-    print(f"  Period:         {datetime.fromtimestamp(start_ms/1000, timezone.utc).date()} → "
-          f"{datetime.fromtimestamp(end_ms/1000, timezone.utc).date()}")
-    print(f"  Trades:         {result.num_trades}")
-    print(f"  Win rate:       {result.win_rate:.1f}%")
-    print(f"  Total PnL:      ${result.total_pnl_usd:+.2f} ({result.total_pnl_pct:+.2f}%)")
-    print(f"  Avg trade:      {result.avg_trade_pnl_pct:+.2f}%")
-    print(f"  Max DD:         {result.max_dd_pct:.2f}%")
-    print(f"  Sharpe proxy:   {result.sharpe_proxy:.3f}")
-    print(f"  Fees paid:      ${result.fees_paid_usd:.2f}")
-    print(f"  Final balance:  ${result.final_balance:.2f}")
-    print(f"  Elapsed:        {elapsed:.1f}s")
-    print(f"\nLimitations (declared honest):")
-    for n in result.notes:
-        print(f"  - {n}")
-    print(f"\nWrote {out_path}")
+    print(f"\n=== AGGREGATE ===")
+    print(f"  Windows:                  {n_splits}")
+    print(f"  Total trades:             {total_trades}")
+    print(f"  Total PnL:                ${total_pnl:+.2f}")
+    print(f"  All windows non-negative: {all_positive}")
+    print(f"  Wrote {out_path}")
+    if n_splits > 1:
+        print(f"\n  Out-of-sample verdict:    "
+              f"{'ROBUST (all windows ≥ 0)' if all_positive else 'OVERFIT-RISK (a window negative)'}")
     return 0
 
 
