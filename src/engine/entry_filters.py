@@ -110,9 +110,23 @@ def _fetch_oi_change_pct(binance_symbol: str, lookback_minutes: int = 60) -> Opt
 def oi_delta_filter(decision, ctx: dict) -> FilterVerdict:
     """For long entries on negative funding, require OI to be RISING (fresh
     shorts to squeeze). For shorts on positive funding, require OI rising
-    (fresh longs to liquidate). Without this, we enter after the move."""
+    (fresh longs to liquidate). Without this, we enter after the move.
+
+    Bypassed when funding rate is extreme (|rate|>0.20%) — the squeeze edge
+    on funding alone is large enough that we don't also need OI confirmation.
+    Mirrors the existing time_of_day extreme-funding bypass. Without this,
+    the bot can be paralysed during real squeeze events: brain qualifies
+    BUYs on -0.30% funding but oi_delta blocks every single one because OI
+    is moving 1-2% (below the 3% threshold), even though the funding
+    extreme IS the squeeze signal."""
     sym = (decision.symbol or "").upper()
     binance_sym = f"{sym}USDT"
+    funding = _funding_rate_from_reasoning(decision.reasoning)
+    if funding is not None and abs(funding) > 0.0020 and sym not in _MAJOR_SYMBOLS:
+        return FilterVerdict(
+            allowed=True, rule="oi_delta",
+            reason=f"{sym} OI bypass — extreme funding {funding*100:+.3f}% is the signal",
+        )
     oi_change = _fetch_oi_change_pct(binance_sym, lookback_minutes=60)
     if oi_change is None:
         # Can't verify → don't block (fail-open). Better to lose a filter
