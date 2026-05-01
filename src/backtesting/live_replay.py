@@ -217,6 +217,7 @@ def replay(
     apply_filters: bool = True,
     include_top_movers: bool = True,
     include_15m_accel: bool = False,
+    min_score_override: Optional[int] = None,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
 
@@ -240,6 +241,14 @@ def replay(
     else:
         notes.append("top-movers events DISABLED")
     notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
+    if min_score_override is not None:
+        # Monkeypatch the module attribute the brain reads so we can
+        # measure what trades WOULD have been taken at a lower threshold.
+        # Restored at function end.
+        import src.engine.rule_brain as _rb
+        _orig_min_score = _rb.MIN_SCORE_TO_TRADE
+        _rb.MIN_SCORE_TO_TRADE = int(min_score_override)
+        notes.append(f"MIN_SCORE_TO_TRADE override: {min_score_override} (prod is {_orig_min_score})")
     notes.append(f"taker fee per side: {TAKER_FEE_PER_SIDE*100:.3f}%")
     notes.append(f"exits: stop|target|max_hold {MAX_HOLD_HOURS}h (no fast-cut/trail)")
 
@@ -518,6 +527,11 @@ def replay(
         std = var ** 0.5
         if std > 0:
             sharpe_proxy = mean_r / std
+
+    if min_score_override is not None:
+        # Restore the prod threshold so subsequent calls aren't polluted.
+        import src.engine.rule_brain as _rb
+        _rb.MIN_SCORE_TO_TRADE = _orig_min_score
 
     return BacktestResult(
         start_ms=start_ms,

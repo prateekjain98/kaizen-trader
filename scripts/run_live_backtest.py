@@ -42,6 +42,10 @@ def main() -> int:
     p.add_argument("--include-15m-accel", action="store_true",
                    help="Enable sub-hour accel detection from 15m klines "
                         "(opt-in; empirically hurts PnL — kept for tuning)")
+    p.add_argument("--min-score", type=int, default=None,
+                   help="Override RuleBrain MIN_SCORE_TO_TRADE for this run "
+                        "(prod default = 40). Lowering it tests whether more "
+                        "marginal signals would have been profitable.")
     p.add_argument("--split", type=int, default=1,
                    help="Split the date range into N equal non-overlapping windows "
                         "(out-of-sample validation). With N>1, each window runs "
@@ -81,7 +85,8 @@ def main() -> int:
                         initial_balance=args.balance,
                         apply_filters=not args.no_filters,
                         include_top_movers=not args.no_top_movers,
-                        include_15m_accel=args.include_15m_accel)
+                        include_15m_accel=args.include_15m_accel,
+                        min_score_override=args.min_score)
         elapsed = time.time() - t0
         all_results.append(result)
 
