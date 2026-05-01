@@ -37,6 +37,8 @@ def main() -> int:
     p.add_argument("--out", default=None, help="Output JSON path (default: data/backtest_<ts>.json)")
     p.add_argument("--no-filters", action="store_true",
                    help="Disable replayable entry-filter chain (brain-only)")
+    p.add_argument("--no-top-movers", action="store_true",
+                   help="Disable top-movers historical reconstruction (funding-only)")
     args = p.parse_args()
 
     if args.days:
@@ -54,7 +56,9 @@ def main() -> int:
     print(f"Replaying {len(symbols)} symbols over {(end_ms-start_ms)/86400000:.0f}d (balance ${args.balance:.0f})")
     t0 = time.time()
     result = replay(symbols=symbols, start_ms=start_ms, end_ms=end_ms,
-                    initial_balance=args.balance, apply_filters=not args.no_filters)
+                    initial_balance=args.balance,
+                    apply_filters=not args.no_filters,
+                    include_top_movers=not args.no_top_movers)
     elapsed = time.time() - t0
 
     out = result.to_dict()

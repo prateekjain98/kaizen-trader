@@ -41,6 +41,7 @@ from src.backtesting.replay_filters import (
     SKIPPED as SKIPPED_FILTERS,
     run_offline_filters,
 )
+from src.backtesting.top_movers_loader import reconstruct as reconstruct_top_movers
 from src.engine.rule_brain import RuleBrain
 from src.engine.signal_detector import SignalPacket
 
@@ -189,6 +190,7 @@ def replay(
     end_ms: int,
     initial_balance: float = 1000.0,
     apply_filters: bool = True,
+    include_top_movers: bool = True,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
 
@@ -207,7 +209,11 @@ def replay(
         notes.append(f"SKIPPED filters (no historical analogue): {','.join(SKIPPED_FILTERS)}")
     else:
         notes.append("entry_filters chain DISABLED (apply_filters=False)")
-    notes.append("only funding_squeeze signals replayed (no listing/fgi/trending)")
+    if include_top_movers:
+        notes.append("top-movers events reconstructed from klines (large_move/major_pump)")
+    else:
+        notes.append("top-movers events DISABLED")
+    notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
     notes.append(f"taker fee per side: {TAKER_FEE_PER_SIDE*100:.3f}%")
     notes.append(f"exits: stop|target|max_hold {MAX_HOLD_HOURS}h (no fast-cut/trail)")
 
@@ -236,16 +242,29 @@ def replay(
                 notes.append(f"oi history unavailable for {sym}: {e}")
                 oi_by_symbol[sym] = []
 
-    # Build a unified, time-ordered event stream of (ts_ms, symbol, rate, mark)
-    events: list[tuple[int, str, float, float]] = []
+    # Build a unified, time-ordered event stream.
+    # Each event is (ts_ms, kind, symbol, payload) where kind is "funding"
+    # or "top_mover".
+    events: list[tuple[int, str, str, dict]] = []
     for sym, frs in funding_by_symbol.items():
         for fr in frs:
-            events.append((int(fr["funding_time"]), sym, float(fr["funding_rate"]), float(fr["mark_price"])))
+            events.append((
+                int(fr["funding_time"]), "funding", sym,
+                {"funding_rate": float(fr["funding_rate"]), "mark_price": float(fr["mark_price"])},
+            ))
+
+    if include_top_movers:
+        tm_events = reconstruct_top_movers(symbols=symbols, start_ms=start_ms, end_ms=end_ms)
+        for tm in tm_events:
+            events.append((tm["ts_ms"], "top_mover", tm["symbol"], tm))
+
     events.sort(key=lambda e: e[0])
 
     open_positions: list[dict] = []  # mirrors what brain expects in self.open_positions
 
-    for ts_ms, sym, rate, mark in events:
+    for ts_ms, kind, sym, payload in events:
+        rate = float(payload.get("funding_rate", 0.0)) if kind == "funding" else 0.0
+        mark = float(payload.get("mark_price", 0.0)) if kind == "funding" else float(payload.get("price", 0.0))
         # Close any expired sim positions before this event (timeline-correct)
         still_open = []
         for pos in open_positions:
@@ -279,32 +298,60 @@ def replay(
         vol_24h = _volume_24h_usd(klines, idx)
         accel = _accel_1h_pct(klines, idx)
 
-        # Only generate funding_squeeze packets when rate matters
-        if abs(rate) < 0.0005:
-            continue
-
-        side_hint = "long" if rate < 0 else "short"
-        packet = SignalPacket(
-            signal_id=f"bt-{sym}-{ts_ms}",
-            symbol=sym,
-            signal_type="funding_squeeze",
-            priority=2,
-            timestamp=float(ts_ms),
-            price_usd=mark,
-            volume_24h=vol_24h,
-            price_change_24h=change_24h,
-            funding_rate=rate,
-            source="binance_funding",
-            reasoning=f"hist funding {rate*100:+.3f}%",
-            suggested_side=side_hint,
-            suggested_stop_pct=0.06,
-            suggested_target_pct=0.08,
-            data={
-                "acceleration_1h": accel,
-                "funding_rate": rate,
-                "mark_price": mark,
-            },
-        )
+        if kind == "funding":
+            # Only generate funding_squeeze packets when rate matters
+            if abs(rate) < 0.0005:
+                continue
+            side_hint = "long" if rate < 0 else "short"
+            packet = SignalPacket(
+                signal_id=f"bt-fund-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type="funding_squeeze",
+                priority=2,
+                timestamp=float(ts_ms),
+                price_usd=mark,
+                volume_24h=vol_24h,
+                price_change_24h=change_24h,
+                funding_rate=rate,
+                source="binance_funding",
+                reasoning=f"hist funding {rate*100:+.3f}%",
+                suggested_side=side_hint,
+                suggested_stop_pct=0.06,
+                suggested_target_pct=0.08,
+                data={
+                    "acceleration_1h": accel,
+                    "funding_rate": rate,
+                    "mark_price": mark,
+                },
+            )
+        else:  # top_mover
+            tm_change = float(payload.get("change_pct", change_24h))
+            tm_accel = float(payload.get("accel_1h_pct", accel))
+            tm_vol = float(payload.get("volume_24h_usd", vol_24h))
+            tm_type = payload.get("event_type", "large_move")
+            side_hint = "long" if tm_change > 0 else "short"
+            packet = SignalPacket(
+                signal_id=f"bt-tm-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type=tm_type,
+                priority=2 if abs(tm_change) > 20 else 1,
+                timestamp=float(ts_ms),
+                price_usd=mark,
+                volume_24h=tm_vol,
+                price_change_24h=tm_change,
+                funding_rate=0.0,
+                source="binance_movers",
+                reasoning=f"hist {tm_type} {tm_change:+.1f}% / 24h vol ${tm_vol/1e6:.0f}M / accel1h {tm_accel:+.1f}%",
+                suggested_side=side_hint,
+                suggested_stop_pct=0.08,
+                suggested_target_pct=0.15,
+                data={
+                    "acceleration_1h": tm_accel,
+                    "change_pct": tm_change,
+                    "volume_24h": tm_vol,
+                    "price": mark,
+                },
+            )
 
         # Refresh brain state and tick
         brain.balance = balance
