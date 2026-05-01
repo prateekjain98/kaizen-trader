@@ -35,6 +35,12 @@ from typing import Optional
 
 from src.backtesting.data_loader import load_klines
 from src.backtesting.funding_loader import load_funding_rates
+from src.backtesting.oi_loader import load_open_interest
+from src.backtesting.replay_filters import (
+    REPLAYABLE as REPLAYABLE_FILTERS,
+    SKIPPED as SKIPPED_FILTERS,
+    run_offline_filters,
+)
 from src.engine.rule_brain import RuleBrain
 from src.engine.signal_detector import SignalPacket
 
@@ -182,16 +188,25 @@ def replay(
     start_ms: int,
     end_ms: int,
     initial_balance: float = 1000.0,
+    apply_filters: bool = True,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
 
     Loads funding-rate history + 1h klines per symbol, synthesizes
     `funding_squeeze` SignalPackets at each funding event (every 8h on Binance),
-    feeds them through RuleBrain.tick(), and simulates the resulting trades
-    against the kline series.
+    feeds them through RuleBrain.tick(), runs the replayable subset of the
+    prod filter chain (time_of_day, correlation, volatility, oi_delta), and
+    simulates the resulting trades against the kline series.
+
+    `apply_filters=False` disables the offline filter chain — useful for
+    measuring brain-only edge in isolation.
     """
     notes: list[str] = []
-    notes.append("entry_filters chain BYPASSED (no historical replay yet)")
+    if apply_filters:
+        notes.append(f"replayed filters: {','.join(REPLAYABLE_FILTERS)}")
+        notes.append(f"SKIPPED filters (no historical analogue): {','.join(SKIPPED_FILTERS)}")
+    else:
+        notes.append("entry_filters chain DISABLED (apply_filters=False)")
     notes.append("only funding_squeeze signals replayed (no listing/fgi/trending)")
     notes.append(f"taker fee per side: {TAKER_FEE_PER_SIDE*100:.3f}%")
     notes.append(f"exits: stop|target|max_hold {MAX_HOLD_HOURS}h (no fast-cut/trail)")
@@ -202,11 +217,24 @@ def replay(
     max_dd_pct = 0.0
     trades: list[SimTrade] = []
     klines_by_symbol: dict[str, list[dict]] = {}
+    klines_15m_by_symbol: dict[str, list[dict]] = {}
     funding_by_symbol: dict[str, list[dict]] = {}
+    oi_by_symbol: dict[str, list[dict]] = {}
 
     for sym in symbols:
         klines_by_symbol[sym] = load_klines(sym, KLINE_INTERVAL, start_ms, end_ms)
         funding_by_symbol[sym] = load_funding_rates(sym, start_ms, end_ms)
+        if apply_filters:
+            try:
+                klines_15m_by_symbol[sym] = load_klines(sym, "15m", start_ms, end_ms)
+            except Exception as e:
+                notes.append(f"15m klines unavailable for {sym}: {e}")
+                klines_15m_by_symbol[sym] = []
+            try:
+                oi_by_symbol[sym] = load_open_interest(sym, start_ms, end_ms)
+            except Exception as e:
+                notes.append(f"oi history unavailable for {sym}: {e}")
+                oi_by_symbol[sym] = []
 
     # Build a unified, time-ordered event stream of (ts_ms, symbol, rate, mark)
     events: list[tuple[int, str, float, float]] = []
@@ -300,6 +328,20 @@ def replay(
             entry_price = float(d_klines[entry_idx]["open"])
             if entry_price <= 0:
                 continue
+
+            # Replayable filter chain (time_of_day, correlation, volatility, oi_delta)
+            if apply_filters:
+                check = run_offline_filters(
+                    symbol=d.symbol,
+                    side=d.side,
+                    ts_ms=ts_ms,
+                    funding_rate=rate,
+                    open_position_symbols=[p["trade"].symbol for p in open_positions],
+                    klines_15m=klines_15m_by_symbol.get(d.symbol, []),
+                    oi_history=oi_by_symbol.get(d.symbol, []),
+                )
+                if not check.allowed:
+                    continue
 
             # Apply funding-rate-aware sizing (live executor mirror)
             size_usd = d.size_usd * _funding_size_multiplier(rate)

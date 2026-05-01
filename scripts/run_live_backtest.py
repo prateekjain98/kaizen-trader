@@ -35,6 +35,8 @@ def main() -> int:
     p.add_argument("--days", type=int, help="Lookback window from today (overrides --start)")
     p.add_argument("--balance", type=float, default=1000.0)
     p.add_argument("--out", default=None, help="Output JSON path (default: data/backtest_<ts>.json)")
+    p.add_argument("--no-filters", action="store_true",
+                   help="Disable replayable entry-filter chain (brain-only)")
     args = p.parse_args()
 
     if args.days:
@@ -51,7 +53,8 @@ def main() -> int:
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     print(f"Replaying {len(symbols)} symbols over {(end_ms-start_ms)/86400000:.0f}d (balance ${args.balance:.0f})")
     t0 = time.time()
-    result = replay(symbols=symbols, start_ms=start_ms, end_ms=end_ms, initial_balance=args.balance)
+    result = replay(symbols=symbols, start_ms=start_ms, end_ms=end_ms,
+                    initial_balance=args.balance, apply_filters=not args.no_filters)
     elapsed = time.time() - t0
 
     out = result.to_dict()
