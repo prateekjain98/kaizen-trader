@@ -701,9 +701,19 @@ class DataStreams:
         symbols in the liquid universe. Mirrors funding_carry_loader.py
         ranking exactly so live and backtest agree.
 
-        Disabled when env var FUNDING_CARRY_ENABLED='0'.
+        DISABLED BY DEFAULT (env var FUNDING_CARRY_ENABLED='1' to enable).
+        Adversarial audit found the +$5.53 backtest result that justified
+        this poller was fabricated by three compounding bugs: re-entry
+        cooldown clock comparing wall-clock to sim time (so 42 trades on
+        9 names back-to-back was a re-trading artifact, not 42 draws),
+        funding_carry totally bypassing the volatility/correlation/oi/basis/
+        cvd/top-crowding chain, and exit-attribution being wick-PnL not
+        carry-PnL (25/42 fast_cut, only 1/42 target). Until those are
+        fixed in backtest AND a clean ROBUST OOS verdict reproduces, the
+        poller stays off-by-default — code path is wired so flipping the
+        env to '1' is a one-line rollout once the validation is honest.
         """
-        if os.environ.get("FUNDING_CARRY_ENABLED", "1") == "0":
+        if os.environ.get("FUNDING_CARRY_ENABLED", "0") != "1":
             return
 
         # Are we within ±5min of an 8h boundary?
