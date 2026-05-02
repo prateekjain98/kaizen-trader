@@ -135,7 +135,15 @@ def _score_signal(
     accel_1h = float(data.get("acceleration_1h", 0))
     pump_hours = float(data.get("pump_duration_hours", 0))
     btc_divergence = float(data.get("btc_divergence_4h", 0))
-    listing_age_hours = float(data.get("listing_age_hours", 999))
+    # CORRECTNESS (audit — brain/filter): live signal_detector populates
+    # the field as `age_hours` (from data_streams TokenSignal.data), backtest
+    # populates it as `listing_age_hours`. The brain previously read only
+    # `listing_age_hours`, so in LIVE the +35 listing bonus never fired
+    # (always defaulted to 999) — the 77%-WR Coinbase listing-pump strategy
+    # was effectively dead in production while backtest claimed it worked.
+    # Read both keys, take the smaller (more conservative) age.
+    listing_age_hours = float(data.get("listing_age_hours",
+                                        data.get("age_hours", 999)))
 
     # Determine strategy type from signal
     signal_type = signal.signal_type or ""
@@ -184,8 +192,12 @@ def _score_signal(
         factors.append(f"new listing {listing_age_hours:.1f}h old (77% WR) +35")
         strategy_type = "listing_pump"
 
-    # FGI extreme fear — contrarian BTC/ETH buy
-    if fgi < 15 and symbol in ("BTC", "ETH"):
+    # FGI extreme fear — contrarian BTC/ETH buy.
+    # CORRECTNESS (audit — brain): aligned threshold to <=20 (was <15) to
+    # match signal_detector.py:200 emit condition. Detector fires whenever
+    # FGI<=20, but brain previously awarded points only at FGI<15, so the
+    # 15-20 sub-band emitted signals that scored 0 and silently dropped.
+    if fgi <= 20 and symbol in ("BTC", "ETH"):
         score += 30
         factors.append(f"FGI={fgi} extreme fear on {symbol} +30")
         strategy_type = "fgi_contrarian"

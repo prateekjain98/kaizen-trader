@@ -592,8 +592,19 @@ class Executor:
 
         with self._lock:
 
-            base_size = min(decision.size_usd, self.MAX_POSITION_SIZE, self.balance * 0.4)
-            size = min(base_size * size_mult, self.MAX_POSITION_SIZE, self.balance * 0.4)
+            # CORRECTNESS (audit H3 — math): the funding multiplier was
+            # asymmetric in effect — penalty (×0.5) bit fully but boost
+            # (×1.25) was silently clipped to base_size's 0.4×balance cap
+            # because base_size was already at the cap. Now we apply size_mult
+            # to decision.size_usd FIRST (the brain's pre-cap intent), and
+            # raise the cap to 0.5×balance when boost is in effect so the
+            # multiplier produces a real position-size delta. Penalty path
+            # is unchanged (still capped at 0.4×balance, but penalty would
+            # always be below cap anyway). MAX_POSITION_SIZE remains the
+            # absolute ceiling regardless.
+            requested = decision.size_usd * size_mult
+            cap_pct = 0.5 if size_mult > 1.0 else 0.4
+            size = min(requested, self.MAX_POSITION_SIZE, self.balance * cap_pct)
             if size < 10:
                 if size_mult < 1.0:
                     log("info", f"Funding penalty reduced {decision.symbol} size to "

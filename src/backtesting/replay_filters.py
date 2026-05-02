@@ -162,23 +162,25 @@ def _atr_pct_from_klines(klines_15m: list[dict], idx_15m: int) -> Optional[float
 
 
 def volatility_check(symbol: str, klines_15m: list[dict], ts_ms: int) -> FilterCheck:
-    """Block when 15m ATR is dead-quiet (<0.5%) or chaotic (>8%)."""
+    """Block when 15m ATR is dead-quiet (<0.5%) or chaotic (>8%).
+
+    CORRECTNESS (audit 8b — temporal): only consider FULLY-CLOSED bars.
+    Previously the primary path picked the bar containing ts_ms (open_time
+    ≤ ts_ms ≤ close_time) and used its close — but that bar's close isn't
+    knowable until close_time, so events firing at hour boundaries were
+    using up to 14m59s of intrabar future data. Now we strictly find the
+    last bar with close_time < ts_ms.
+    """
     if not klines_15m:
         return FilterCheck(True, "volatility", "no klines — fail-open")
-    # locate the 15m candle covering ts_ms
+    # Find last bar fully closed before ts_ms (no in-progress peek).
     idx = None
-    for i, k in enumerate(klines_15m):
-        if k["open_time"] <= ts_ms <= k["close_time"]:
+    for i in range(len(klines_15m) - 1, -1, -1):
+        if klines_15m[i]["close_time"] < ts_ms:
             idx = i
             break
     if idx is None:
-        # fallback: nearest preceding
-        for i in range(len(klines_15m) - 1, -1, -1):
-            if klines_15m[i]["close_time"] <= ts_ms:
-                idx = i
-                break
-    if idx is None:
-        return FilterCheck(True, "volatility", "no covering candle — fail-open")
+        return FilterCheck(True, "volatility", "no closed candle — fail-open")
     atr = _atr_pct_from_klines(klines_15m, idx)
     if atr is None:
         return FilterCheck(True, "volatility", "atr unavailable — fail-open")
@@ -247,18 +249,21 @@ def basis_check(
     """
     if not spot_klines_1h or not futures_klines_1h:
         return FilterCheck(True, "basis", "spot/fut klines unavailable — fail-open")
-    # Find the kline whose open_time covers ts_ms in each series
+    # CORRECTNESS (audit 8e — temporal): use only fully-CLOSED bars. The
+    # previous `open_time <= ts_ms` predicate selected the in-progress bar
+    # whose `close` isn't knowable until close_time — up to 1h of intrabar
+    # lookahead. Now we strictly require the bar to have closed before ts_ms.
     s_close = f_close = None
     for k in reversed(spot_klines_1h):
-        if k["open_time"] <= ts_ms:
+        if k["close_time"] < ts_ms:
             s_close = float(k["close"])
             break
     for k in reversed(futures_klines_1h):
-        if k["open_time"] <= ts_ms:
+        if k["close_time"] < ts_ms:
             f_close = float(k["close"])
             break
     if s_close is None or f_close is None or s_close <= 0:
-        return FilterCheck(True, "basis", "no covering kline — fail-open")
+        return FilterCheck(True, "basis", "no closed kline — fail-open")
     basis = (f_close - s_close) / s_close
     if side == "long" and basis > _BASIS_LONG_BLOCK:
         return FilterCheck(False, "basis",
@@ -326,10 +331,14 @@ def cvd_check(
     """
     if not klines_1h:
         return FilterCheck(True, "cvd_flow", "klines unavailable — fail-open")
-    # Locate last bar at-or-before ts_ms
+    # CORRECTNESS (audit 8d — temporal): use only fully-CLOSED bars. The
+    # previous `open_time <= ts_ms` predicate selected the in-progress bar,
+    # whose `taker_buy_volume`/`close` aren't knowable until close_time —
+    # up to 1h of intrabar lookahead. CVD is a directional gate so this
+    # silently flipped admits/blocks. Now strictly require close_time<ts_ms.
     idx = None
     for i in range(len(klines_1h) - 1, -1, -1):
-        if klines_1h[i]["open_time"] <= ts_ms:
+        if klines_1h[i]["close_time"] < ts_ms:
             idx = i
             break
     if idx is None or idx < _CVD_WINDOW_BARS - 1:

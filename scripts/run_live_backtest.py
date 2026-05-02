@@ -164,16 +164,48 @@ def main() -> int:
         + [f"{k}={v}" for k, v in agg_exit.items() if k not in order]
     )
 
+    # Statistical verdict (audit — replaces the broken "all windows ≥ 0"
+    # criterion which had 25% false-positive rate at split=2 even under H0).
+    # Pool every trade's pnl_pct; one-sided t-test against 0 with
+    # Bonferroni-corrected α=0.0025 (≈10 hypotheses tested per session).
+    # Tiers:
+    #   n < 30  → INSUFFICIENT (no verdict; sample too small)
+    #   n < 100 → PRELIMINARY  (CI shown; no claim)
+    #   n ≥ 100 + t > 2.81 → ROBUST
+    #   n ≥ 100 + t ≤ 2.81 → INCONCLUSIVE
+    all_pnl_pct = [t.pnl_pct for r in all_results for t in r.trades]
+    n = len(all_pnl_pct)
+    if n >= 2:
+        mean = sum(all_pnl_pct) / n
+        var = sum((x - mean) ** 2 for x in all_pnl_pct) / (n - 1)
+        std = var ** 0.5
+        se = std / (n ** 0.5) if n else 0.0
+        t_stat = (mean / se) if se > 0 else 0.0
+    else:
+        mean = std = se = t_stat = 0.0
+    if n < 30:
+        verdict = f"INSUFFICIENT (n={n} < 30, no verdict)"
+    elif n < 100:
+        ci_lo = mean - 1.96 * se
+        ci_hi = mean + 1.96 * se
+        verdict = f"PRELIMINARY (n={n}; mean {mean:+.3f}% 95%CI [{ci_lo:+.3f}, {ci_hi:+.3f}]%; t={t_stat:+.2f})"
+    elif t_stat > 2.81:  # one-sided α=0.0025, Bonferroni for ~10 tests
+        verdict = f"ROBUST (n={n}, t={t_stat:+.2f} > 2.81)"
+    else:
+        verdict = f"INCONCLUSIVE (n={n}, t={t_stat:+.2f} ≤ 2.81; not significant after Bonferroni)"
+
     print(f"\n=== AGGREGATE ===")
     print(f"  Windows:                  {n_splits}")
     print(f"  Total trades:             {total_trades}")
     print(f"  Total PnL:                ${total_pnl:+.2f}")
-    print(f"  All windows non-negative: {all_positive}")
+    print(f"  Per-trade mean:           {mean:+.3f}%")
+    print(f"  Per-trade stdev:          {std:.3f}%")
+    print(f"  t-statistic:              {t_stat:+.3f}")
+    print(f"  All windows non-negative: {all_positive}  (legacy gate, NOT a verdict)")
     print(f"  Exit reasons:             {agg_exit_str}")
     print(f"  Wrote {out_path}")
-    if n_splits > 1:
-        print(f"\n  Out-of-sample verdict:    "
-              f"{'ROBUST (all windows ≥ 0)' if all_positive else 'OVERFIT-RISK (a window negative)'}")
+    if n_splits > 1 or n > 0:
+        print(f"\n  Statistical verdict:      {verdict}")
     return 0
 
 
