@@ -235,14 +235,32 @@ Validated by real-money discipline (every metric below has a `git log` /
   using `close_time` data (1h lookahead); stable_flow used same-day flow at
   start-of-day (24h lookahead); FGI same-day timestamp (≤60min lookahead).
   All shifted to honest causal timestamps.
-- **Documented honest baseline** — the strategy as currently coded has
-  thin-but-real edge driven by cross-sectional funding carry on small alts:
-  90d × split=2 × 30 symbols → 107 trades, +$5.53, ROBUST (W1 +$2.02, W2
-  +$3.50). This is the **first defensible ROBUST OOS verdict** in the
-  project's history, and it survives only because every prior "ROBUST"
-  result was deconstructed and proven to be lookahead/slippage/exit
-  fabrication.
+- **Caught and retracted the funding_carry +$5.53 fiction** — the original
+  90d × split=2 × 30 symbols → 107 trades / +$5.53 / "ROBUST" verdict was
+  deconstructed within minutes of being deployed. Adversarial audit
+  surfaced 3 compounding bugs (re-entry cooldown comparing wall-clock to
+  sim time → 42 trades on 9 names back-to-back; total filter-chain bypass
+  for funding_carry signals → no volatility/correlation/oi/basis/cvd/
+  ls-crowding gates; 25/42 trades exited via fast_cut and only 1/42 hit
+  target, so the +$5.70 W1 figure was wick-PnL not carry-PnL). Walk-forward
+  OOS validation (60d IS / 30d OOS / 4 folds) independently confirmed:
+  **0/4 folds profitable**, carry-attributable PnL **-$5.44 / 43 trades**,
+  OOS Sharpe **-2.11** (vs literature's 0.5-1.5 "genuine edge" band). The
+  prod-wiring (commit 0576eb8) was disabled by default (commit 0f5c698)
+  before the next 8h boundary fired any live carry trades on the fictitious
+  edge.
 
 The loop's most important output is what it KILLED: the +$2.29 / +$2.82 /
-+$9.20 "ROBUST" results that earlier honest-but-incomplete backtests
-reported. Each was a fiction the loop's discipline eventually caught.
++$9.20 / +$5.53 "ROBUST" results that earlier honest-but-incomplete
+backtests reported. Each was a fiction the loop's discipline eventually
+caught — sometimes within minutes of deployment, before any live capital
+was at risk.
+
+**Current honest verdict**: NO proven OOS edge in this strategy stack.
+funding_squeeze (single-name, absolute rate) shows borderline positive
+small-n results; cross-sectional funding_carry shows no OOS survival.
+The path forward is fixing the 3 audit-identified bugs (cooldown clock,
+filter-bypass scope, exit-attribution to thesis vs heuristics), then
+re-running walk-forward — if PnL stays negative, the carry thesis
+itself is wrong (not a coding bug), and the project pivots to a
+different alpha source.
