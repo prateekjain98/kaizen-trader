@@ -48,6 +48,11 @@ from src.backtesting.funding_loader import load_funding_rates
 from src.backtesting.funding_carry_loader import reconstruct_funding_carry
 from src.backtesting.listing_loader import load_exchange_listings
 from src.backtesting.oi_loader import load_open_interest
+from src.backtesting.liquidation_loader import (
+    load_liquidations,
+    load_forward_collected as load_forward_liquidations,
+    aggregate_5m_window as liq_aggregate_5m_window,
+)
 from src.backtesting.top_ls_loader import load_top_ls_ratio
 from src.backtesting.replay_filters import (
     REPLAYABLE as REPLAYABLE_FILTERS,
@@ -348,6 +353,9 @@ def replay(
     include_stable_flow: bool = True,
     include_funding_carry: bool = True,
     include_chain_flow: bool = True,
+    include_liquidation_cascade: bool = False,
+    liquidation_source: str = "bitfinex",  # 'bitfinex' | 'forward'
+    liquidation_min_usd_5m: float = 1_500_000.0,
     apply_regime_gate: bool = True,
     apply_slippage: bool = True,
     min_score_override: Optional[int] = None,
@@ -393,6 +401,13 @@ def replay(
         notes.append("chain_flow events from DefiLlama per-chain TVL (Eth/Sol/Arb)")
     else:
         notes.append("chain_flow events DISABLED")
+    if include_liquidation_cascade:
+        notes.append(
+            f"liquidation_cascade events from {liquidation_source} "
+            f"(single-exchange proxy; cross-exchange aggregate requires paid Coinglass)"
+        )
+    else:
+        notes.append("liquidation_cascade events DISABLED (set include_liquidation_cascade=True)")
     notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
     if min_score_override is not None:
         # Monkeypatch the module attribute the brain reads so we can
@@ -688,6 +703,84 @@ def replay(
         notes.append(f"chain_flow events emitted: {chain_flow_event_count} "
                      f"(1d-lagged for no-lookahead)")
 
+    liq_event_count = 0
+    if include_liquidation_cascade:
+        # Single-source-of-truth: load all events for the window once,
+        # apply the audit-mandated 1-day lag inside the loader, then walk
+        # 5-minute buckets emitting a 'liquidation_cascade' event when the
+        # rolling-window $-notional crosses the threshold. We bucket on
+        # 5m boundaries to mirror prod LiquidationTracker.cascade_score().
+        try:
+            if liquidation_source == "forward":
+                liq_events = load_forward_liquidations(
+                    start_ms, end_ms, symbols=symbols,
+                )
+                src_name = "forward_collected_binance_ws"
+            else:
+                liq_events = load_liquidations(
+                    start_ms, end_ms, symbols=symbols,
+                )
+                src_name = "bitfinex_public_v2"
+        except Exception as e:
+            notes.append(f"liquidation history unavailable: {e}")
+            liq_events = []
+            src_name = liquidation_source
+        # Pre-bucket events by symbol → list[event] for O(1) lookup per tick.
+        liq_by_sym: dict[str, list[dict]] = {}
+        for ev in liq_events:
+            liq_by_sym.setdefault(ev["symbol"], []).append(ev)
+        # Walk every 5m, evaluate cascade trigger.
+        bucket_ms = 5 * 60_000
+        for sym, evs in liq_by_sym.items():
+            if sym not in set(symbols):
+                continue
+            evs.sort(key=lambda r: r["timestamp"])
+            t = (start_ms // bucket_ms) * bucket_ms + bucket_ms
+            last_emit_ms = -10_000_000
+            while t <= end_ms:
+                agg = liq_aggregate_5m_window(evs, sym, t, window_ms=bucket_ms)
+                # Emit once per direction per cascade window — gate on
+                # threshold AND a 5m de-dup so a sustained cascade across
+                # multiple 5m windows doesn't spam events.
+                long_v = agg["long_liq_usd_5m"]
+                short_v = agg["short_liq_usd_5m"]
+                cascade_event = None
+                liq_usd = 0.0
+                if long_v >= liquidation_min_usd_5m and long_v >= short_v:
+                    cascade_event = "forced_long_close"
+                    liq_usd = long_v
+                    # Longs liq → price wicked down → fade w/ long
+                    side_hint = "long"
+                elif short_v >= liquidation_min_usd_5m and short_v > long_v:
+                    cascade_event = "forced_short_close"
+                    liq_usd = short_v
+                    # Shorts liq → price wicked up → fade w/ short
+                    side_hint = "short"
+                if cascade_event and (t - last_emit_ms) >= bucket_ms:
+                    events.append((t, "liquidation_cascade", sym, {
+                        "liq_usd_5m": liq_usd,
+                        "long_liq_usd_5m": long_v,
+                        "short_liq_usd_5m": short_v,
+                        "cascade_event": cascade_event,
+                        "side_hint": side_hint,
+                        "tier": "small_alt" if sym not in ("BTC", "ETH") else "major",
+                        "source": src_name,
+                    }))
+                    liq_event_count += 1
+                    last_emit_ms = t
+                t += bucket_ms
+        notes.append(
+            f"liquidation_cascade events emitted: {liq_event_count} "
+            f"(source={src_name}, threshold=${liquidation_min_usd_5m/1e6:.1f}M/5m, "
+            f"1d-lagged for no-lookahead)"
+        )
+        if not liq_events and liquidation_source == "forward":
+            notes.append(
+                "⚠ no forward-collected liquidation data found at "
+                "data/liquidations/forward/ — run scripts/collect_liquidations.py "
+                "for ≥14d to accumulate before backtesting"
+            )
+
     if include_fgi_contrarian:
         if include_15m_accel:
             # Sub-hour accel detection from 15m klines. EMPIRICALLY hurts
@@ -904,6 +997,36 @@ def replay(
                     "funding_rate": carry_rate,
                     "funding_rank_pct": carry_rank,
                     "mark_price": close_price,
+                },
+            )
+        elif kind == "liquidation_cascade":
+            liq_usd = float(payload.get("liq_usd_5m", 0.0))
+            cascade_event = payload.get("cascade_event", "forced_long_close")
+            side_hint = payload.get("side_hint", "long")
+            tier = payload.get("tier", "small_alt")
+            close_price = float(klines[idx]["close"]) if klines else 0.0
+            packet = SignalPacket(
+                signal_id=f"bt-liq-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type="liquidation_cascade",
+                priority=2,
+                timestamp=float(ts_ms),
+                price_usd=close_price,
+                volume_24h=vol_24h,
+                price_change_24h=change_24h,
+                source=payload.get("source", "bitfinex_public_v2"),
+                reasoning=f"hist liq cascade {cascade_event} ${liq_usd/1e6:.1f}M/5m on {sym} ({tier}) — fade {side_hint}",
+                suggested_side=side_hint,
+                suggested_stop_pct=0.04,
+                suggested_target_pct=0.09,
+                data={
+                    "liq_usd_5m": liq_usd,
+                    "long_liq_usd_5m": float(payload.get("long_liq_usd_5m", 0.0)),
+                    "short_liq_usd_5m": float(payload.get("short_liq_usd_5m", 0.0)),
+                    "cascade_event": cascade_event,
+                    "side_hint": side_hint,
+                    "tier": tier,
+                    "acceleration_1h": accel,
                 },
             )
         else:  # fgi

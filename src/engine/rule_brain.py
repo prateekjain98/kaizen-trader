@@ -66,6 +66,10 @@ STRATEGY_RISK = {
     # Filtered order-book imbalance (OBI-F, arXiv 2507.22712).
     # Fast mean-reverter: 2% stop, 3% target. Default-OFF in data_streams.
     "orderbook_imbalance": {"stop_pct": 0.02, "target_pct": 0.03},
+    # BTC mempool fee stress — directional short on regime flip. Tight stop,
+    # modest target — moves are quick and the edge decays if a rally absorbs
+    # on-chain selling. Default-OFF until ≥7d of collector history exists.
+    "mempool_stress":      {"stop_pct": 0.04, "target_pct": 0.07},
 }
 
 # Liquid universe for cross-sectional carry. The signal IS the rank — we
@@ -309,6 +313,18 @@ def _score_signal(
             score += 15
             factors.append(f"1h accel {accel_1h:+.1f}% opposes imbalance (snap setup) +15")
         strategy_type = "orderbook_imbalance"
+
+    # BTC mempool fee stress — directional short on regime flip. +25 base,
+    # +15 when FGI is also elevated (>70): paired greed + fee stress is the
+    # post-rally-top setup the thesis is built around. BTC-only by emitter.
+    if signal_type == "mempool_stress" and symbol == "BTC":
+        regime = data.get("regime", "elevated")
+        score += 25
+        factors.append(f"mempool_stress regime={regime} +25")
+        if fgi > 70:
+            score += 15
+            factors.append(f"FGI={fgi} extreme greed pairs with fee stress +15")
+        strategy_type = "mempool_stress"
 
     # ------------------------------------------------------------------
     # Penalties

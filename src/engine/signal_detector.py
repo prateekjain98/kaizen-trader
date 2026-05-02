@@ -91,8 +91,37 @@ class SignalDetector:
             return self._process_liquidation_cascade(sid, signal, snapshot)
         elif signal.event_type == "orderbook_imbalance":
             return self._process_orderbook_imbalance(sid, signal, snapshot)
+        elif signal.event_type == "mempool_stress":
+            return self._process_mempool_stress(sid, signal, snapshot)
 
         return None
+
+    def _process_mempool_stress(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
+        """BTC mempool fee stress — bearish directional signal (BTC only).
+
+        Edge: high on-chain fees correlate with miner sell pressure and
+        post-rally retail FOMO tops. Backtest validation pending — the
+        collector (scripts/collect_mempool.py) must accumulate ≥7d of history
+        before the regime classifier returns anything but 'calm'.
+        """
+        if signal.symbol != "BTC":
+            return None
+        d = signal.data or {}
+        side = d.get("side_hint", "short")
+        regime = d.get("regime", "elevated")
+        price = float(snapshot.prices.get("BTC", 0))
+        return SignalPacket(
+            signal_id=sid, symbol="BTC", signal_type="mempool_stress",
+            priority=signal.priority, timestamp=signal.timestamp,
+            source=signal.source or "mempool_space",
+            price_usd=price,
+            volume_24h=snapshot.volumes_24h.get("BTC", 0),
+            fear_greed_index=snapshot.fear_greed_index,
+            reasoning=f"BTC mempool fee regime={regime} (fastest={d.get('fastest_fee', 0)} sat/vB) — fade with {side}",
+            suggested_side=side,
+            suggested_stop_pct=0.04, suggested_target_pct=0.07,
+            data=d,
+        )
 
     def _process_orderbook_imbalance(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
         """Filtered OBI mean-reversion (arXiv 2507.22712).

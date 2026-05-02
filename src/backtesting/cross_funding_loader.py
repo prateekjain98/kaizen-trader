@@ -1,6 +1,6 @@
-"""Cross-exchange funding-rate aggregator -- Binance / Bybit / OKX / Hyperliquid.
+"""Cross-exchange funding aggregator -- Binance/Bybit/OKX/Hyperliquid.
 
-All public free endpoints, stdlib urllib only. Rates normalised to 8h-equivalent
+Public free endpoints, stdlib urllib only. Rates normalised to per-8h
 so spreads across venues with different funding intervals are comparable.
 """
 
@@ -14,119 +14,90 @@ from urllib.error import URLError
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "cross_funding"
 _TIMEOUT = 15
 _UA = {"User-Agent": "kaizen-trader-backtest/1.0"}
-
-# Funding interval per venue, in hours. Used to normalise to 8h-equivalent.
-# Binance: 8h. Bybit: usually 8h (some perps 4h). OKX: 8h. Hyperliquid: 1h.
+# Funding interval per venue (hours). Bybit can be 4h on some perps; we assume 8h.
 _INTERVAL_H = {"binance": 8, "bybit": 8, "okx": 8, "hyperliquid": 1}
 
 
-def _http_get(url: str) -> Optional[dict]:
+def _http(url: str, body: Optional[dict] = None) -> Optional[dict]:
     try:
-        with urlopen(Request(url, headers=_UA), timeout=_TIMEOUT) as r:
-            return json.loads(r.read().decode())
-    except (URLError, Exception) as e:
-        print(f"  WARN GET {url[:60]}: {e}")
-        return None
-
-
-def _http_post(url: str, body: dict) -> Optional[dict]:
-    try:
-        data = json.dumps(body).encode()
-        req = Request(
-            url,
-            data=data,
-            headers={**_UA, "Content-Type": "application/json"},
-            method="POST",
-        )
+        headers = dict(_UA)
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+        req = Request(url, data=data, headers=headers,
+                      method="POST" if body is not None else "GET")
         with urlopen(req, timeout=_TIMEOUT) as r:
             return json.loads(r.read().decode())
     except (URLError, Exception) as e:
-        print(f"  WARN POST {url[:60]}: {e}")
+        print(f"  WARN {url[:60]}: {e}")
         return None
 
 
 def _to_8h(rate: float, venue: str) -> float:
-    """Normalise a per-period funding rate to per-8h."""
     return rate * (8.0 / _INTERVAL_H.get(venue, 8))
 
 
-# ---------- per-venue spot fetchers ----------
-
-def _binance_rate(symbol: str) -> Optional[float]:
-    pair = symbol.upper() + "USDT"
-    data = _http_get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={pair}")
-    if not data or "lastFundingRate" not in data:
-        return None
-    return _to_8h(float(data["lastFundingRate"]), "binance")
+def _binance_rate(sym: str) -> Optional[float]:
+    d = _http(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}USDT")
+    return _to_8h(float(d["lastFundingRate"]), "binance") if d and "lastFundingRate" in d else None
 
 
-def _bybit_rate(symbol: str) -> Optional[float]:
-    pair = symbol.upper() + "USDT"
-    data = _http_get(
-        f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={pair}"
-    )
-    if not data or data.get("retCode") != 0:
+def _bybit_rate(sym: str) -> Optional[float]:
+    d = _http(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}USDT")
+    if not d or d.get("retCode") != 0:
         return None
-    items = data.get("result", {}).get("list") or []
-    if not items:
+    items = d.get("result", {}).get("list") or []
+    if not items or items[0].get("fundingRate") in (None, ""):
         return None
-    rate = items[0].get("fundingRate")
-    if rate in (None, ""):
-        return None
-    return _to_8h(float(rate), "bybit")
+    return _to_8h(float(items[0]["fundingRate"]), "bybit")
 
 
-def _okx_rate(symbol: str) -> Optional[float]:
-    inst = f"{symbol.upper()}-USDT-SWAP"
-    data = _http_get(f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}")
-    if not data or data.get("code") != "0":
+def _okx_rate(sym: str) -> Optional[float]:
+    d = _http(f"https://www.okx.com/api/v5/public/funding-rate?instId={sym}-USDT-SWAP")
+    if not d or d.get("code") != "0":
         return None
-    items = data.get("data") or []
-    if not items:
+    items = d.get("data") or []
+    if not items or items[0].get("fundingRate") in (None, ""):
         return None
-    rate = items[0].get("fundingRate")
-    if rate in (None, ""):
-        return None
-    return _to_8h(float(rate), "okx")
+    return _to_8h(float(items[0]["fundingRate"]), "okx")
 
 
-def _hyperliquid_rate(symbol: str) -> Optional[float]:
-    data = _http_post(
-        "https://api.hyperliquid.xyz/info", {"type": "metaAndAssetCtxs"}
-    )
-    if not isinstance(data, list) or len(data) != 2:
-        return None
-    universe = data[0].get("universe") or []
-    ctxs = data[1] or []
-    sym = symbol.upper()
-    for i, asset in enumerate(universe):
-        if asset.get("name", "").upper() == sym and i < len(ctxs):
-            rate = ctxs[i].get("funding")
-            if rate in (None, ""):
-                return None
-            return _to_8h(float(rate), "hyperliquid")
-    return None
+_HL_CACHE: dict = {}
+
+
+def _hyperliquid_rate(sym: str) -> Optional[float]:
+    if not _HL_CACHE:
+        d = _http("https://api.hyperliquid.xyz/info", {"type": "metaAndAssetCtxs"})
+        if not isinstance(d, list) or len(d) != 2:
+            return None
+        universe, ctxs = d[0].get("universe") or [], d[1] or []
+        for i, asset in enumerate(universe):
+            if i >= len(ctxs):
+                break
+            r = ctxs[i].get("funding")
+            if r not in (None, ""):
+                _HL_CACHE[asset.get("name", "").upper()] = _to_8h(float(r), "hyperliquid")
+    return _HL_CACHE.get(sym.upper())
+
+
+_FETCHERS = (("binance", _binance_rate), ("bybit", _bybit_rate),
+             ("okx", _okx_rate), ("hyperliquid", _hyperliquid_rate))
 
 
 def fetch_cross_funding(symbol: str) -> dict:
-    """Return {exchange: rate_per_8h} for all 4 venues. Missing venues omitted."""
+    """Return {exchange: rate_per_8h} for the 4 venues. Missing venues omitted."""
+    sym = symbol.upper()
     out: dict = {}
-    for name, fn in (
-        ("binance", _binance_rate),
-        ("bybit", _bybit_rate),
-        ("okx", _okx_rate),
-        ("hyperliquid", _hyperliquid_rate),
-    ):
-        r = fn(symbol)
+    for name, fn in _FETCHERS:
+        r = fn(sym)
         if r is not None:
             out[name] = r
     return out
 
 
-def find_spread_events(
-    symbol_universe: list[str], min_spread: float = 0.0005
-) -> list[dict]:
-    """Scan symbols, return events where max(rate)-min(rate) >= min_spread (per 8h)."""
+def find_spread_events(symbol_universe: list[str], min_spread: float = 0.0005) -> list[dict]:
+    """Symbols where max(rate) - min(rate) >= min_spread (per 8h), sorted desc."""
     events: list[dict] = []
     for sym in symbol_universe:
         rates = fetch_cross_funding(sym)
@@ -134,20 +105,14 @@ def find_spread_events(
             continue
         hi_v, hi = max(rates.items(), key=lambda kv: kv[1])
         lo_v, lo = min(rates.items(), key=lambda kv: kv[1])
-        spread = hi - lo
-        if spread >= min_spread:
-            events.append({
-                "symbol": sym,
-                "spread": spread,
-                "long_venue": lo_v,   # pay funding low / receive on short side
-                "short_venue": hi_v,
-                "rates": rates,
-            })
+        if hi - lo >= min_spread:
+            events.append({"symbol": sym, "spread": hi - lo,
+                           "long_venue": lo_v, "short_venue": hi_v, "rates": rates})
     events.sort(key=lambda e: e["spread"], reverse=True)
     return events
 
 
-# ---------- historical loader ----------
+# ---------- historical ----------
 
 def _cache_path(symbol: str, start_ms: int, end_ms: int) -> Path:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,66 +120,43 @@ def _cache_path(symbol: str, start_ms: int, end_ms: int) -> Path:
     return _DATA_DIR / f"{safe}_cross_{start_ms}_{end_ms}.csv"
 
 
-def _binance_history(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
-    pair = symbol.upper() + "USDT"
-    url = (
-        f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={pair}"
-        f"&startTime={start_ms}&endTime={end_ms}&limit=1000"
-    )
-    data = _http_get(url) or []
-    return [
-        {"venue": "binance", "ts": int(r["fundingTime"]),
-         "rate": _to_8h(float(r["fundingRate"]), "binance")}
-        for r in data
-    ]
+def _binance_hist(sym: str, s: int, e: int) -> list[dict]:
+    d = _http(f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}USDT"
+              f"&startTime={s}&endTime={e}&limit=1000") or []
+    return [{"venue": "binance", "ts": int(r["fundingTime"]),
+             "rate": _to_8h(float(r["fundingRate"]), "binance")} for r in d]
 
 
-def _bybit_history(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
-    pair = symbol.upper() + "USDT"
-    url = (
-        f"https://api.bybit.com/v5/market/funding/history?category=linear"
-        f"&symbol={pair}&startTime={start_ms}&endTime={end_ms}&limit=200"
-    )
-    data = _http_get(url) or {}
-    items = data.get("result", {}).get("list") or []
-    return [
-        {"venue": "bybit", "ts": int(r["fundingRateTimestamp"]),
-         "rate": _to_8h(float(r["fundingRate"]), "bybit")}
-        for r in items
-    ]
+def _bybit_hist(sym: str, s: int, e: int) -> list[dict]:
+    d = _http(f"https://api.bybit.com/v5/market/funding/history?category=linear"
+              f"&symbol={sym}USDT&startTime={s}&endTime={e}&limit=200") or {}
+    items = d.get("result", {}).get("list") or []
+    return [{"venue": "bybit", "ts": int(r["fundingRateTimestamp"]),
+             "rate": _to_8h(float(r["fundingRate"]), "bybit")} for r in items]
 
 
-def _okx_history(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
-    inst = f"{symbol.upper()}-USDT-SWAP"
-    url = (
-        f"https://www.okx.com/api/v5/public/funding-rate-history?instId={inst}"
-        f"&before={start_ms}&after={end_ms}&limit=100"
-    )
-    data = _http_get(url) or {}
-    items = data.get("data") or []
-    return [
-        {"venue": "okx", "ts": int(r["fundingTime"]),
-         "rate": _to_8h(float(r["fundingRate"]), "okx")}
-        for r in items
-    ]
+def _okx_hist(sym: str, s: int, e: int) -> list[dict]:
+    d = _http(f"https://www.okx.com/api/v5/public/funding-rate-history"
+              f"?instId={sym}-USDT-SWAP&before={s}&after={e}&limit=100") or {}
+    items = d.get("data") or []
+    return [{"venue": "okx", "ts": int(r["fundingTime"]),
+             "rate": _to_8h(float(r["fundingRate"]), "okx")} for r in items]
 
 
 def load_history(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
-    """Historical funding rows {venue, ts, rate(8h-norm)} from venues that expose it.
-
-    Hyperliquid history isn't exposed via a simple free endpoint, so it's omitted.
-    Cached per (symbol, range) to data/cross_funding/.
+    """Historical {venue, ts, rate(8h-norm)} from venues that expose it.
+    Hyperliquid history isn't on a free endpoint, so it's omitted.
+    Cached to data/cross_funding/.
     """
     cache = _cache_path(symbol, start_ms, end_ms)
     if cache.exists():
         with open(cache, "r", newline="") as f:
-            return [
-                {"venue": r["venue"], "ts": int(r["ts"]), "rate": float(r["rate"])}
-                for r in csv.DictReader(f)
-            ]
+            return [{"venue": r["venue"], "ts": int(r["ts"]), "rate": float(r["rate"])}
+                    for r in csv.DictReader(f)]
+    sym = symbol.upper()
     rows: list[dict] = []
-    for fn in (_binance_history, _bybit_history, _okx_history):
-        rows.extend(fn(symbol, start_ms, end_ms))
+    for fn in (_binance_hist, _bybit_hist, _okx_hist):
+        rows.extend(fn(sym, start_ms, end_ms))
     rows.sort(key=lambda r: (r["ts"], r["venue"]))
     if rows:
         cache.parent.mkdir(parents=True, exist_ok=True)
