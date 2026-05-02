@@ -36,6 +36,7 @@ from typing import Optional
 from src.backtesting.data_loader import load_klines, load_futures_klines
 from src.backtesting.fgi_loader import load_fear_greed_index, get_fgi_at_timestamp
 from src.backtesting.funding_loader import load_funding_rates
+from src.backtesting.listing_loader import load_exchange_listings
 from src.backtesting.oi_loader import load_open_interest
 from src.backtesting.replay_filters import (
     REPLAYABLE as REPLAYABLE_FILTERS,
@@ -219,6 +220,7 @@ def replay(
     include_top_movers: bool = True,
     include_15m_accel: bool = False,
     include_fgi_contrarian: bool = True,
+    include_listing_pump: bool = True,
     min_score_override: Optional[int] = None,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
@@ -246,6 +248,10 @@ def replay(
         notes.append("fgi_contrarian events from alternative.me FGI history (BTC/ETH only)")
     else:
         notes.append("fgi_contrarian events DISABLED")
+    if include_listing_pump:
+        notes.append("listing_pump events from Binance Futures/Spot + Coinbase listing dates")
+    else:
+        notes.append("listing_pump events DISABLED")
     notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
     if min_score_override is not None:
         # Monkeypatch the module attribute the brain reads so we can
@@ -274,15 +280,25 @@ def replay(
     oi_by_symbol: dict[str, list[dict]] = {}
 
     oi_missing_count = 0
+    spot_unavailable_count = 0
     need_15m = apply_filters or include_top_movers
     for sym in symbols:
-        klines_by_symbol[sym] = load_klines(sym, KLINE_INTERVAL, start_ms, end_ms)
-        funding_by_symbol[sym] = load_funding_rates(sym, start_ms, end_ms)
+        try:
+            klines_by_symbol[sym] = load_klines(sym, KLINE_INTERVAL, start_ms, end_ms)
+        except Exception:
+            # Some symbols (tokenised stock futures, delisted, unicode names)
+            # have no spot kline data. Fall through with empty list — events
+            # for that symbol can still fire but trades won't simulate.
+            klines_by_symbol[sym] = []
+            spot_unavailable_count += 1
+        try:
+            funding_by_symbol[sym] = load_funding_rates(sym, start_ms, end_ms)
+        except Exception:
+            funding_by_symbol[sym] = []
         if need_15m:
             try:
                 klines_15m_by_symbol[sym] = load_klines(sym, "15m", start_ms, end_ms)
-            except Exception as e:
-                notes.append(f"15m klines unavailable for {sym}: {e}")
+            except Exception:
                 klines_15m_by_symbol[sym] = []
         if apply_filters:
             try:
@@ -298,6 +314,10 @@ def replay(
                 notes.append(f"oi history unavailable for {sym}: {e}")
                 oi_by_symbol[sym] = []
                 oi_missing_count += 1
+    if spot_unavailable_count > 0:
+        notes.append(f"⚠ spot klines unavailable for {spot_unavailable_count}/{len(symbols)} "
+                     f"symbols (tokenised stocks, delisted, or unicode names) — "
+                     f"events fire but trades skip simulation")
     if apply_filters and oi_missing_count > 0:
         # Binance's openInterestHist endpoint typically retains only ~30d of
         # data. For windows older than that, this filter silently fail-opens.
@@ -323,6 +343,27 @@ def replay(
         tm_events = reconstruct_top_movers(symbols=symbols, start_ms=start_ms, end_ms=end_ms)
         for tm in tm_events:
             events.append((tm["ts_ms"], "top_mover", tm["symbol"], tm))
+
+    listing_event_count = 0
+    if include_listing_pump:
+        try:
+            listings = load_exchange_listings()
+        except Exception as e:
+            notes.append(f"listing history unavailable: {e}")
+            listings = []
+        symbol_set = set(symbols)
+        for L in listings:
+            sym = L.get("symbol", "")
+            ts = int(L.get("listing_date_ms", 0))
+            if sym not in symbol_set or ts < start_ms or ts > end_ms:
+                continue
+            events.append((ts, "listing", sym, {
+                "exchange": L.get("exchange", ""),
+                "listing_type": L.get("listing_type", ""),
+                "listing_date_ms": ts,
+            }))
+            listing_event_count += 1
+        notes.append(f"listing_pump events emitted: {listing_event_count}")
 
     fgi_event_count = 0
     if include_fgi_contrarian:
@@ -456,6 +497,26 @@ def replay(
                     "volume_24h": tm_vol,
                     "price": mark,
                 },
+            )
+        elif kind == "listing":
+            listing_ts = int(payload.get("listing_date_ms", ts_ms))
+            age_hours = max(0.0, (ts_ms - listing_ts) / 3_600_000)
+            exchange = payload.get("exchange", "")
+            close_price = float(klines[idx]["close"]) if klines else 0.0
+            stop_pct = 0.08 if "coinbase" in exchange.lower() else 0.05
+            packet = SignalPacket(
+                signal_id=f"bt-list-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type="listing_pump",
+                priority=3,
+                timestamp=float(ts_ms),
+                price_usd=close_price,
+                source=exchange or "binance_futures",
+                reasoning=f"NEW {exchange or 'exchange'} listing detected. Age: {age_hours:.1f}h",
+                suggested_side="long",
+                suggested_stop_pct=stop_pct,
+                suggested_target_pct=0.30,
+                data={"listing_age_hours": age_hours, "exchange": exchange},
             )
         else:  # fgi
             fgi_val = int(payload.get("fgi", 50))
