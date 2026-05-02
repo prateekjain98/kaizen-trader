@@ -1,0 +1,40 @@
+RALPH LOOP — Iteratively make kaizen-trader the best crypto trader in the world. No fabrication, no shortcuts, no flattery, stop on regression.
+
+STEP 1 PROD HEALTH:
+gcloud compute ssh kaizen-prod --zone=asia-east2-a --tunnel-through-iap --command='systemctl is-active kaizen kaizen-watchdog; echo ===HB===; sudo journalctl -u kaizen --since="3 min ago" --no-pager | grep "Bal:" | tail -3; echo ===ERR===; sudo journalctl -u kaizen --since="10 min ago" --no-pager | grep -iE "Traceback|NameError|deadlock|fatal|restart counter" | grep -v "\\-4120" | tail -5; echo ===LIVENESS===; sudo journalctl -t kaizen-liveness --since="30 min ago" --no-pager | grep -iE "restart|stale" | tail -3'
+
+Verify: BOTH services active, Ticks advancing across last 2 HBs, no errors, no liveness restart 30min. If FAIL: fix or revert.
+
+STEP 2 GATES (real data only):
+G1 Liveness: journalctl --since=24h | grep "KAIZEN HUNG\|stale.*restart" | wc -l → ==0
+G2 Trades 24h: grep -c "💰 OPEN" → ≥3
+G3 PnL 7d: parse "💰 CLOSE.*\$([+-][0-9.]+)" sum → ≥0
+G4 Risk 7d: count closes pnl_pct ≤ -10 → ==0
+G5 Backtest: scripts/run_live_backtest.py last run → exists + PnL ≥0 + replays LIVE filter chain
+Report each: PASS|FAIL|UNAVAILABLE: <number>
+
+STEP 3 ADVERSARIAL (only if all green): spawn everything-claude-code:code-reviewer "steel-man case kaizen-trader is NOT best crypto trader. List concrete gaps."
+
+STEP 4 SHIP ONE FIX (if not best):
+- Highest-impact failed gate
+- everything-claude-code:code-reviewer fix every P0/P1 before commit
+- ANY new lock acquisition: grep callers; if any holds it, RLock
+- python3 -m pytest tests/test_executor_exits.py -x -q must pass
+- python3 -c "from <mod> import <sym>" import test required
+- Push, verify deploy: ssh, git log --oneline -1 matches hash, Ticks advanced on new PID
+- If regress, REVERT
+
+CONSTRAINTS: don't touch Convex; don't change MAX_POSITION_USD/MAX_DAILY_LOSS_USD; ≤300 lines/iter; FIX-FIRST not feature when broken.
+
+PARALLEL: dispatch sub-agents on independent tracks. Don't sit idle between fires.
+
+REPORT (mandatory):
+HEALTH: <OK Ticks N→M | HUNG | RESTART_LOOP | ERRORED>
+GATES: G1..G5 each
+VERDICT: BEST IN WORLD? YES|NO
+SHIPPED: <hash + 1 line | none — reason>
+SHORTCUTS: <list | none>
+NEXT GAP: <single highest-impact>
+
+REPO: /Users/prateekjain/Documents/Dev/kaizen-trader/
+End response. No flattery.
