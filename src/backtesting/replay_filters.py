@@ -10,12 +10,13 @@ Replayed filters (PARITY with prod logic):
     2. correlation_filter — uses simulator's open_positions list
     3. volatility_filter — computes 15m ATR from kline series
     4. oi_delta_filter   — uses historical openInterestHist via oi_loader
+    5. basis_filter      — uses synchronised perp/spot 1h closes
+    6. top_trader_crowding — uses topLongShortPositionRatio history (5m,
+                              ~30d Binance retention — older windows
+                              fail-open like oi_delta)
 
 Skipped filters (DECLARED, no historical analogue available offline):
-    * basis_filter         (needs synchronised perp/spot historical pair)
     * cvd_flow_filter      (needs full aggTrade tape replay — too expensive)
-    * top_trader_crowding  (no public historical endpoint for the
-                             topLongShortPositionRatio metric)
     * liquidation_cascade  (no public historical forceOrder dump)
 
 Each backtest run that calls `run_offline_filters` records the list of
@@ -50,13 +51,17 @@ _ATR_LOOKBACK_15M = 14
 _OI_FLAT_THRESHOLD = 0.03  # |Δ| < 3% over 1h is "flat"
 
 
-REPLAYABLE = ["time_of_day", "correlation", "volatility", "oi_delta", "basis"]
-SKIPPED = ["cvd_flow", "top_trader_crowding", "liquidation_cascade"]
+REPLAYABLE = ["time_of_day", "correlation", "volatility", "oi_delta", "basis", "top_crowding"]
+SKIPPED = ["cvd_flow", "liquidation_cascade"]
 
 
 # Basis filter constants (parity with src.engine.entry_filters.basis_filter)
 _BASIS_LONG_BLOCK = 0.001    # perp >0.1% over spot blocks new longs
 _BASIS_SHORT_BLOCK = -0.001  # perp <-0.1% under spot blocks new shorts
+
+# Top-trader crowding constants (parity with src.engine.entry_filters)
+_TOP_RATIO_LONG_BLOCK = 2.5    # ratio > 2.5 → 71%+ long, refuse new longs
+_TOP_RATIO_SHORT_BLOCK = 0.5   # ratio < 0.5 → 67%+ short, refuse new shorts
 
 
 @dataclass
@@ -231,6 +236,45 @@ def basis_check(
                        f"{symbol} basis {basis*100:+.2f}% supports {side}")
 
 
+def top_ls_check(
+    symbol: str,
+    side: str,
+    ts_ms: int,
+    ls_history: list[dict],
+) -> FilterCheck:
+    """Mirror prod `top_trader_crowding_filter`: refuse longs when top traders
+    are >71% long (ratio > 2.5) and refuse shorts when >67% short
+    (ratio < 0.5). Uses the most recent ratio at-or-before ts_ms (live filter
+    polls the latest 5m bucket; we read the same).
+
+    Falls open when no history is available — same posture as prod, which
+    fail-opens on fetch error so a Binance hiccup doesn't block all trades.
+    """
+    if not ls_history:
+        return FilterCheck(True, "top_crowding", "ls history unavailable — fail-open")
+    cur = None
+    for r in ls_history:
+        t = r.get("timestamp", 0)
+        if t <= ts_ms:
+            cur = r
+        else:
+            break
+    if cur is None:
+        return FilterCheck(True, "top_crowding", "ls history thin — fail-open")
+    ratio = float(cur.get("long_short_ratio", 0))
+    if ratio <= 0:
+        return FilterCheck(True, "top_crowding", "ratio zero — fail-open")
+    long_pct = ratio / (1 + ratio) * 100
+    if side == "long" and ratio > _TOP_RATIO_LONG_BLOCK:
+        return FilterCheck(False, "top_crowding",
+                           f"{symbol} top traders {long_pct:.0f}% long (ratio {ratio:.2f}) — refuse to add to crowd")
+    if side == "short" and ratio < _TOP_RATIO_SHORT_BLOCK:
+        return FilterCheck(False, "top_crowding",
+                           f"{symbol} top traders {100-long_pct:.0f}% short (ratio {ratio:.2f}) — refuse to add to crowd")
+    return FilterCheck(True, "top_crowding",
+                       f"{symbol} top L/S ratio {ratio:.2f} — {side} OK")
+
+
 # ─── Chain runner ────────────────────────────────────────────────────────
 
 def run_offline_filters(
@@ -243,6 +287,7 @@ def run_offline_filters(
     oi_history: Optional[list[dict]] = None,
     spot_klines_1h: Optional[list[dict]] = None,
     futures_klines_1h: Optional[list[dict]] = None,
+    ls_history: Optional[list[dict]] = None,
 ) -> FilterCheck:
     """Run the replayable subset of the prod filter chain. Returns the
     first BLOCK or a final allow if nothing blocks."""
@@ -252,9 +297,10 @@ def run_offline_filters(
         volatility_check(symbol, klines_15m or [], ts_ms),
         oi_delta_check(symbol, side, ts_ms, oi_history or []),
         basis_check(symbol, side, ts_ms, spot_klines_1h or [], futures_klines_1h or []),
+        top_ls_check(symbol, side, ts_ms, ls_history or []),
     ]
     for c in checks:
         if not c.allowed:
             return c
     return FilterCheck(True, "all_replayable_passed",
-                       f"{symbol} {side} cleared time/corr/vol/oi/basis (cvd/ls/liq SKIPPED)")
+                       f"{symbol} {side} cleared time/corr/vol/oi/basis/top_ls (cvd/liq SKIPPED)")

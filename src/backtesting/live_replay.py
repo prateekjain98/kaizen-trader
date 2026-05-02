@@ -38,6 +38,7 @@ from src.backtesting.fgi_loader import load_fear_greed_index, get_fgi_at_timesta
 from src.backtesting.funding_loader import load_funding_rates
 from src.backtesting.listing_loader import load_exchange_listings
 from src.backtesting.oi_loader import load_open_interest
+from src.backtesting.top_ls_loader import load_top_ls_ratio
 from src.backtesting.replay_filters import (
     REPLAYABLE as REPLAYABLE_FILTERS,
     SKIPPED as SKIPPED_FILTERS,
@@ -278,8 +279,10 @@ def replay(
     futures_klines_by_symbol: dict[str, list[dict]] = {}
     funding_by_symbol: dict[str, list[dict]] = {}
     oi_by_symbol: dict[str, list[dict]] = {}
+    ls_by_symbol: dict[str, list[dict]] = {}
 
     oi_missing_count = 0
+    ls_missing_count = 0
     spot_unavailable_count = 0
     need_15m = apply_filters or include_top_movers
     for sym in symbols:
@@ -314,6 +317,14 @@ def replay(
                 notes.append(f"oi history unavailable for {sym}: {e}")
                 oi_by_symbol[sym] = []
                 oi_missing_count += 1
+            try:
+                ls_by_symbol[sym] = load_top_ls_ratio(sym, start_ms, end_ms)
+                if not ls_by_symbol[sym]:
+                    ls_missing_count += 1
+            except Exception as e:
+                notes.append(f"top L/S history unavailable for {sym}: {e}")
+                ls_by_symbol[sym] = []
+                ls_missing_count += 1
     if spot_unavailable_count > 0:
         notes.append(f"⚠ spot klines unavailable for {spot_unavailable_count}/{len(symbols)} "
                      f"symbols (tokenised stocks, delisted, or unicode names) — "
@@ -325,6 +336,13 @@ def replay(
         notes.append(
             f"⚠ oi_delta fail-open for {oi_missing_count}/{len(symbols)} "
             f"symbols (Binance OI history retention limit, ~30d) — that "
+            f"filter effectively bypassed in this window"
+        )
+    if apply_filters and ls_missing_count > 0:
+        # Same retention limit on topLongShortPositionRatio (~30d).
+        notes.append(
+            f"⚠ top_crowding fail-open for {ls_missing_count}/{len(symbols)} "
+            f"symbols (Binance top L/S retention limit, ~30d) — that "
             f"filter effectively bypassed in this window"
         )
 
@@ -575,6 +593,7 @@ def replay(
                     oi_history=oi_by_symbol.get(d.symbol, []),
                     spot_klines_1h=klines_by_symbol.get(d.symbol, []),
                     futures_klines_1h=futures_klines_by_symbol.get(d.symbol, []),
+                    ls_history=ls_by_symbol.get(d.symbol, []),
                 )
                 if not check.allowed:
                     continue
