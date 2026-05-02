@@ -63,6 +63,9 @@ STRATEGY_RISK = {
     # and modest targets. Empirical wick-revert magnitudes on Oct 10-11 2025
     # cascade clustered in the 6-12% range.
     "liquidation_cascade": {"stop_pct": 0.035, "target_pct": 0.09},
+    # Filtered order-book imbalance (OBI-F, arXiv 2507.22712).
+    # Fast mean-reverter: 2% stop, 3% target. Default-OFF in data_streams.
+    "orderbook_imbalance": {"stop_pct": 0.02, "target_pct": 0.03},
 }
 
 # Liquid universe for cross-sectional carry. The signal IS the rank — we
@@ -292,6 +295,20 @@ def _score_signal(
             score += 5
             factors.append(f"liq cascade strong dominance ratio={ratio:.1f}x +5")
         strategy_type = "liquidation_cascade"
+
+    # Filtered order-book imbalance (OBI-F, arXiv 2507.22712).
+    # +35 base for the persistent imbalance triggering, +15 when the 1h
+    # trend confirms the mean-revert setup (price moving OPPOSITE the
+    # imbalance direction — book is loaded for the snap-back).
+    if signal_type == "orderbook_imbalance":
+        obi_ema = float(data.get("obi_f_ema", 0.0))
+        score += 35
+        factors.append(f"OBI-F |{obi_ema:+.2f}| persistent imbalance +35")
+        # accel_1h is OPPOSITE obi sign → snap setup confirmed
+        if (obi_ema > 0 and accel_1h < 0) or (obi_ema < 0 and accel_1h > 0):
+            score += 15
+            factors.append(f"1h accel {accel_1h:+.1f}% opposes imbalance (snap setup) +15")
+        strategy_type = "orderbook_imbalance"
 
     # ------------------------------------------------------------------
     # Penalties

@@ -89,8 +89,43 @@ class SignalDetector:
             return self._process_large_move(sid, signal, snapshot)
         elif signal.event_type == "liquidation_cascade":
             return self._process_liquidation_cascade(sid, signal, snapshot)
+        elif signal.event_type == "orderbook_imbalance":
+            return self._process_orderbook_imbalance(sid, signal, snapshot)
 
         return None
+
+    def _process_orderbook_imbalance(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
+        """Filtered OBI mean-reversion (arXiv 2507.22712).
+
+        Trigger: |obi_f_ema| > 0.4 AND prevailing 1h move runs OPPOSITE
+        the imbalance (book is loaded for the snap-back). side_hint is
+        therefore the imbalance direction itself — long when bids dominate
+        a downtrend, short when asks dominate an uptrend.
+        """
+        d = signal.data or {}
+        obi_ema = float(d.get("obi_f_ema", 0.0))
+        accel_1h = float(d.get("acceleration_1h", 0.0))
+        if abs(obi_ema) <= 0.4:
+            return None
+        # Mean-reversion gate: imbalance must be opposite the 1h move.
+        if obi_ema > 0 and accel_1h >= 0:
+            return None
+        if obi_ema < 0 and accel_1h <= 0:
+            return None
+        side_hint = "long" if obi_ema > 0 else "short"
+        symbol = signal.symbol
+        price = float(d.get("price", 0.0)) or float(snapshot.prices.get(symbol, 0))
+        return SignalPacket(
+            signal_id=sid, symbol=symbol, signal_type="orderbook_imbalance",
+            priority=1, timestamp=signal.timestamp, source="binance_obi_ws",
+            price_usd=price,
+            fear_greed_index=snapshot.fear_greed_index,
+            reasoning=(f"filtered OBI {obi_ema:+.2f} vs 1h move {accel_1h:+.1f}% — "
+                       f"mean-revert {side_hint}"),
+            suggested_side=side_hint,
+            suggested_stop_pct=0.02, suggested_target_pct=0.03,
+            data={"obi_f_ema": obi_ema, "acceleration_1h": accel_1h, "price": price},
+        )
 
     def _process_liquidation_cascade(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
         """Liquidation cascade — fade the wick.

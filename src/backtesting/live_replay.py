@@ -39,6 +39,11 @@ from src.backtesting.stablecoin_loader import (
     load_stablecoin_history,
     get_stablecoin_flow_at_timestamp,
 )
+from src.backtesting.chain_tvl_loader import (
+    load_chain_tvl_history,
+    get_chain_tvl_at_timestamp,
+    CHAIN_SYMBOL_MAP,
+)
 from src.backtesting.funding_loader import load_funding_rates
 from src.backtesting.funding_carry_loader import reconstruct_funding_carry
 from src.backtesting.listing_loader import load_exchange_listings
@@ -342,6 +347,7 @@ def replay(
     include_listing_pump: bool = True,
     include_stable_flow: bool = True,
     include_funding_carry: bool = True,
+    include_chain_flow: bool = True,
     apply_regime_gate: bool = True,
     apply_slippage: bool = True,
     min_score_override: Optional[int] = None,
@@ -383,6 +389,10 @@ def replay(
         notes.append("funding_carry events from cross-sectional 8h ranking (top/bot 10%)")
     else:
         notes.append("funding_carry events DISABLED")
+    if include_chain_flow:
+        notes.append("chain_flow events from DefiLlama per-chain TVL (Eth/Sol/Arb)")
+    else:
+        notes.append("chain_flow events DISABLED")
     notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
     if min_score_override is not None:
         # Monkeypatch the module attribute the brain reads so we can
@@ -625,6 +635,59 @@ def replay(
             funding_carry_event_count += 1
         notes.append(f"funding_carry events emitted: {funding_carry_event_count}")
 
+    chain_flow_event_count = 0
+    if include_chain_flow:
+        # Per-chain TVL flow → ecosystem-wide bull/bear events. Daily walk
+        # mirroring stable_flow. Audit-fix: 1-day-lag the lookup (today's
+        # TVL = end-of-day-N, only knowable AFTER day-N).
+        symbol_set = set(symbols)
+        chain_histories: dict[str, list[dict]] = {}
+        for chain in CHAIN_SYMBOL_MAP:
+            chain_syms = [s for s in CHAIN_SYMBOL_MAP[chain] if s in symbol_set]
+            if not chain_syms:
+                continue
+            try:
+                chain_histories[chain] = load_chain_tvl_history(chain)
+            except Exception as e:
+                notes.append(f"chain TVL unavailable for {chain}: {e}")
+                chain_histories[chain] = []
+        day_ms = 86_400_000
+        t = (start_ms // day_ms) * day_ms
+        while t <= end_ms:
+            for chain, history in chain_histories.items():
+                if not history:
+                    continue
+                row = get_chain_tvl_at_timestamp(history, t - day_ms)
+                if row is None:
+                    continue
+                net24 = float(row["net_24h_change_pct"])
+                net7 = float(row["net_7d_change_pct"])
+                kind = None
+                side_hint = "long"
+                if net24 > 5.0 and net7 > 0.0:
+                    kind = "chain_flow_bull"
+                    side_hint = "long"
+                elif net24 < -5.0 and net7 < 0.0:
+                    kind = "chain_flow_bear"
+                    side_hint = "short"
+                if kind is None:
+                    continue
+                for sym in CHAIN_SYMBOL_MAP[chain]:
+                    if sym not in symbol_set:
+                        continue
+                    events.append((t, "chain_flow", sym, {
+                        "chain": chain,
+                        "chain_tvl_usd": float(row["tvl_usd"]),
+                        "chain_tvl_net_24h_pct": net24,
+                        "chain_tvl_net_7d_pct": net7,
+                        "side_hint": side_hint,
+                        "event_kind": kind,
+                    }))
+                    chain_flow_event_count += 1
+            t += day_ms
+        notes.append(f"chain_flow events emitted: {chain_flow_event_count} "
+                     f"(1d-lagged for no-lookahead)")
+
     if include_fgi_contrarian:
         if include_15m_accel:
             # Sub-hour accel detection from 15m klines. EMPIRICALLY hurts
@@ -787,6 +850,32 @@ def replay(
                     "stablecoin_net_24h_usd": net24,
                     "stablecoin_net_7d_usd": float(payload.get("stablecoin_net_7d_usd", 0.0)),
                     "stablecoin_total_usd": float(payload.get("stablecoin_total_usd", 0.0)),
+                },
+            )
+        elif kind == "chain_flow":
+            chg24 = float(payload.get("chain_tvl_net_24h_pct", 0.0))
+            chg7 = float(payload.get("chain_tvl_net_7d_pct", 0.0))
+            chain = payload.get("chain", "?")
+            event_kind = payload.get("event_kind", "chain_flow_bull")
+            side_hint = payload.get("side_hint", "long")
+            close_price = float(klines[idx]["close"]) if klines else 0.0
+            packet = SignalPacket(
+                signal_id=f"bt-tvl-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type=event_kind,
+                priority=2,
+                timestamp=float(ts_ms),
+                price_usd=close_price,
+                source="defillama_chain_tvl",
+                reasoning=f"{chain} TVL {chg24:+.1f}%/24h, 7d {chg7:+.1f}% — {event_kind} {side_hint}",
+                suggested_side=side_hint,
+                suggested_stop_pct=0.06 if side_hint == "long" else 0.05,
+                suggested_target_pct=0.12 if side_hint == "long" else 0.08,
+                data={
+                    "chain": chain,
+                    "chain_tvl_usd": float(payload.get("chain_tvl_usd", 0.0)),
+                    "chain_tvl_net_24h_pct": chg24,
+                    "chain_tvl_net_7d_pct": chg7,
                 },
             )
         elif kind == "funding_carry":

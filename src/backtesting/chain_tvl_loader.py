@@ -1,5 +1,11 @@
 """Chain-level TVL flow loader — DefiLlama historicalChainTvl per chain.
 
+Prod gate: env var `CHAIN_FLOW_ENABLED` (default '0') — the live poller
+that emits chain_flow_* signals into RuleBrain MUST early-return unless
+this is set to '1'. Backtest harness ignores the env var (default-on for
+measurement). Mirrors the FUNDING_CARRY_ENABLED posture in data_streams.py:
+keep the code path wired but dark in prod until OOS validates.
+
 Edge thesis: net TVL flow per ecosystem leads price action by 12-48h.
 When Solana TVL rips +5%/24h while uptrending 7d, capital is rotating in
 → SOL/JUP/ORCA bullish. When Ethereum TVL drains in concert with a 7d
@@ -19,10 +25,16 @@ NOT lag for you, the consumer is responsible (mirrors stable_flow).
 """
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Optional
 from urllib.request import urlopen, Request
+
+
+def chain_flow_enabled_in_prod() -> bool:
+    """Prod gate. Live emitter must respect this; backtest ignores it."""
+    return os.environ.get("CHAIN_FLOW_ENABLED", "0") == "1"
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "chain_tvl"
 _API_URL_TMPL = "https://api.llama.fi/v2/historicalChainTvl/{chain}"

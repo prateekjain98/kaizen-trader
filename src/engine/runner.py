@@ -230,6 +230,15 @@ class TradingEngine:
 
     def _sync_brain_state(self):
         """Sync executor state into brain so Claude sees current portfolio."""
+        # Tell DataStreams which symbols are currently held so the OBI-F
+        # WS sub can rotate to (held ∪ trending). The L2 depth stream is
+        # high-bandwidth — only subscribe where we actually trade.
+        try:
+            self.streams._held_position_symbols = {
+                p.symbol for p in self.executor.positions
+            }
+        except Exception:
+            pass
         self.brain.balance = self.executor.balance
         self.brain.daily_pnl = self.executor.daily_pnl
         self.brain.open_positions = [

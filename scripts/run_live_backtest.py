@@ -45,6 +45,8 @@ def main() -> int:
                    help="Disable listing_pump event replay (Binance + Coinbase listing dates)")
     p.add_argument("--no-stable-flow", action="store_true",
                    help="Disable stable_flow event replay (DefiLlama stablecoin net-flow)")
+    p.add_argument("--no-chain-flow", action="store_true",
+                   help="Disable per-chain TVL flow event replay (DefiLlama)")
     p.add_argument("--no-funding-carry", action="store_true",
                    help="Disable cross-sectional funding-carry event replay")
     p.add_argument("--no-regime-gate", action="store_true",
@@ -104,6 +106,7 @@ def main() -> int:
                         include_listing_pump=not args.no_listings,
                         include_stable_flow=not args.no_stable_flow,
                         include_funding_carry=not args.no_funding_carry,
+                        include_chain_flow=not args.no_chain_flow,
                         apply_regime_gate=not args.no_regime_gate,
                         apply_slippage=not args.no_slippage,
                         min_score_override=args.min_score)

@@ -72,6 +72,12 @@ _LIQ_TIER_LARGE = frozenset({
 # pending_signals queue every 30s while a cascade is rolling.
 _LIQ_CASCADE_COOLDOWN_S = 300
 
+# OBI-F: don't re-emit per-symbol within this window. The persistent
+# imbalance + 1h-opposite gate is rare; if it does fire, give the trade
+# room to play out before re-arming.
+_OB_IMBALANCE_COOLDOWN_S = 600
+_OB_IMBALANCE_TRIGGER = 0.4  # |obi_f_ema| threshold per arXiv 2507.22712
+
 
 def _liq_tier_of(symbol: str) -> str:
     s = (symbol or "").upper()
@@ -419,6 +425,15 @@ class DataStreams:
         self._last_carry_boundary_ms: int = 0
         # symbol → unix-seconds of last cascade signal emission (for cooldown)
         self._last_liq_cascade_emit: dict[str, float] = {}
+        # symbol → unix-seconds of last OBI-F signal emission (for cooldown)
+        self._last_ob_imbalance_emit: dict[str, float] = {}
+        # Symbols held by the executor — set externally by runner each tick so
+        # the OBI-F WS subscription can rotate to active positions + trending.
+        self._held_position_symbols: set[str] = set()
+        # Last regime emitted for mempool stress (so we only fire on flips, not
+        # every poll while regime stays elevated/extreme).
+        self._last_mempool_regime: str = "calm"
+        self._last_mempool_emit_s: float = 0.0
 
     def get_prices_snapshot(self) -> dict[str, float]:
         """Return a shallow copy of the current prices dict, taken under lock.
@@ -495,6 +510,8 @@ class DataStreams:
             ("crypto_news", self._poll_news, 300),                  # 5 min — CoinTelegraph RSS
             ("funding_carry", self._poll_funding_carry, 60),        # 1 min tick, fires only at 8h boundaries
             ("liquidation_cascade", self._poll_liquidation_cascade, 30),  # 30s tick, env-gated
+            ("ob_imbalance", self._poll_orderbook_imbalance, 15),         # 15s tick, env-gated
+            ("mempool_stress", self._poll_mempool_stress, 300),  # 5min, env-gated, BTC fee regime
         ]
 
         for name, fn, interval_s in streams:
@@ -934,3 +951,126 @@ class DataStreams:
 
         if emitted:
             log("info", f"[liq_cascade] emitted {emitted} cascade events")
+
+    def _poll_orderbook_imbalance(self):
+        """Emit orderbook_imbalance TokenSignals from the OBI-F tracker.
+
+        Filtered top-5 OBI on the 5-min EMA, gated to active symbols only.
+        We rotate the WS subscription to (held positions ∪ top trending),
+        because the L2 depth20@100ms stream is HIGH bandwidth — broadcasting
+        the universe would be wasteful.
+
+        DEFAULT-OFF: gated by env OB_IMBALANCE_ENABLED='1'. This signal is
+        HARD to backtest — exchanges don't republish historical L2 books
+        for free. A faithful walk-forward would need an aggTrade-replay
+        infrastructure that reconstructs the book from depth-snapshot +
+        diff-update events. Until that exists, OOS validation is impossible
+        and the safe default is OFF, mirroring the audit discipline applied
+        to FUNDING_CARRY_ENABLED and LIQUIDATION_CASCADE_ENABLED.
+        """
+        if os.environ.get("OB_IMBALANCE_ENABLED", "0") != "1":
+            return
+        try:
+            from src.engine.orderbook_tracker import get_tracker
+            tracker = get_tracker()
+        except Exception:
+            return
+        if tracker.status != "connected" and not tracker.active_symbols():
+            tracker.start()
+
+        # Refresh active symbol set: held positions + top trending, capped.
+        with self._lock:
+            held = set(self._held_position_symbols)
+            trending = list(self.snapshot.trending_tokens or [])
+        active = set(s.upper() for s in held)
+        for t in trending:
+            active.add((t or "").upper())
+            if len(active) >= 12:
+                break
+        active.discard("")
+        tracker.set_active_symbols(active)
+
+        now_s = time.time()
+        now_ms = now_s * 1000
+        emitted = 0
+        for sym in tracker.active_symbols():
+            ema = tracker.obi_f_ema(sym)
+            if ema is None or abs(ema) <= _OB_IMBALANCE_TRIGGER:
+                continue
+            last_emit = self._last_ob_imbalance_emit.get(sym, 0.0)
+            if now_s - last_emit < _OB_IMBALANCE_COOLDOWN_S:
+                continue
+            price = self.snapshot.prices.get(sym, 0.0)
+            self.on_signal(TokenSignal(
+                source="binance_obi_ws",
+                symbol=sym,
+                event_type="orderbook_imbalance",
+                data={
+                    "obi_f_ema": ema,
+                    "obi_f": tracker.obi_f(sym),
+                    "price": price,
+                },
+                timestamp=now_ms,
+                priority=1,
+            ))
+            self._last_ob_imbalance_emit[sym] = now_s
+            emitted += 1
+        if emitted:
+            log("info", f"[ob_imbalance] emitted {emitted} OBI-F events")
+
+    def _poll_mempool_stress(self):
+        """BTC mempool fee-market regime → bearish directional signal on flip.
+
+        Thesis: BTC fee spikes precede major sell-offs (miners netflow stress)
+        and post-rally tops (retail FOMO). When the trailing-24h median fee
+        crosses into the 75th/95th percentile of trailing-7d, we emit
+        `mempool_stress` with side_hint=short for BTC ONLY.
+
+        DEFAULT-OFF (MEMPOOL_STRESS_ENABLED='1' to enable). Default off because
+        we have NO history yet — can't backtest until the collector
+        (scripts/collect_mempool.py) has run for ≥7 days.
+        """
+        if os.environ.get("MEMPOOL_STRESS_ENABLED", "0") != "1":
+            return
+        try:
+            from src.backtesting.mempool_loader import (
+                append_snapshot, load_history, regime_from_recent,
+            )
+        except Exception:
+            return
+
+        append_snapshot()
+        history = load_history()
+        if not history:
+            return
+        regime = regime_from_recent(history)
+
+        prev = self._last_mempool_regime
+        self._last_mempool_regime = regime
+        if regime == "calm" or prev == regime:
+            return
+
+        now_s = time.time()
+        if now_s - self._last_mempool_emit_s < 6 * 3600:
+            return
+        self._last_mempool_emit_s = now_s
+
+        latest = history[-1]
+        self.on_signal(TokenSignal(
+            source="mempool_space",
+            symbol="BTC",
+            event_type="mempool_stress",
+            data={
+                "side_hint": "short",
+                "regime": regime,
+                "fastest_fee": latest["fastest_fee"],
+                "half_hour_fee": latest["half_hour_fee"],
+                "mempool_vsize": latest["mempool_vsize"],
+                "total_pending_fee_btc": latest["total_pending_fee_btc"],
+                "baseline_samples": len(history),
+            },
+            timestamp=now_s * 1000,
+            priority=2 if regime == "extreme" else 1,
+        ))
+        log("info", f"[mempool_stress] regime flip {prev}->{regime} "
+                    f"fastest={latest['fastest_fee']} sat/vB")
