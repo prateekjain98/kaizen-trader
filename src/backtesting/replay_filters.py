@@ -14,9 +14,12 @@ Replayed filters (PARITY with prod logic):
     6. top_trader_crowding — uses topLongShortPositionRatio history (5m,
                               ~30d Binance retention — older windows
                               fail-open like oi_delta)
+    7. cvd_flow            — approximates CVD from kline takerBuyBase
+                              (col 9) over a 4h window; no aggTrade replay
+                              needed. Falls open on stale caches lacking
+                              the taker-buy column.
 
 Skipped filters (DECLARED, no historical analogue available offline):
-    * cvd_flow_filter      (needs full aggTrade tape replay — too expensive)
     * liquidation_cascade  (no public historical forceOrder dump)
 
 Each backtest run that calls `run_offline_filters` records the list of
@@ -51,8 +54,18 @@ _ATR_LOOKBACK_15M = 14
 _OI_FLAT_THRESHOLD = 0.03  # |Δ| < 3% over 1h is "flat"
 
 
-REPLAYABLE = ["time_of_day", "correlation", "volatility", "oi_delta", "basis", "top_crowding"]
-SKIPPED = ["cvd_flow", "liquidation_cascade"]
+REPLAYABLE = ["time_of_day", "correlation", "volatility", "oi_delta", "basis", "top_crowding", "cvd_flow"]
+SKIPPED = ["liquidation_cascade"]
+
+# CVD flow thresholds — kept in lock-step with src.engine.entry_filters.
+# Prod accumulates aggTrade-level signed USD flow over a 15min window and
+# blocks longs below -25k / shorts above +25k. Offline we approximate with
+# (taker_buy - taker_sell) base-volume summed across a 4-bar (4h) sliding
+# window of 1h klines, then convert to USD via the latest close. The 4h
+# window smooths the coarser bar resolution; thresholds are the same.
+_CVD_LONG_BLOCK_BELOW = -25_000.0
+_CVD_SHORT_BLOCK_ABOVE = 25_000.0
+_CVD_WINDOW_BARS = 4
 
 
 # Basis filter constants (parity with src.engine.entry_filters.basis_filter)
@@ -275,6 +288,52 @@ def top_ls_check(
                        f"{symbol} top L/S ratio {ratio:.2f} — {side} OK")
 
 
+def cvd_check(
+    symbol: str,
+    side: str,
+    ts_ms: int,
+    klines_1h: list[dict],
+) -> FilterCheck:
+    """Offline analogue of `entry_filters.cvd_flow_filter`.
+
+    Approximates cumulative volume delta from Binance kline column 9
+    (takerBuyBase): per bar, signed flow ≈ (taker_buy - taker_sell) * close.
+    Sum across the last 4 bars (4h window on 1h klines) ending at-or-before
+    ts_ms. Block longs when window CVD < -25k USD, shorts when > +25k USD.
+    Falls open when klines or taker-buy data are unavailable (stale cache,
+    short series), matching prod's fail-open posture.
+    """
+    if not klines_1h:
+        return FilterCheck(True, "cvd_flow", "klines unavailable — fail-open")
+    # Locate last bar at-or-before ts_ms
+    idx = None
+    for i in range(len(klines_1h) - 1, -1, -1):
+        if klines_1h[i]["open_time"] <= ts_ms:
+            idx = i
+            break
+    if idx is None or idx < _CVD_WINDOW_BARS - 1:
+        return FilterCheck(True, "cvd_flow", "window thin — fail-open")
+    window = klines_1h[idx - _CVD_WINDOW_BARS + 1: idx + 1]
+    cvd_usd = 0.0
+    saw_taker = False
+    for k in window:
+        tb = float(k.get("taker_buy_volume", 0.0) or 0.0)
+        ts = float(k.get("taker_sell_volume", 0.0) or 0.0)
+        if tb > 0 or ts > 0:
+            saw_taker = True
+        cvd_usd += (tb - ts) * float(k["close"])
+    if not saw_taker:
+        return FilterCheck(True, "cvd_flow", "stale cache lacks taker-buy — fail-open")
+    if side == "long" and cvd_usd < _CVD_LONG_BLOCK_BELOW:
+        return FilterCheck(False, "cvd_flow",
+                           f"{symbol} 4h CVD ${cvd_usd:,.0f} — sell tape, refuse long entry")
+    if side == "short" and cvd_usd > _CVD_SHORT_BLOCK_ABOVE:
+        return FilterCheck(False, "cvd_flow",
+                           f"{symbol} 4h CVD ${cvd_usd:,.0f} — buy tape, refuse short entry")
+    return FilterCheck(True, "cvd_flow",
+                       f"{symbol} 4h CVD ${cvd_usd:,.0f} — {side} OK")
+
+
 # ─── Chain runner ────────────────────────────────────────────────────────
 
 def run_offline_filters(
@@ -288,6 +347,7 @@ def run_offline_filters(
     spot_klines_1h: Optional[list[dict]] = None,
     futures_klines_1h: Optional[list[dict]] = None,
     ls_history: Optional[list[dict]] = None,
+    klines_1h: Optional[list[dict]] = None,
 ) -> FilterCheck:
     """Run the replayable subset of the prod filter chain. Returns the
     first BLOCK or a final allow if nothing blocks."""
@@ -298,9 +358,10 @@ def run_offline_filters(
         oi_delta_check(symbol, side, ts_ms, oi_history or []),
         basis_check(symbol, side, ts_ms, spot_klines_1h or [], futures_klines_1h or []),
         top_ls_check(symbol, side, ts_ms, ls_history or []),
+        cvd_check(symbol, side, ts_ms, klines_1h or spot_klines_1h or []),
     ]
     for c in checks:
         if not c.allowed:
             return c
     return FilterCheck(True, "all_replayable_passed",
-                       f"{symbol} {side} cleared time/corr/vol/oi/basis/top_ls (cvd/liq SKIPPED)")
+                       f"{symbol} {side} cleared time/corr/vol/oi/basis/top_ls/cvd (liq SKIPPED)")

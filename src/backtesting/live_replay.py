@@ -35,6 +35,10 @@ from typing import Optional
 
 from src.backtesting.data_loader import load_klines, load_futures_klines
 from src.backtesting.fgi_loader import load_fear_greed_index, get_fgi_at_timestamp
+from src.backtesting.stablecoin_loader import (
+    load_stablecoin_history,
+    get_stablecoin_flow_at_timestamp,
+)
 from src.backtesting.funding_loader import load_funding_rates
 from src.backtesting.listing_loader import load_exchange_listings
 from src.backtesting.oi_loader import load_open_interest
@@ -222,6 +226,7 @@ def replay(
     include_15m_accel: bool = False,
     include_fgi_contrarian: bool = True,
     include_listing_pump: bool = True,
+    include_stable_flow: bool = True,
     min_score_override: Optional[int] = None,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
@@ -253,6 +258,10 @@ def replay(
         notes.append("listing_pump events from Binance Futures/Spot + Coinbase listing dates")
     else:
         notes.append("listing_pump events DISABLED")
+    if include_stable_flow:
+        notes.append("stable_flow events from DefiLlama stablecoin daily totals (BTC/ETH only)")
+    else:
+        notes.append("stable_flow events DISABLED")
     notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
     if min_score_override is not None:
         # Monkeypatch the module attribute the brain reads so we can
@@ -409,6 +418,38 @@ def replay(
                 t += day_ms
         notes.append(f"fgi_contrarian events emitted: {fgi_event_count}")
 
+    stable_flow_event_count = 0
+    if include_stable_flow:
+        try:
+            stable_history = load_stablecoin_history()
+        except Exception as e:
+            notes.append(f"stablecoin history unavailable: {e}")
+            stable_history = []
+        if stable_history:
+            day_ms = 86_400_000
+            t = (start_ms // day_ms) * day_ms
+            while t <= end_ms:
+                row = get_stablecoin_flow_at_timestamp(stable_history, t)
+                if row is not None:
+                    net24 = row["net_24h_change_usd"]
+                    if net24 > 300_000_000 or net24 < -300_000_000:
+                        side_hint = "long" if net24 > 0 else "short"
+                        kind = "stable_flow_bull" if net24 > 0 else "stable_flow_bear"
+                        for sym in ("BTC", "ETH"):
+                            if sym not in symbols:
+                                continue
+                            events.append((t, "stable_flow", sym, {
+                                "stablecoin_net_24h_usd": float(net24),
+                                "stablecoin_net_7d_usd": float(row["net_7d_change_usd"]),
+                                "stablecoin_total_usd": float(row["total_circulating_usd"]),
+                                "side_hint": side_hint,
+                                "event_kind": kind,
+                            }))
+                            stable_flow_event_count += 1
+                t += day_ms
+        notes.append(f"stable_flow events emitted: {stable_flow_event_count}")
+
+    if include_fgi_contrarian:
         if include_15m_accel:
             # Sub-hour accel detection from 15m klines. EMPIRICALLY hurts
             # PnL at all thresholds 5/8/10% (commits 1fdfe6d + this) — kept
@@ -536,6 +577,29 @@ def replay(
                 suggested_target_pct=0.30,
                 data={"listing_age_hours": age_hours, "exchange": exchange},
             )
+        elif kind == "stable_flow":
+            net24 = float(payload.get("stablecoin_net_24h_usd", 0.0))
+            event_kind = payload.get("event_kind", "stable_flow_bull")
+            side_hint = payload.get("side_hint", "long")
+            close_price = float(klines[idx]["close"]) if klines else 0.0
+            packet = SignalPacket(
+                signal_id=f"bt-stbl-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type=event_kind,
+                priority=2,
+                timestamp=float(ts_ms),
+                price_usd=close_price,
+                source="defillama_stablecoins",
+                reasoning=f"stablecoin net 24h ${net24/1e6:+.0f}M ({event_kind}) — {side_hint}",
+                suggested_side=side_hint,
+                suggested_stop_pct=0.06 if side_hint == "long" else 0.05,
+                suggested_target_pct=0.12 if side_hint == "long" else 0.08,
+                data={
+                    "stablecoin_net_24h_usd": net24,
+                    "stablecoin_net_7d_usd": float(payload.get("stablecoin_net_7d_usd", 0.0)),
+                    "stablecoin_total_usd": float(payload.get("stablecoin_total_usd", 0.0)),
+                },
+            )
         else:  # fgi
             fgi_val = int(payload.get("fgi", 50))
             side_hint = payload.get("side_hint", "long")
@@ -594,6 +658,7 @@ def replay(
                     spot_klines_1h=klines_by_symbol.get(d.symbol, []),
                     futures_klines_1h=futures_klines_by_symbol.get(d.symbol, []),
                     ls_history=ls_by_symbol.get(d.symbol, []),
+                    klines_1h=klines_by_symbol.get(d.symbol, []),
                 )
                 if not check.allowed:
                     continue

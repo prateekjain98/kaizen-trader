@@ -33,15 +33,25 @@ def _cache_path(symbol: str, interval: str, start_ms: int, end_ms: int) -> Path:
 
 
 def _parse_kline(raw: list) -> dict:
-    """Parse a single Binance kline array into a dict."""
+    """Parse a single Binance kline array into a dict.
+
+    Binance kline columns: [openTime, open, high, low, close, volume,
+    closeTime, quoteVolume, numTrades, takerBuyBase, takerBuyQuote, ignore].
+    We capture takerBuyBase (col 9) so offline CVD replay (cvd_check) can
+    approximate buy/sell pressure without replaying full aggTrade tape.
+    """
+    volume = float(raw[5])
+    taker_buy = float(raw[9]) if len(raw) > 9 else 0.0
     return {
         "open_time": int(raw[0]),
         "open": float(raw[1]),
         "high": float(raw[2]),
         "low": float(raw[3]),
         "close": float(raw[4]),
-        "volume": float(raw[5]),
+        "volume": volume,
         "close_time": int(raw[6]),
+        "taker_buy_volume": taker_buy,
+        "taker_sell_volume": max(volume - taker_buy, 0.0),
     }
 
 
@@ -53,14 +63,25 @@ def _read_cache(path: Path) -> Optional[list[dict]]:
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            volume = float(row["volume"])
+            # Old caches predate taker-buy capture — fall back to a 50/50
+            # split with a flag so cvd_check can fail-open on stale cache.
+            if "taker_buy_volume" in row and row["taker_buy_volume"] != "":
+                taker_buy = float(row["taker_buy_volume"])
+                taker_sell = float(row.get("taker_sell_volume") or max(volume - taker_buy, 0.0))
+            else:
+                taker_buy = volume / 2.0
+                taker_sell = volume / 2.0
             rows.append({
                 "open_time": int(row["open_time"]),
                 "open": float(row["open"]),
                 "high": float(row["high"]),
                 "low": float(row["low"]),
                 "close": float(row["close"]),
-                "volume": float(row["volume"]),
+                "volume": volume,
                 "close_time": int(row["close_time"]),
+                "taker_buy_volume": taker_buy,
+                "taker_sell_volume": taker_sell,
             })
     return rows if rows else None
 
@@ -68,7 +89,10 @@ def _read_cache(path: Path) -> Optional[list[dict]]:
 def _write_cache(path: Path, klines: list[dict]) -> None:
     """Write kline data to CSV cache."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["open_time", "open", "high", "low", "close", "volume", "close_time"]
+    fieldnames = [
+        "open_time", "open", "high", "low", "close", "volume", "close_time",
+        "taker_buy_volume", "taker_sell_volume",
+    ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

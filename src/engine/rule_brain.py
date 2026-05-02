@@ -48,6 +48,8 @@ STRATEGY_RISK = {
     "listing_pump":        {"stop_pct": 0.10, "target_pct": 0.20},
     "fgi_contrarian":      {"stop_pct": 0.08, "target_pct": 0.15},
     "trending_breakout":   {"stop_pct": 0.10, "target_pct": 0.20},
+    "stable_flow_bull":    {"stop_pct": 0.06, "target_pct": 0.12},
+    "stable_flow_bear":    {"stop_pct": 0.05, "target_pct": 0.08},
 }
 DEFAULT_RISK = {"stop_pct": 0.10, "target_pct": 0.20}
 
@@ -173,6 +175,18 @@ def _score_signal(
         score += 30
         factors.append(f"FGI={fgi} extreme fear on {symbol} +30")
         strategy_type = "fgi_contrarian"
+
+    # Stablecoin net-flow — orthogonal risk-on / risk-off signal (BTC/ETH only)
+    if signal_type == "stable_flow_bull" and symbol in ("BTC", "ETH"):
+        net24 = float(data.get("stablecoin_net_24h_usd", 0.0))
+        score += 30
+        factors.append(f"stbl net24 ${net24/1e6:+.0f}M (bull issuance) +30")
+        strategy_type = "stable_flow_bull"
+    elif signal_type == "stable_flow_bear" and symbol in ("BTC", "ETH"):
+        net24 = float(data.get("stablecoin_net_24h_usd", 0.0))
+        score += 25
+        factors.append(f"stbl net24 ${net24/1e6:+.0f}M (bear redemption) +25")
+        strategy_type = "stable_flow_bear"
 
     # ------------------------------------------------------------------
     # Penalties

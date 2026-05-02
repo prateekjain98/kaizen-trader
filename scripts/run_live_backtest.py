@@ -43,6 +43,8 @@ def main() -> int:
                    help="Disable fgi_contrarian event replay (alternative.me)")
     p.add_argument("--no-listings", action="store_true",
                    help="Disable listing_pump event replay (Binance + Coinbase listing dates)")
+    p.add_argument("--no-stable-flow", action="store_true",
+                   help="Disable stable_flow event replay (DefiLlama stablecoin net-flow)")
     p.add_argument("--include-15m-accel", action="store_true",
                    help="Enable sub-hour accel detection from 15m klines "
                         "(opt-in; empirically hurts PnL — kept for tuning)")
@@ -92,6 +94,7 @@ def main() -> int:
                         include_15m_accel=args.include_15m_accel,
                         include_fgi_contrarian=not args.no_fgi,
                         include_listing_pump=not args.no_listings,
+                        include_stable_flow=not args.no_stable_flow,
                         min_score_override=args.min_score)
         elapsed = time.time() - t0
         all_results.append(result)
