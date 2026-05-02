@@ -76,16 +76,32 @@ _TREND_TYPES = frozenset({
     "large_move",
     "major_pump",
     "listing_pump",
+    # Chain-flow: TVL ripping ↑ + 7d↑ → ecosystem rotation. Trend, not reversion.
+    "chain_flow_bull",
+    "chain_flow_bear",
 })
 
-# CVD flow thresholds — kept in lock-step with src.engine.entry_filters.
-# Prod accumulates aggTrade-level signed USD flow over a 15min window and
-# blocks longs below -25k / shorts above +25k. Offline we approximate with
-# (taker_buy - taker_sell) base-volume summed across a 4-bar (4h) sliding
-# window of 1h klines, then convert to USD via the latest close. The 4h
-# window smooths the coarser bar resolution; thresholds are the same.
-_CVD_LONG_BLOCK_BELOW = -25_000.0
-_CVD_SHORT_BLOCK_ABOVE = 25_000.0
+# CVD flow thresholds — backtest analogue of src.engine.entry_filters.
+#
+# IMPORTANT: backtest CVD is NOT magnitude-comparable to prod CVD. Prod sums
+# aggTrade-level signed USD flow tick-by-tick over a 15min window. Backtest
+# approximates with (taker_buy - taker_sell)*close summed across 4 hourly
+# bars (a 4h window). Two distortions stack:
+#   1. Window length: 4h vs 15min → ~16x more flow passes through, BUT
+#   2. Bar bucketing: kline taker-buy vs taker-sell offsets nearly cancel at
+#      the bar level (intra-bar buy-sell churn collapses to a small net),
+#      so observed bar-CVD magnitudes are typically ~50x SMALLER than the
+#      tick-aggregate-equivalent for the same interval would be.
+# Net empirical: backtest cvd_usd lands roughly 1-2 orders of magnitude lower
+# than prod for the same symbol/regime. Audit found a $25k threshold
+# essentially never blocked in replay (tape "looked flat" everywhere).
+#
+# Correction: drop the threshold by ~50x to $500 to recover order-of-magnitude
+# parity with the bar-bucketed signal. A future follow-up should normalize
+# by per-bar averaged signed flow instead of raw sum (best fix), but the
+# cheaper threshold drop is the correctness-restoring change.
+_CVD_LONG_BLOCK_BELOW = -500.0
+_CVD_SHORT_BLOCK_ABOVE = 500.0
 _CVD_WINDOW_BARS = 4
 
 
@@ -435,6 +451,11 @@ def run_offline_filters(
         return FilterCheck(
             True, "stable_flow_bypass",
             "macro signal — derivatives filters do not apply",
+        )
+    if signal_type and signal_type.startswith("chain_flow"):
+        return FilterCheck(
+            True, "chain_flow_bypass",
+            "per-chain TVL macro signal — derivatives filters do not apply",
         )
     # Cross-sectional funding carry is ranked-relative — the alpha is in
     # the rank itself, not the absolute funding/OI/CVD posture the prod

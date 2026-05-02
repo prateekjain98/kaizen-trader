@@ -50,11 +50,19 @@ STRATEGY_RISK = {
     "trending_breakout":   {"stop_pct": 0.10, "target_pct": 0.20},
     "stable_flow_bull":    {"stop_pct": 0.06, "target_pct": 0.12},
     "stable_flow_bear":    {"stop_pct": 0.05, "target_pct": 0.08},
+    # Per-chain TVL flow — macro ecosystem bet (capital rotating into/out of
+    # an L1/L2). Asymmetric: bull bigger edge per the spec literature.
+    "chain_flow_bull":     {"stop_pct": 0.06, "target_pct": 0.12},
+    "chain_flow_bear":     {"stop_pct": 0.05, "target_pct": 0.08},
     # Cross-sectional funding carry — tighter than funding_squeeze because
     # the alpha bleeds out fast: the 8h funding window itself prices most
     # of the reversion, so we want quick targets and quick stops.
     "funding_carry_long":  {"stop_pct": 0.06, "target_pct": 0.10},
     "funding_carry_short": {"stop_pct": 0.06, "target_pct": 0.10},
+    # Liquidation cascade fade — reversion is fast (5-30min), so tight stops
+    # and modest targets. Empirical wick-revert magnitudes on Oct 10-11 2025
+    # cascade clustered in the 6-12% range.
+    "liquidation_cascade": {"stop_pct": 0.035, "target_pct": 0.09},
 }
 
 # Liquid universe for cross-sectional carry. The signal IS the rank — we
@@ -214,6 +222,23 @@ def _score_signal(
         factors.append(f"stbl net24 ${net24/1e6:+.0f}M (bear redemption) +25")
         strategy_type = "stable_flow_bear"
 
+    # Chain-level TVL flow (per-ecosystem capital rotation). Mapped at the
+    # event source (live_replay) — by the time we score, the symbol is
+    # guaranteed to be on the chain that fired. Asymmetric +25 / +20 per
+    # spec — bull regime has historically been the bigger edge per unit risk.
+    if signal_type == "chain_flow_bull":
+        chg24 = float(data.get("chain_tvl_net_24h_pct", 0.0))
+        chain = data.get("chain", "?")
+        score += 25
+        factors.append(f"{chain} TVL +{chg24:.1f}%/24h + 7d↑ (bull) +25")
+        strategy_type = "chain_flow_bull"
+    elif signal_type == "chain_flow_bear":
+        chg24 = float(data.get("chain_tvl_net_24h_pct", 0.0))
+        chain = data.get("chain", "?")
+        score += 20
+        factors.append(f"{chain} TVL {chg24:+.1f}%/24h + 7d↓ (bear) +20")
+        strategy_type = "chain_flow_bear"
+
     # Cross-sectional funding carry — the rank IS the signal. We don't
     # double-count the absolute-funding-level scoring above; carry events
     # are emitted separately by the dedicated loader. Asymmetric scoring:
@@ -243,6 +268,30 @@ def _score_signal(
             score += 10
             factors.append(f"x-sec carry tail (top 5%) +10")
         strategy_type = "funding_carry_short"
+
+    # Liquidation cascade fade — base +35, with tier-aware bonus when the
+    # cascade is unusually large for its tier (≥3x threshold). The
+    # opposite-side trade-direction is already encoded in suggested_side
+    # by signal_detector — we just score and trust the side_hint.
+    if signal_type == "liquidation_cascade":
+        liq_usd = float(data.get("liq_usd_5m", 0.0))
+        tier = data.get("tier", "small_alt")
+        ratio = float(data.get("imbalance_ratio", 1.0))
+        score += 35
+        factors.append(f"liq cascade {tier} ${liq_usd/1e3:.0f}k/5m ratio={ratio:.1f}x +35")
+        # Big-cascade bonus: ≥3x the tier floor (250k major / 50k large /
+        # 10k small) means a real capitulation, not just background noise.
+        tier_floors = {"major": 250_000, "large": 50_000, "small_alt": 10_000}
+        floor = tier_floors.get(tier, 10_000)
+        if liq_usd >= 3 * floor:
+            score += 10
+            factors.append(f"liq cascade ≥3x floor (${floor/1e3:.0f}k) +10")
+        # Strong dominance bonus: ratio ≥3 means one side is overwhelmingly
+        # dominant — the directional revert is cleaner.
+        if ratio >= 3.0:
+            score += 5
+            factors.append(f"liq cascade strong dominance ratio={ratio:.1f}x +5")
+        strategy_type = "liquidation_cascade"
 
     # ------------------------------------------------------------------
     # Penalties

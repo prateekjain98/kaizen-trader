@@ -87,8 +87,37 @@ class SignalDetector:
             return self._process_major_pump(sid, signal, snapshot)
         elif signal.event_type == "large_move":
             return self._process_large_move(sid, signal, snapshot)
+        elif signal.event_type == "liquidation_cascade":
+            return self._process_liquidation_cascade(sid, signal, snapshot)
 
         return None
+
+    def _process_liquidation_cascade(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
+        """Liquidation cascade — fade the wick.
+
+        side_hint is set by the emitter to the OPPOSITE of the cascade side:
+        forced_long_close (longs liquidated, price wicked down) → suggested_side='long'
+        forced_short_close (shorts liquidated, price wicked up)  → suggested_side='short'
+        Brain reads suggested_side directly; field-name discipline per audit.
+        """
+        d = signal.data or {}
+        side_hint = d.get("side_hint", "long")
+        liq_usd = float(d.get("liq_usd_5m", 0.0))
+        tier = d.get("tier", "small_alt")
+        cascade_event = d.get("cascade_event", "")
+        price = float(snapshot.prices.get(signal.symbol, 0))
+        return SignalPacket(
+            signal_id=sid, symbol=signal.symbol, signal_type="liquidation_cascade",
+            priority=signal.priority, timestamp=signal.timestamp,
+            source=signal.source or "binance_liq_ws",
+            price_usd=price,
+            volume_24h=snapshot.volumes_24h.get(signal.symbol, 0),
+            fear_greed_index=snapshot.fear_greed_index,
+            reasoning=f"Liq cascade {cascade_event} ${liq_usd:,.0f}/5m on {signal.symbol} ({tier}) — fade with {side_hint}",
+            suggested_side=side_hint,
+            suggested_stop_pct=0.04, suggested_target_pct=0.09,
+            data=d,
+        )
 
     def _process_listing(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
         """New exchange listing — highest priority signal."""

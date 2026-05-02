@@ -166,6 +166,15 @@ class TradingEngine:
         if packet:
             # Queue for next brain tick
             self.brain.add_signal(packet)
+            # Pre-subscribe CVD tracker on high-priority signals so by the time
+            # the brain decides to enter, we already have minutes of tape. No-op
+            # in paper mode (tracker not started). subscribe() is idempotent.
+            if not self.paper and getattr(packet, "priority", 0) >= 2:
+                try:
+                    from src.engine.cvd_tracker import get_tracker as _cvd
+                    _cvd().subscribe(packet.symbol)
+                except Exception:
+                    pass
 
     # ── OKX WS callbacks ───────────────────────────────────────────────
 

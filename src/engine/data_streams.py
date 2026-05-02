@@ -50,6 +50,39 @@ _CARRY_MIN_SYMBOLS = 8            # need a real distribution to rank
 
 
 # ---------------------------------------------------------------------------
+# Liquidation-cascade emitter constants
+# ---------------------------------------------------------------------------
+# Tier-aware thresholds mirror entry_filters._LIQ_THRESHOLDS so the entry
+# filter and the signal emitter agree on what counts as a "cascade". If the
+# entry filter would block sub-threshold cascades anyway, no point emitting
+# signals that always get filtered out.
+_LIQ_CASCADE_THRESHOLDS = {
+    "major": 250_000,
+    "large": 50_000,
+    "small_alt": 10_000,   # slightly above filter floor (5k) to avoid noise
+}
+# Same tiers as entry_filters._tier_of — duplicated to avoid a circular import
+# (entry_filters imports SignalPacket from signal_detector → data_streams).
+_LIQ_TIER_MAJORS = frozenset({"BTC", "ETH"})
+_LIQ_TIER_LARGE = frozenset({
+    "SOL", "BNB", "XRP", "AVAX", "MATIC", "LINK", "DOT", "UNI", "ATOM",
+})
+# Don't re-emit a cascade signal for the same symbol within this window —
+# the brain already dedups by hour bucket, but we don't want to spam the
+# pending_signals queue every 30s while a cascade is rolling.
+_LIQ_CASCADE_COOLDOWN_S = 300
+
+
+def _liq_tier_of(symbol: str) -> str:
+    s = (symbol or "").upper()
+    if s in _LIQ_TIER_MAJORS:
+        return "major"
+    if s in _LIQ_TIER_LARGE:
+        return "large"
+    return "small_alt"
+
+
+# ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
 
@@ -384,6 +417,8 @@ class DataStreams:
         # Last 8h funding boundary we've already emitted carry events for.
         # Avoids duplicate emission across the 60s tick / ±5min window.
         self._last_carry_boundary_ms: int = 0
+        # symbol → unix-seconds of last cascade signal emission (for cooldown)
+        self._last_liq_cascade_emit: dict[str, float] = {}
 
     def get_prices_snapshot(self) -> dict[str, float]:
         """Return a shallow copy of the current prices dict, taken under lock.
@@ -459,6 +494,7 @@ class DataStreams:
             ("top_movers", self._poll_top_movers, 60),              # 1 min — catches pumps fast
             ("crypto_news", self._poll_news, 300),                  # 5 min — CoinTelegraph RSS
             ("funding_carry", self._poll_funding_carry, 60),        # 1 min tick, fires only at 8h boundaries
+            ("liquidation_cascade", self._poll_liquidation_cascade, 30),  # 30s tick, env-gated
         ]
 
         for name, fn, interval_s in streams:
@@ -818,3 +854,83 @@ class DataStreams:
         self._last_carry_boundary_ms = bucket_ms
         if emitted:
             log("info", f"[funding_carry] emitted {emitted} carry events at boundary {bucket_ms}")
+
+    def _poll_liquidation_cascade(self):
+        """Emit liquidation_cascade TokenSignals from the live WS tracker.
+
+        Strategy thesis: when a tier-relevant USD volume of liquidations
+        cascades on a symbol within 5min and one side dominates, the wick
+        often reverts in minutes (academic evidence on Oct 10-11 2025
+        cascade). We emit OPPOSITE-side bias:
+          - long_liq dominant (price wicked DOWN on long stops) → side_hint=long (fade-up)
+          - short_liq dominant (price wicked UP on short stops) → side_hint=short (fade-down)
+
+        DEFAULT-OFF until OOS validation passes (LIQUIDATION_CASCADE_ENABLED='1').
+        Mirrors funding_carry's audit-discipline pattern — code is wired,
+        flip the env to roll it out once a clean backtest verdict reproduces.
+        """
+        if os.environ.get("LIQUIDATION_CASCADE_ENABLED", "0") != "1":
+            return
+        try:
+            from src.engine.liquidation_tracker import get_tracker
+            tracker = get_tracker()
+        except Exception:
+            return
+        if tracker.status != "connected":
+            return
+
+        now_s = time.time()
+        now_ms = now_s * 1000
+        emitted = 0
+        for sym in tracker.all_active_symbols():
+            # Cooldown: don't re-emit while a cascade is rolling.
+            last_emit = self._last_liq_cascade_emit.get(sym, 0.0)
+            if now_s - last_emit < _LIQ_CASCADE_COOLDOWN_S:
+                continue
+            summary = tracker.cascade_score(sym, window_seconds=300)
+            long_usd = summary["long_liq_usd_5m"]
+            short_usd = summary["short_liq_usd_5m"]
+            total = long_usd + short_usd
+            tier = _liq_tier_of(sym)
+            threshold = _LIQ_CASCADE_THRESHOLDS[tier]
+            if total < threshold:
+                continue
+            # Need a clear dominant side; otherwise it's two-sided liquidation
+            # (chop) and there's no clean revert direction to fade.
+            dominant = summary["dominant_side"]
+            if dominant is None or summary["imbalance_ratio"] < 1.5:
+                continue
+            # forced_long_close (longs liquidated, dominant=='long', price
+            # wicked down) → fade with LONG entry.
+            # forced_short_close (shorts liquidated, dominant=='short',
+            # price wicked up) → fade with SHORT entry.
+            side_hint = "long" if dominant == "long" else "short"
+            cascade_event = (
+                "forced_long_close" if dominant == "long" else "forced_short_close"
+            )
+            largest = tracker.largest_single_in_window(sym, 300)
+            count = tracker.liquidation_count(sym, 300)
+
+            self.on_signal(TokenSignal(
+                source="binance_liq_ws",
+                symbol=sym,
+                event_type="liquidation_cascade",
+                data={
+                    "side_hint": side_hint,
+                    "cascade_event": cascade_event,
+                    "liq_usd_5m": total,
+                    "long_liq_usd_5m": long_usd,
+                    "short_liq_usd_5m": short_usd,
+                    "imbalance_ratio": summary["imbalance_ratio"],
+                    "largest_single_usd": largest,
+                    "liq_count_5m": count,
+                    "tier": tier,
+                },
+                timestamp=now_ms,
+                priority=2,
+            ))
+            self._last_liq_cascade_emit[sym] = now_s
+            emitted += 1
+
+        if emitted:
+            log("info", f"[liq_cascade] emitted {emitted} cascade events")

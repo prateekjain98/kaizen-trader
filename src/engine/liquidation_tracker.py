@@ -92,6 +92,40 @@ class LiquidationTracker:
                 return 0.0
             return sum(usd for ts, usd in d if ts >= cutoff)
 
+    def all_active_symbols(self) -> list[str]:
+        """All symbols with any liquidation in our retained history.
+        Used by the cascade poller to know which symbols to scan without
+        re-walking every Binance perp every tick."""
+        with self._lock:
+            return list(set(self._long_liqs.keys()) | set(self._short_liqs.keys()))
+
+    def largest_single_in_window(self, symbol: str, window_seconds: int = 300) -> float:
+        """Largest single liquidation $-notional on `symbol` in the window
+        (across both sides). Useful for outlier detection."""
+        cutoff = time.time() - window_seconds
+        sym = (symbol or "").upper()
+        with self._lock:
+            longs = self._long_liqs.get(sym) or ()
+            shorts = self._short_liqs.get(sym) or ()
+            biggest = 0.0
+            for ts, usd in longs:
+                if ts >= cutoff and usd > biggest:
+                    biggest = usd
+            for ts, usd in shorts:
+                if ts >= cutoff and usd > biggest:
+                    biggest = usd
+            return biggest
+
+    def liquidation_count(self, symbol: str, window_seconds: int = 300) -> int:
+        """Count of liquidations on `symbol` (both sides) in the window."""
+        cutoff = time.time() - window_seconds
+        sym = (symbol or "").upper()
+        with self._lock:
+            longs = self._long_liqs.get(sym) or ()
+            shorts = self._short_liqs.get(sym) or ()
+            return sum(1 for ts, _ in longs if ts >= cutoff) + \
+                   sum(1 for ts, _ in shorts if ts >= cutoff)
+
     def cascade_score(self, symbol: str, window_seconds: int = 300) -> dict:
         """Return a per-direction summary suitable for entry filters.
         {

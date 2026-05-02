@@ -436,9 +436,20 @@ def cvd_flow_filter(decision, ctx: dict) -> FilterVerdict:
     if cvd is None:
         return FilterVerdict(allowed=True, rule="cvd_flow",
                              reason=f"{decision.symbol} cvd not subscribed — fail-open")
+    # Per-symbol freshness gate: if the tape went silent for this specific
+    # symbol (delisting, trading halt, regional partition) we have stale CVD
+    # and must fail-open rather than block on yesterday's flow.
+    age = tracker.last_trade_age_s(decision.symbol)
+    if age is not None and age > 60.0:
+        return FilterVerdict(allowed=True, rule="cvd_flow",
+                             reason=f"{decision.symbol} aggTrade silent {age:.0f}s — fail-open")
     # Stash unconditionally so any downstream consumer (logging, analytics,
     # sizing) can read it whether we pass or block.
     ctx["cvd_15m_usd"] = cvd
+    c5 = tracker.cvd_5m_usd(decision.symbol)
+    if c5 is not None:
+        ctx["cvd_5m_usd"] = c5
+        ctx["cvd_velocity_usd_per_min"] = c5 / 5.0
     if decision.side == "long" and cvd < _CVD_LONG_BLOCK_BELOW:
         return FilterVerdict(
             allowed=False, rule="cvd_flow",

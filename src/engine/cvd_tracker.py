@@ -51,6 +51,9 @@ class CVDTracker:
         # symbol → deque of (ts, signed_usd) — buyer-initiated positive,
         # seller-initiated negative.
         self._flows: dict[str, collections.deque] = {}
+        # Per-symbol last aggTrade arrival monotonic-ish wall-time. Lets entry
+        # filters fail-open if the tape went silent (delisted, halt, partition).
+        self._last_trade_ts: dict[str, float] = {}
         self._subbed: set[str] = set()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -101,6 +104,7 @@ class CVDTracker:
         # signal — review caught this as a P1 false-signal risk.
         with self._lock:
             self._flows.pop(sym, None)
+            self._last_trade_ts.pop(sym, None)
 
     def cvd(self, symbol: str, window_seconds: int = 900) -> Optional[float]:
         """Cumulative volume delta in USD over the last `window_seconds`.
@@ -112,6 +116,44 @@ class CVDTracker:
             if not d:
                 return None
             return sum(usd for ts, usd in d if ts >= cutoff)
+
+    def cvd_5m_usd(self, symbol: str) -> Optional[float]:
+        """Signed flow USD over last 5min. None if no data."""
+        return self.cvd(symbol, window_seconds=300)
+
+    def cvd_15m_usd(self, symbol: str) -> Optional[float]:
+        """Signed flow USD over last 15min. None if no data."""
+        return self.cvd(symbol, window_seconds=900)
+
+    def cvd_velocity_usd_per_min(self, symbol: str) -> Optional[float]:
+        """5min CVD averaged per minute — useful as a momentum proxy.
+        None if no data."""
+        c5 = self.cvd_5m_usd(symbol)
+        if c5 is None:
+            return None
+        return c5 / 5.0
+
+    def last_trade_age_s(self, symbol: str) -> Optional[float]:
+        """Seconds since the most recent aggTrade for `symbol`. None if we
+        never received one (subscription not yet active)."""
+        sym = (symbol or "").upper()
+        with self._lock:
+            ts = self._last_trade_ts.get(sym)
+        if ts is None:
+            return None
+        return max(0.0, time.time() - ts)
+
+    def subscribe_many(self, symbols) -> int:
+        """Batch-subscribe a list of symbols (e.g. trending top 20). Idempotent.
+        Returns the number of newly added subscriptions."""
+        added = 0
+        for s in symbols or []:
+            sym = (s or "").upper()
+            if not sym or sym in self._subbed:
+                continue
+            self.subscribe(sym)
+            added += 1
+        return added
 
     def divergence_signal(self, symbol: str, price_delta_pct: float,
                            window_seconds: int = 900) -> Optional[str]:
@@ -233,6 +275,7 @@ class CVDTracker:
                     # We may receive a few trades after unsubscribe; ignore.
                     return
                 d.append((ts, signed))
+                self._last_trade_ts[sym] = ts
                 cutoff = ts - self._RETAIN_SECONDS
                 while d and d[0][0] < cutoff:
                     d.popleft()
