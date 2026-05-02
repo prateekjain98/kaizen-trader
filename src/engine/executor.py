@@ -148,7 +148,7 @@ class Executor:
     MAX_POSITIONS = 10
     MAX_POSITION_SIZE = env.max_position_usd
     MAX_DAILY_LOSS = env.max_daily_loss_usd
-    COMMISSION_PCT = 0.00075    # Binance with BNB discount
+    COMMISSION_PCT = 0.00040    # Binance USDM Futures taker VIP-0 (0.04%; 0.036% with BNB)
 
     def __init__(self, paper: bool = True, initial_balance: float = 10_000,
                  trust_initial_balance: bool = False):
