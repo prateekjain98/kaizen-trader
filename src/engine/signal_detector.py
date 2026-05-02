@@ -132,9 +132,20 @@ class SignalDetector:
         return None
 
     def _process_funding(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
-        """Extreme funding rate — short squeeze or long squeeze."""
+        """Extreme funding rate — short squeeze or long squeeze.
+
+        Cross-sectional carry events (carry_event_type set by the funding_carry
+        poller) are routed to the dedicated funding_carry_long / funding_carry_short
+        signal types so the brain scores them via its rank-based path. They
+        bypass the absolute-level 0.1% gate because the rank IS the signal.
+        """
         rate = signal.data.get("funding_rate", 0)
         symbol = signal.symbol
+
+        # Cross-sectional carry route — distinct from absolute-level squeeze.
+        carry_event_type = signal.data.get("carry_event_type")
+        if carry_event_type in ("funding_carry_long", "funding_carry_short"):
+            return self._process_funding_carry(sid, signal, snapshot)
 
         # Only process very extreme rates
         if abs(rate) < 0.001:
@@ -151,6 +162,35 @@ class SignalDetector:
             reasoning=f"Extreme funding {rate*100:+.3f}% — {'shorts paying longs heavily' if rate < 0 else 'longs paying shorts heavily'}",
             suggested_side=side, suggested_stop_pct=0.06, suggested_target_pct=0.08,
             data=signal.data,
+        )
+
+    def _process_funding_carry(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
+        """Cross-sectional funding carry — load-bearing alpha (ROBUST OOS).
+
+        Mirrors live_replay.py's carry SignalPacket builder so live and
+        backtest produce identical packets, which is what lets the brain's
+        rank-based scoring fire on prod the same way it fires in backtest.
+        """
+        d = signal.data
+        carry_event_type = d.get("carry_event_type", "funding_carry_long")
+        rate = float(d.get("funding_rate", 0.0))
+        rank = float(d.get("funding_rank_pct", 1.0))
+        side_hint = d.get("side_hint", "long" if carry_event_type == "funding_carry_long" else "short")
+        price = float(d.get("mark_price", 0.0)) or float(snapshot.prices.get(signal.symbol, 0))
+
+        return SignalPacket(
+            signal_id=sid, symbol=signal.symbol, signal_type=carry_event_type,
+            priority=2, timestamp=signal.timestamp, source="binance_funding_xsec",
+            price_usd=price, funding_rate=rate,
+            fear_greed_index=snapshot.fear_greed_index,
+            reasoning=f"x-sec funding carry rank={rank*100:.0f}% rate={rate*100:+.3f}% — {side_hint}",
+            suggested_side=side_hint,
+            suggested_stop_pct=0.06, suggested_target_pct=0.10,
+            data={
+                "funding_rate": rate,
+                "funding_rank_pct": rank,
+                "mark_price": price,
+            },
         )
 
     def _process_fgi(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:

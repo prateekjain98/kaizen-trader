@@ -13,6 +13,7 @@ All free, no auth required (except Binance WS for authenticated channels).
 """
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,31 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 from src.engine.log import log
+
+
+# ---------------------------------------------------------------------------
+# Cross-sectional funding-carry constants (mirror funding_carry_loader.py)
+# ---------------------------------------------------------------------------
+
+# Liquid universe — must match rule_brain._CARRY_LIQUID_UNIVERSE so the
+# brain actually scores what we emit. Hard-coded rather than imported to
+# avoid a circular dep (rule_brain imports SignalPacket from signal_detector
+# which imports from data_streams).
+_CARRY_LIQUID_UNIVERSE = frozenset({
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "MATIC",
+    "DOT", "UNI", "ATOM", "NEAR", "AAVE", "COMP", "LTC", "ADA", "TRX",
+    "OP", "ARB", "INJ", "SUI", "APT", "FIL", "TIA", "SEI", "STX",
+})
+
+# 8h funding boundaries on Binance: 00:00, 08:00, 16:00 UTC. Fire within
+# ±5 min of a boundary so we settle on the freshly-stamped rate.
+_CARRY_BOUNDARY_HOURS = (0, 8, 16)
+_CARRY_BOUNDARY_WINDOW_S = 5 * 60
+
+# Mirror funding_carry_loader floors exactly so live and backtest agree.
+_CARRY_MIN_RATE = 0.0005          # |rate| ≥ 0.05%
+_CARRY_TOP_PCT = 0.10             # top/bottom decile
+_CARRY_MIN_SYMBOLS = 8            # need a real distribution to rank
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +381,9 @@ class DataStreams:
         self._lock = threading.Lock()
         self._binance_ws = None
         self._ws_tick_count = 0
+        # Last 8h funding boundary we've already emitted carry events for.
+        # Avoids duplicate emission across the 60s tick / ±5min window.
+        self._last_carry_boundary_ms: int = 0
 
     def get_prices_snapshot(self) -> dict[str, float]:
         """Return a shallow copy of the current prices dict, taken under lock.
@@ -429,6 +458,7 @@ class DataStreams:
             ("global_market", self._poll_global_market, 300),       # 5 min
             ("top_movers", self._poll_top_movers, 60),              # 1 min — catches pumps fast
             ("crypto_news", self._poll_news, 300),                  # 5 min — CoinTelegraph RSS
+            ("funding_carry", self._poll_funding_carry, 60),        # 1 min tick, fires only at 8h boundaries
         ]
 
         for name, fn, interval_s in streams:
@@ -660,3 +690,121 @@ class DataStreams:
                     timestamp=now,
                     priority=2,
                 ))
+
+    def _poll_funding_carry(self):
+        """Cross-sectional funding-carry — load-bearing alpha (ROBUST OOS).
+
+        Fires at 8h funding boundaries (00:00, 08:00, 16:00 UTC, ±5min). Pulls
+        every USDT-perp funding rate in one /fapi/v1/premiumIndex call, ranks
+        them, and emits funding_extreme TokenSignals for the top decile (with
+        side_hint='short') and bottom decile (side_hint='long') — but only for
+        symbols in the liquid universe. Mirrors funding_carry_loader.py
+        ranking exactly so live and backtest agree.
+
+        Disabled when env var FUNDING_CARRY_ENABLED='0'.
+        """
+        if os.environ.get("FUNDING_CARRY_ENABLED", "1") == "0":
+            return
+
+        # Are we within ±5min of an 8h boundary?
+        now_s = time.time()
+        gm = time.gmtime(now_s)
+        seconds_into_hour = gm.tm_min * 60 + gm.tm_sec
+        on_boundary_hour = gm.tm_hour in _CARRY_BOUNDARY_HOURS
+        in_post_window = on_boundary_hour and seconds_into_hour <= _CARRY_BOUNDARY_WINDOW_S
+        in_pre_window = (
+            (gm.tm_hour + 1) % 24 in _CARRY_BOUNDARY_HOURS
+            and seconds_into_hour >= 3600 - _CARRY_BOUNDARY_WINDOW_S
+        )
+        if not (in_post_window or in_pre_window):
+            return
+
+        # Bucket to canonical 8h slot for dedup (matches loader._bucket_ts).
+        now_ms = int(now_s * 1000)
+        bucket_ms = (now_ms // (8 * 3_600_000)) * (8 * 3_600_000)
+        if bucket_ms == self._last_carry_boundary_ms:
+            return  # already emitted for this funding window
+
+        # One call returns funding for ALL perps. Use raw fetch (not
+        # fetch_binance_funding_rates — that drops names below 0.03%, which
+        # is fine for funding_squeeze but we need the FULL distribution to
+        # rank cross-sectionally).
+        data = _fetch_json("https://fapi.binance.com/fapi/v1/premiumIndex")
+        if not data or not isinstance(data, list):
+            return
+
+        # Build universe: USDT-quoted perps only, normalize 1000-prefixed
+        # symbols (e.g. 1000PEPEUSDT → PEPE) to match brain's expected names.
+        snapshot: list[tuple[str, float, float]] = []  # (symbol, rate, mark)
+        for item in data:
+            raw_sym = item.get("symbol", "")
+            if not raw_sym.endswith("USDT"):
+                continue
+            base = raw_sym[:-4]
+            if base.startswith("1000"):
+                base = base[4:]
+            try:
+                rate = float(item.get("lastFundingRate", 0))
+                mark = float(item.get("markPrice", 0))
+            except (TypeError, ValueError):
+                continue
+            if abs(rate) < _CARRY_MIN_RATE:
+                continue
+            snapshot.append((base, rate, mark))
+
+        if len(snapshot) < _CARRY_MIN_SYMBOLS:
+            return
+
+        snapshot.sort(key=lambda x: x[1])
+        n = len(snapshot)
+        k = max(1, int(round(n * _CARRY_TOP_PCT)))
+        bottom = snapshot[:k]   # most-negative rates → LONG
+        top = snapshot[-k:]     # most-positive rates → SHORT
+
+        ts_ms = float(now_ms)
+        emitted = 0
+
+        for i, (sym, rate, mark) in enumerate(bottom):
+            if sym not in _CARRY_LIQUID_UNIVERSE:
+                continue
+            self.on_signal(TokenSignal(
+                source="binance_funding_xsec",
+                symbol=sym,
+                event_type="funding_extreme",
+                data={
+                    "symbol": sym,
+                    "funding_rate": rate,
+                    "mark_price": mark,
+                    "side_hint": "long",
+                    "funding_rank_pct": (i + 1) / n,
+                    "carry_event_type": "funding_carry_long",
+                },
+                timestamp=ts_ms,
+                priority=2,
+            ))
+            emitted += 1
+
+        for j, (sym, rate, mark) in enumerate(top):
+            if sym not in _CARRY_LIQUID_UNIVERSE:
+                continue
+            rank_from_top = (k - j) / n
+            self.on_signal(TokenSignal(
+                source="binance_funding_xsec",
+                symbol=sym,
+                event_type="funding_extreme",
+                data={
+                    "symbol": sym,
+                    "funding_rate": rate,
+                    "mark_price": mark,
+                    "side_hint": "short",
+                    "funding_rank_pct": rank_from_top,
+                    "carry_event_type": "funding_carry_short",
+                },
+                timestamp=ts_ms,
+                priority=2,
+            ))
+            emitted += 1
+
+        self._last_carry_boundary_ms = bucket_ms
+        if emitted:
+            log("info", f"[funding_carry] emitted {emitted} carry events at boundary {bucket_ms}")
