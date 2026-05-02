@@ -50,7 +50,21 @@ STRATEGY_RISK = {
     "trending_breakout":   {"stop_pct": 0.10, "target_pct": 0.20},
     "stable_flow_bull":    {"stop_pct": 0.06, "target_pct": 0.12},
     "stable_flow_bear":    {"stop_pct": 0.05, "target_pct": 0.08},
+    # Cross-sectional funding carry — tighter than funding_squeeze because
+    # the alpha bleeds out fast: the 8h funding window itself prices most
+    # of the reversion, so we want quick targets and quick stops.
+    "funding_carry_long":  {"stop_pct": 0.06, "target_pct": 0.10},
+    "funding_carry_short": {"stop_pct": 0.06, "target_pct": 0.10},
 }
+
+# Liquid universe for cross-sectional carry. The signal IS the rank — we
+# don't want it firing on micro-caps where one whale's funding spike is
+# the whole signal. Names below cover ~80% of perp open interest.
+_CARRY_LIQUID_UNIVERSE = frozenset({
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "MATIC",
+    "DOT", "UNI", "ATOM", "NEAR", "AAVE", "COMP", "LTC", "ADA", "TRX",
+    "OP", "ARB", "INJ", "SUI", "APT", "FIL", "TIA", "SEI", "STX",
+})
 DEFAULT_RISK = {"stop_pct": 0.10, "target_pct": 0.20}
 
 
@@ -187,6 +201,36 @@ def _score_signal(
         score += 25
         factors.append(f"stbl net24 ${net24/1e6:+.0f}M (bear redemption) +25")
         strategy_type = "stable_flow_bear"
+
+    # Cross-sectional funding carry — the rank IS the signal. We don't
+    # double-count the absolute-funding-level scoring above; carry events
+    # are emitted separately by the dedicated loader. Asymmetric scoring:
+    # longs (bot decile) get +35 because crypto's mean-reversion edge is
+    # historically stronger from the short-pain side; shorts +30 because
+    # extreme positive funding can sustain in a strong uptrend.
+    if signal_type == "funding_carry_long" and symbol in _CARRY_LIQUID_UNIVERSE:
+        rank = float(data.get("funding_rank_pct", 1.0))
+        carry_rate = float(data.get("funding_rate", 0.0))
+        score += 35
+        factors.append(f"x-sec funding carry LONG rank={rank*100:.0f}% rate={carry_rate*100:+.3f}% +35")
+        # Extreme-tail bonus: deepest 5% (rank ≤ 0.05) gets an extra +10
+        # so the strongest cross-sectional outliers clear MIN_SCORE_TO_TRADE
+        # even when the absolute funding level is too small to trip the
+        # legacy funding_squeeze bonus (-0.1% threshold). The whole point
+        # of the carry strategy is that the RANK is the signal.
+        if rank <= 0.05:
+            score += 10
+            factors.append(f"x-sec carry tail (top 5%) +10")
+        strategy_type = "funding_carry_long"
+    elif signal_type == "funding_carry_short" and symbol in _CARRY_LIQUID_UNIVERSE:
+        rank = float(data.get("funding_rank_pct", 1.0))
+        carry_rate = float(data.get("funding_rate", 0.0))
+        score += 30
+        factors.append(f"x-sec funding carry SHORT rank={rank*100:.0f}% rate={carry_rate*100:+.3f}% +30")
+        if rank <= 0.05:
+            score += 10
+            factors.append(f"x-sec carry tail (top 5%) +10")
+        strategy_type = "funding_carry_short"
 
     # ------------------------------------------------------------------
     # Penalties

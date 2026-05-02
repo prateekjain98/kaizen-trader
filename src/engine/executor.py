@@ -443,12 +443,32 @@ class Executor:
                 "total_commissions": self.total_commissions,
                 "started_at": self._started_at,
             }
-        with open(_PORTFOLIO_FILE, "w") as f:
-            json.dump(state, f, indent=2)
+        # Bug class: prior code wrote in place — a crash or kill mid-write
+        # left a half-written portfolio.json, and on restart the recovery
+        # path would either fail to parse or load partial state. Mirror the
+        # atomic pattern used for watchdog stops: write tmp + os.replace.
+        tmp = f"{_PORTFOLIO_FILE}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, _PORTFOLIO_FILE)
+        except Exception as e:
+            log("warn", f"Failed to write portfolio file: {e}")
 
     def _reset_daily(self):
         now = time.time()
         if now - self._daily_reset_ts > 86400:
+            # Bug class: funding_paid_24h was tracked but never settled into
+            # daily_pnl/balance — the bot's "daily P&L" silently diverged from
+            # the exchange's reality whenever funding was paid/received.
+            # Credit (or debit) the rolled funding into the closing day's
+            # P&L AND balance so the next 24h window starts clean.
+            funding = self.funding_paid_24h or 0.0
+            if funding:
+                with self._lock:
+                    # Settle funding into balance — this is real cash that
+                    # flowed in/out of the futures wallet over the past 24h.
+                    self.balance += funding
             self.daily_pnl = 0
             self._daily_reset_ts = now
 
@@ -875,7 +895,14 @@ class Executor:
                 trail_factor = self._trail_factor(profit_pct, pos.stop_pct)
                 if trail_factor is not None:
                     new_trail = price * (1 + pos.stop_pct * trail_factor)
-                    if pos.trailing_stop_price == 0 or new_trail < pos.trailing_stop_price:
+                    # Bug class: prior code treated trailing_stop_price==0 as
+                    # "accept any new_trail", which let the short trail INIT
+                    # to a value WORSE than the original stop. The trail must
+                    # only ever IMPROVE (move lower) from the initial stop at
+                    # entry_price * (1 + stop_pct).
+                    initial_short_stop = pos.entry_price * (1 + pos.stop_pct)
+                    current = pos.trailing_stop_price if pos.trailing_stop_price > 0 else initial_short_stop
+                    if new_trail < current:
                         pos.trailing_stop_price = new_trail
 
             # Check stop loss (uses trailing if active)
@@ -927,7 +954,10 @@ class Executor:
             self._closing.add(pos.id)
 
         try:
-            exit_commission = pos.size_usd * self.COMMISSION_PCT
+            # Bug class: commission was applied to entry notional (size_usd)
+            # instead of exit notional. Fees are charged on the value of THIS
+            # fill — which scales with exit_price, not the entry size.
+            exit_commission = exit_price * pos.quantity * self.COMMISSION_PCT
 
             if pos.side == "long":
                 pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
@@ -951,6 +981,21 @@ class Executor:
                         log("error", f"Close FAILED for {pos.symbol}: {trade.error or 'unknown'} "
                             f"— position remains open, watchdog will retry")
                         return  # Do NOT update local state
+                    # Bug class: previously we credited pnl from the REQUESTED
+                    # exit_price (mark we saw at decision time) rather than the
+                    # ACTUAL fill from the exchange. On fast moves slippage can
+                    # be material — recompute pnl + exit_commission off the
+                    # real fill so balance, closed_trade, and memory all agree
+                    # with the exchange's reality.
+                    if getattr(trade, "price", 0) and trade.price > 0:
+                        exit_price = trade.price
+                        exit_commission = exit_price * pos.quantity * self.COMMISSION_PCT
+                        if pos.side == "long":
+                            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
+                        else:
+                            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price
+                        gross_pnl = pos.size_usd * pnl_pct
+                        pnl_usd = gross_pnl - pos.entry_commission - exit_commission
                 except Exception as e:
                     log("error", f"Close execution error: {pos.symbol}: {e} — position remains open")
                     return

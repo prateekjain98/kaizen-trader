@@ -99,7 +99,15 @@ def reconstruct(
             change = _change_pct_24h(klines, idx)
             vol = _volume_24h_usd(klines, idx)
             accel = _accel_1h_pct(klines, idx)
-            ts_ms = int(klines[idx]["open_time"])
+            # CORRECTNESS-CRITICAL (audit lookahead #2): the change and accel
+            # use klines[idx]["close"], which is only KNOWN at close_time.
+            # Previously stamped at open_time → events fired ~1h before the
+            # data was actually knowable. This caused systematic phantom edge
+            # because the next bar's open became the entry, but live prod's
+            # equivalent /ticker/24hr endpoint can only know the move at
+            # close_time. Stamp at close_time + 1ms so consumers see the
+            # event the moment the bar closes.
+            ts_ms = int(klines[idx]["close_time"]) + 1
             price = float(klines[idx]["close"])
 
             qualifies_24h = (
@@ -169,7 +177,10 @@ def accel_events_from_15m(
         )
         if vol_24h < min_volume_usd:
             continue
-        ts_ms = int(klines_15m[i]["open_time"])
+        # CORRECTNESS (audit lookahead #3): same fix as the 1h path —
+        # cur_close above only known at close_time, so stamp at close_time+1
+        # to avoid pre-publication lookahead.
+        ts_ms = int(klines_15m[i]["close_time"]) + 1
         if ts_ms - last_emit_ms < cooldown_ms:
             continue
         last_emit_ms = ts_ms

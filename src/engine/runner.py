@@ -73,7 +73,10 @@ def _fetch_binance_account_balance() -> float | None:
             data = _json.loads(resp.read().decode())
         for asset in data:
             if asset.get("asset") == "USDT":
-                return float(asset.get("balance", 0))
+                # Bug class: `balance` is wallet balance (includes margin
+                # locked in open positions). Sizing must use availableBalance,
+                # the actual free USDT we can deploy on a new entry.
+                return float(asset.get("availableBalance", 0))
         return None
     except Exception as e:
         log("error", f"Failed to fetch Binance balance: {e}")
@@ -329,9 +332,21 @@ class TradingEngine:
                         # Find and close the position
                         for pos in self.executor.positions:
                             if pos.symbol == decision.symbol:
-                                pnl_pct = pos.unrealized_pnl_pct * 100
-                                pnl_usd = pos.unrealized_pnl_usd if hasattr(pos, 'unrealized_pnl_usd') else 0
                                 self.executor._close_position(pos, pos.current_price, "claude_decision")
+                                # Bug class: prior code recorded pnl from
+                                # pos.current_price (last observed mark) rather
+                                # than the actual fill price. After the close
+                                # lands, the ClosedTrade carries the real
+                                # exit_price + post-fee pnl_usd — use those
+                                # for memory so the brain learns from truth,
+                                # not from the mark it saw a tick ago.
+                                last_closed = self.executor.closed_trades[-1] if self.executor.closed_trades else None
+                                if last_closed is None or last_closed.position.id != pos.id:
+                                    # Close failed (live exchange rejected) —
+                                    # position remains open; skip recording.
+                                    break
+                                pnl_pct = last_closed.pnl_pct * 100
+                                pnl_usd = last_closed.pnl_usd
                                 self.trades_closed += 1
                                 self.memory.record_trade(
                                     symbol=pos.symbol,

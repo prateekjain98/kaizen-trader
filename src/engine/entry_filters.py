@@ -575,9 +575,38 @@ DEFAULT_FILTERS: list[Callable] = [
 ]
 
 
+def _strategy_of(decision) -> str:
+    """Pull the strategy label off a decision. RuleBrain stamps it on
+    thesis_conditions["strategy"]; ClaudeBrain may set it from JSON. Fall
+    back to a strategy_type attribute if present."""
+    tc = getattr(decision, "thesis_conditions", None) or {}
+    if isinstance(tc, dict):
+        s = tc.get("strategy", "")
+        if s:
+            return str(s)
+    return str(getattr(decision, "strategy_type", "") or "")
+
+
 def run_filters(decision, ctx: dict, filters: Optional[list] = None) -> FilterVerdict:
     """Run filter chain, short-circuit on first block. Returns the blocking
-    verdict, or an allow if all pass."""
+    verdict, or an allow if all pass.
+
+    Stable_flow signals are MACRO bets on BTC/ETH driven by stablecoin
+    mint/burn flows — the derivatives-microstructure filters
+    (oi_delta, cvd_flow, top_crowding, basis, volatility) were calibrated
+    for small-alt squeeze setups and shouldn't gate a macro thesis. Mirrors
+    the extreme-funding bypass already used in time_of_day / oi_delta /
+    liquidation_cascade: when the upstream signal is strong and the chain's
+    heuristics are out-of-domain, let the trade through.
+    """
+    strategy = _strategy_of(decision)
+    if strategy.startswith("stable_flow"):
+        v = FilterVerdict(
+            allowed=True, rule="stable_flow_bypass",
+            reason=f"{decision.symbol} macro signal ({strategy}) — derivatives filters do not apply",
+        )
+        log("info", f"Entry filter BYPASS [{v.rule}]: {v.reason}")
+        return v
     chain = filters if filters is not None else DEFAULT_FILTERS
     for f in chain:
         v = f(decision, ctx)

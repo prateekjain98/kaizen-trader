@@ -77,19 +77,26 @@ def load_fear_greed_index(force_refresh: bool = False) -> list[dict]:
     return records
 
 
-def get_fgi_at_timestamp(fgi_data: list[dict], ts_ms: float) -> int:
+def get_fgi_at_timestamp(fgi_data: list[dict], ts_ms: float) -> Optional[int]:
     """Get the FGI value at or before the given timestamp.
 
     Uses binary search for efficiency since fgi_data is sorted.
-    Returns the FGI value (0-100), or 50 (neutral) if no data available.
+    Returns the FGI value (0-100), or **None** when no real data is available
+    (empty dataset OR timestamp predates the FGI dataset start in Feb 2018).
+
+    Previously returned 50 (neutral) on missing data — that silently fabricated
+    a "Neutral" reading for any caller that gated on `fgi <= 20` or `fgi >= 80`,
+    causing the rule to never fire in pre-2018 windows when the answer should
+    be "we don't know." Per the no-fabricated-data discipline, callers must now
+    handle None explicitly.
     """
     if not fgi_data:
-        return 50
+        return None
 
     # Binary search for nearest timestamp <= ts_ms
     lo, hi = 0, len(fgi_data) - 1
     if ts_ms < fgi_data[0]["timestamp_ms"]:
-        return 50  # before data starts
+        return None  # before data starts — we genuinely don't know
     if ts_ms >= fgi_data[-1]["timestamp_ms"]:
         return fgi_data[-1]["value"]
 

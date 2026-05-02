@@ -54,8 +54,29 @@ _ATR_LOOKBACK_15M = 14
 _OI_FLAT_THRESHOLD = 0.03  # |Δ| < 3% over 1h is "flat"
 
 
-REPLAYABLE = ["time_of_day", "correlation", "volatility", "oi_delta", "basis", "top_crowding", "cvd_flow"]
+REPLAYABLE = ["regime", "time_of_day", "correlation", "volatility", "oi_delta", "basis", "top_crowding", "cvd_flow"]
 SKIPPED = ["liquidation_cascade"]
+
+# Regime-switch meta-gate. In CALM regimes (low realised vol) only
+# mean-reversion plays survive; in HOT regimes only trend/momentum.
+# NEUTRAL allows everything (default posture). See regime_detector.py.
+_MEAN_REVERT_TYPES = frozenset({
+    "funding_squeeze",
+    "fgi_contrarian",
+    "stable_flow_bull",
+    "stable_flow_bear",
+    # Cross-sectional funding carry is a REVERSION trade — extreme funding
+    # rates revert toward the median over the next funding window. Belongs
+    # with funding_squeeze / fgi_contrarian in the mean-revert bucket.
+    "funding_carry",
+    "funding_carry_long",
+    "funding_carry_short",
+})
+_TREND_TYPES = frozenset({
+    "large_move",
+    "major_pump",
+    "listing_pump",
+})
 
 # CVD flow thresholds — kept in lock-step with src.engine.entry_filters.
 # Prod accumulates aggTrade-level signed USD flow over a 15min window and
@@ -334,6 +355,38 @@ def cvd_check(
                        f"{symbol} 4h CVD ${cvd_usd:,.0f} — {side} OK")
 
 
+# ─── Regime meta-gate ────────────────────────────────────────────────────
+
+def regime_check(strategy_type: str, regime: Optional[str]) -> FilterCheck:
+    """Meta-gate that switches strategy families on/off by RV regime.
+
+    CALM:    block trend/momentum (large_move, major_pump, listing_pump,
+             funding_carry*) — mean-revert dominates in low-vol.
+    HOT:     block mean-revert (funding_squeeze, fgi_contrarian,
+             stable_flow_*) — trend dominates in high-vol.
+    NEUTRAL: pass everything.
+
+    Falls open when regime is None / unknown (e.g. the BTC baseline window
+    isn't ready yet) so the gate degrades to today's behaviour.
+    """
+    if not regime or regime == "neutral":
+        return FilterCheck(True, "regime")
+    st = (strategy_type or "").lower()
+    if regime == "calm":
+        # Block trend types; allow mean-revert (incl. funding_carry).
+        if st in _TREND_TYPES:
+            return FilterCheck(False, "regime",
+                               f"calm regime — {st} is trend/momentum, blocked")
+        return FilterCheck(True, "regime", f"calm regime — {st} ok")
+    if regime == "hot":
+        if (st in _MEAN_REVERT_TYPES or st.startswith("stable_flow")
+                or st.startswith("funding_carry")):
+            return FilterCheck(False, "regime",
+                               f"hot regime — {st} is mean-revert, blocked")
+        return FilterCheck(True, "regime", f"hot regime — {st} ok")
+    return FilterCheck(True, "regime")
+
+
 # ─── Chain runner ────────────────────────────────────────────────────────
 
 def run_offline_filters(
@@ -348,9 +401,45 @@ def run_offline_filters(
     futures_klines_1h: Optional[list[dict]] = None,
     ls_history: Optional[list[dict]] = None,
     klines_1h: Optional[list[dict]] = None,
+    signal_type: str = "",
+    regime_strategy: Optional[str] = None,
+    current_regime: Optional[str] = None,
 ) -> FilterCheck:
     """Run the replayable subset of the prod filter chain. Returns the
-    first BLOCK or a final allow if nothing blocks."""
+    first BLOCK or a final allow if nothing blocks.
+
+    Stable_flow signals are MACRO bets on BTC/ETH driven by stablecoin
+    mint/burn flows — the derivatives-microstructure filters
+    (oi_delta, cvd_flow, top_crowding, basis, volatility) were calibrated
+    for small-alt squeeze setups and shouldn't gate a macro thesis. Mirrors
+    the extreme-funding bypass already used in time_of_day / oi_delta:
+    when the upstream signal is strong and the chain's heuristics are
+    out-of-domain, let the trade through rather than silently swallowing it.
+    """
+    # Regime meta-gate runs FIRST so trend/mean-revert mismatches get
+    # rejected before we burn cycles on the per-symbol microstructure
+    # checks. regime_strategy falls back to signal_type when not given.
+    rg = regime_check(regime_strategy or signal_type, current_regime)
+    if not rg.allowed:
+        return rg
+    if signal_type and signal_type.startswith("stable_flow"):
+        return FilterCheck(
+            True, "stable_flow_bypass",
+            "macro signal — derivatives filters do not apply",
+        )
+    # Cross-sectional funding carry is ranked-relative — the alpha is in
+    # the rank itself, not the absolute funding/OI/CVD posture the prod
+    # filters were calibrated for. Without this bypass, the LONG side
+    # (most-negative funding) would systematically fail oi_delta (books
+    # falling, no fresh longs) and basis (perp under spot), and SHORTs
+    # would fail basis (perp over spot, "extended"). Those are exactly
+    # the trades carry WANTS. Same posture as the stable_flow_bypass and
+    # the extreme-funding bypass in time_of_day_filter.
+    if signal_type and signal_type.startswith("funding_carry"):
+        return FilterCheck(
+            True, "funding_carry_bypass",
+            "cross-sectional carry — ranking is the signal, derivatives filters do not apply",
+        )
     checks = [
         time_of_day_check(symbol, ts_ms, funding_rate),
         correlation_check(symbol, open_position_symbols),

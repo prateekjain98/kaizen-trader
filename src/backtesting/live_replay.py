@@ -40,6 +40,7 @@ from src.backtesting.stablecoin_loader import (
     get_stablecoin_flow_at_timestamp,
 )
 from src.backtesting.funding_loader import load_funding_rates
+from src.backtesting.funding_carry_loader import reconstruct_funding_carry
 from src.backtesting.listing_loader import load_exchange_listings
 from src.backtesting.oi_loader import load_open_interest
 from src.backtesting.top_ls_loader import load_top_ls_ratio
@@ -48,16 +49,27 @@ from src.backtesting.replay_filters import (
     SKIPPED as SKIPPED_FILTERS,
     run_offline_filters,
 )
+from src.backtesting.regime_detector import regime_at_timestamp
+from src.backtesting.slippage_model import slippage_bps as _slippage_bps
 from src.backtesting.top_movers_loader import (
     reconstruct as reconstruct_top_movers,
     accel_events_from_15m,
 )
 from src.engine.rule_brain import RuleBrain
 from src.engine.signal_detector import SignalPacket
+from src.engine.executor import Executor as _ProdExecutor
 
 
 TAKER_FEE_PER_SIDE = 0.0004  # Binance Futures taker fee (0.04%)
-MAX_HOLD_HOURS = 24
+# Mirror prod exit logic. Read constants directly off the prod Executor so any
+# tuning over there propagates into the backtest without drift.
+MAX_HOLD_HOURS = 48  # prod update_price uses pos.hold_hours > 48
+TRAIL_TIERS = _ProdExecutor.TRAIL_TIERS  # ((5.0, 0.25), (3.0, 0.5), (1.5, 1.0))
+FAST_CUT_PNL_THRESHOLD = -0.02  # mirrors _fast_cut_allowed: pnl_pct <= -2%
+# Prod uses 30min hold + velocity_5min<=0. 1h bar granularity here, so we
+# require >=2 bars (~2h hold) AND two consecutive closes <= -2% before firing.
+# Single-bar fires whipsaw-cut every recovery (0% WR seen in prior attempt).
+FAST_CUT_MIN_BARS = 2
 KLINE_INTERVAL = "1h"
 
 
@@ -77,6 +89,7 @@ class SimTrade:
     fees_usd: float
     score: int
     funding_rate: float
+    slippage_usd: float = 0.0
 
 
 @dataclass
@@ -94,8 +107,17 @@ class BacktestResult:
     avg_trade_pnl_pct: float
     sharpe_proxy: float
     fees_paid_usd: float
+    total_slippage_usd: float = 0.0
     trades: list[SimTrade] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+    def exit_reason_histogram(self) -> dict[str, int]:
+        """Count trades by exit_reason. Mirrors prod executor exit reasons:
+        stop / trail / target / fast_cut / max_hold."""
+        h: dict[str, int] = {}
+        for t in self.trades:
+            h[t.exit_reason] = h.get(t.exit_reason, 0) + 1
+        return h
 
     def by_strategy(self) -> dict[str, dict]:
         """Aggregate PnL stats by strategy type for visibility into which
@@ -122,6 +144,7 @@ class BacktestResult:
         d = asdict(self)
         d["trades"] = [asdict(t) for t in self.trades]
         d["by_strategy"] = self.by_strategy()
+        d["exit_reasons"] = self.exit_reason_histogram()
         return d
 
 
@@ -181,12 +204,34 @@ def _accel_1h_pct(klines: list[dict], idx: int) -> float:
     return (cur["close"] - prev["close"]) / prev["close"] * 100.0
 
 
-def _funding_size_multiplier(rate: float) -> float:
-    if abs(rate) > 0.001:  # 0.1%
-        return 1.25
-    if abs(rate) < 0.0002:  # 0.02%
-        return 0.5
-    return 1.0
+def _funding_size_multiplier(rate: float, side: str = "long") -> float:
+    """Direction-aware funding sizing — mirrors prod
+    `Executor._funding_size_multiplier` exactly (audit fix C1).
+
+      long  + neg funding → receive → BOOST 1.25×
+      long  + pos funding → pay → PENALTY 0.5×
+      short + pos funding → receive → BOOST
+      short + neg funding → pay → PENALTY
+      |rate| < 0.1% → 1.0× (noise band)
+
+    Previous direction-blind version (1.25 on |rate|>0.1% regardless of side)
+    systematically OVER-sized every extreme-funding trade — backtest PnL on
+    the entire funding_squeeze family was inflated whenever rate sign was
+    against the trade.
+    """
+    if abs(rate) < _ProdExecutor._FUNDING_FAVORABLE_THRESHOLD:
+        return 1.0
+    if side == "long":
+        return _ProdExecutor._FUNDING_BOOST_MULT if rate < 0 else _ProdExecutor._FUNDING_PENALTY_MULT
+    return _ProdExecutor._FUNDING_BOOST_MULT if rate > 0 else _ProdExecutor._FUNDING_PENALTY_MULT
+
+
+def _trail_factor(profit_pct: float, stop_pct: float):
+    """Mirror Executor._trail_factor: tightest matching tier wins."""
+    for activation_mult, factor in TRAIL_TIERS:
+        if profit_pct >= activation_mult * stop_pct:
+            return factor
+    return None
 
 
 def _simulate_exit(
@@ -196,22 +241,91 @@ def _simulate_exit(
     side: str,
     stop_pct: float,
     target_pct: float,
+    symbol: str = "",
 ) -> tuple[int, float, str]:
-    """Walk forward from entry_idx; return (exit_idx, exit_price, reason)."""
-    max_idx = min(entry_idx + MAX_HOLD_HOURS, len(klines) - 1)
+    """Walk forward bar-by-bar mirroring prod executor.update_price.
+
+    Applies progressive trailing stop tiers, hard target, fast-cut, and
+    48h max hold. Returns (exit_idx, exit_price, reason in
+    {stop|trail|target|fast_cut|max_hold}).
+
+    The trail tier evaluation uses the bar's HIGH (long) / LOW (short) as
+    the candidate price each bar — the most aggressive trail the bar would
+    have produced under tick-level prod logic. Stop trigger then uses the
+    bar's LOW (long) / HIGH (short) against the resulting effective stop.
+    Target wins ties on the same bar (matches prod ordering: stop check
+    fires first against the live trailing price as price walks up).
+    """
+    n = len(klines)
+    max_idx = min(entry_idx + MAX_HOLD_HOURS, n - 1)
+
+    if side == "long":
+        hard_stop = entry_price * (1 - stop_pct)
+        trail_price = 0.0  # init to 0; effective stop falls back to hard
+    else:
+        hard_stop = entry_price * (1 + stop_pct)
+        trail_price = entry_price * (1 + stop_pct)  # init to hard for shorts
+
+    target = entry_price * (1 + target_pct) if side == "long" else entry_price * (1 - target_pct)
+
+    underwater_streak = 0  # consecutive bars closed <= entry*(1-2%) (long sense)
+    fast_cut_exempt = symbol.upper() in {"BTC", "ETH", "SOL", "BNB", "XRP"}
+
     for i in range(entry_idx, max_idx + 1):
         k = klines[i]
-        high, low = float(k["high"]), float(k["low"])
+        high, low, close = float(k["high"]), float(k["low"]), float(k["close"])
+        bars_held = i - entry_idx + 1  # 1 at entry bar
+
+        # --- Update progressive trail using bar extremum ---
         if side == "long":
-            if low <= entry_price * (1 - stop_pct):
-                return i, entry_price * (1 - stop_pct), "stop"
-            if high >= entry_price * (1 + target_pct):
-                return i, entry_price * (1 + target_pct), "target"
-        else:  # short
-            if high >= entry_price * (1 + stop_pct):
-                return i, entry_price * (1 + stop_pct), "stop"
-            if low <= entry_price * (1 - target_pct):
-                return i, entry_price * (1 - target_pct), "target"
+            cand_price = high
+            profit_pct = (cand_price - entry_price) / entry_price
+            f = _trail_factor(profit_pct, stop_pct)
+            if f is not None:
+                new_trail = cand_price * (1 - stop_pct * f)
+                if new_trail > trail_price:
+                    trail_price = new_trail
+            effective_stop = max(hard_stop, trail_price)
+            using_trail = trail_price > hard_stop
+        else:
+            cand_price = low
+            profit_pct = (entry_price - cand_price) / entry_price
+            f = _trail_factor(profit_pct, stop_pct)
+            if f is not None:
+                new_trail = cand_price * (1 + stop_pct * f)
+                if new_trail < trail_price:
+                    trail_price = new_trail
+            effective_stop = min(hard_stop, trail_price)
+            using_trail = trail_price < hard_stop
+
+        # --- Stop / trail trigger ---
+        if side == "long" and low <= effective_stop:
+            return i, effective_stop, ("trail" if using_trail else "stop")
+        if side == "short" and high >= effective_stop:
+            return i, effective_stop, ("trail" if using_trail else "stop")
+
+        # --- Target trigger ---
+        if side == "long" and high >= target:
+            return i, target, "target"
+        if side == "short" and low <= target:
+            return i, target, "target"
+
+        # --- Fast-cut: sustained-downtrend gate ---
+        if not fast_cut_exempt:
+            if side == "long":
+                underwater = close <= entry_price * (1 + FAST_CUT_PNL_THRESHOLD)
+            else:
+                underwater = close >= entry_price * (1 - FAST_CUT_PNL_THRESHOLD)
+            if underwater:
+                underwater_streak += 1
+            else:
+                underwater_streak = 0
+            if (
+                bars_held >= FAST_CUT_MIN_BARS
+                and underwater_streak >= FAST_CUT_MIN_BARS
+            ):
+                return i, close, "fast_cut"
+
     final = klines[max_idx]
     return max_idx, float(final["close"]), "max_hold"
 
@@ -227,6 +341,9 @@ def replay(
     include_fgi_contrarian: bool = True,
     include_listing_pump: bool = True,
     include_stable_flow: bool = True,
+    include_funding_carry: bool = True,
+    apply_regime_gate: bool = True,
+    apply_slippage: bool = True,
     min_score_override: Optional[int] = None,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
@@ -262,6 +379,10 @@ def replay(
         notes.append("stable_flow events from DefiLlama stablecoin daily totals (BTC/ETH only)")
     else:
         notes.append("stable_flow events DISABLED")
+    if include_funding_carry:
+        notes.append("funding_carry events from cross-sectional 8h ranking (top/bot 10%)")
+    else:
+        notes.append("funding_carry events DISABLED")
     notes.append("listing/fgi/trending signals NOT replayed (no historical loaders yet)")
     if min_score_override is not None:
         # Monkeypatch the module attribute the brain reads so we can
@@ -272,7 +393,11 @@ def replay(
         _rb.MIN_SCORE_TO_TRADE = int(min_score_override)
         notes.append(f"MIN_SCORE_TO_TRADE override: {min_score_override} (prod is {_orig_min_score})")
     notes.append(f"taker fee per side: {TAKER_FEE_PER_SIDE*100:.3f}%")
-    notes.append(f"exits: stop|target|max_hold {MAX_HOLD_HOURS}h (no fast-cut/trail)")
+    if apply_slippage:
+        notes.append("slippage model ENABLED (sqrt market-impact, vol-aware; see slippage_model.py)")
+    else:
+        notes.append("slippage model DISABLED (--no-slippage; backtest will OVER-state PnL vs live)")
+    notes.append(f"exits: prod-mirror trail({TRAIL_TIERS})/fast_cut(>={FAST_CUT_MIN_BARS}bar @<={FAST_CUT_PNL_THRESHOLD*100:.0f}%)/max_hold {MAX_HOLD_HOURS}h")
 
     brain = RuleBrain(balance=initial_balance)
     balance = initial_balance
@@ -355,6 +480,26 @@ def replay(
             f"filter effectively bypassed in this window"
         )
 
+    # Realised-vol regime meta-gate: precompute regime per backtest tick
+    # using BTC 1h klines as the market-wide proxy. Lazy-load BTC if it
+    # isn't already in the universe so the gate always has data.
+    btc_klines_for_regime: list[dict] = klines_by_symbol.get("BTC") or []
+    if apply_regime_gate and not btc_klines_for_regime:
+        try:
+            btc_klines_for_regime = load_klines("BTC", KLINE_INTERVAL, start_ms, end_ms)
+        except Exception as e:
+            notes.append(f"BTC klines for regime gate unavailable: {e}")
+            btc_klines_for_regime = []
+    if apply_regime_gate:
+        notes.append("regime meta-gate ENABLED (RV_7d vs 90d-median, calm<0.6 / hot>1.4)")
+    else:
+        notes.append("regime meta-gate DISABLED (--no-regime-gate)")
+
+    # Counters for honest reporting
+    regime_blocks = 0
+    other_blocks = 0
+    regime_seen: dict[str, int] = {"calm": 0, "neutral": 0, "hot": 0}
+
     # Build a unified, time-ordered event stream.
     # Each event is (ts_ms, kind, symbol, payload) where kind is "funding"
     # or "top_mover".
@@ -405,7 +550,17 @@ def replay(
             day_ms = 86_400_000
             t = (start_ms // day_ms) * day_ms
             while t <= end_ms:
-                fgi = get_fgi_at_timestamp(fgi_history, t)
+                # CORRECTNESS (audit H3 / lookahead #4): alternative.me's day-N
+                # FGI value is timestamped at day-N 00:00 UTC but is computed
+                # from end-of-day-(N-1) data and published 00:00-01:00 UTC.
+                # Using day-N's value at day-N 00:00 risks 0-60min lookahead.
+                # Lag the lookup by 1 day (use yesterday's published value)
+                # for an honest no-lookahead replay. FGI is a slow signal —
+                # 1d lag costs effectively nothing.
+                fgi = get_fgi_at_timestamp(fgi_history, t - day_ms)
+                if fgi is None:
+                    t += day_ms
+                    continue
                 if fgi <= 20 or fgi >= 80:
                     for sym in ("BTC", "ETH"):
                         if sym not in symbols:
@@ -416,7 +571,7 @@ def replay(
                         }))
                         fgi_event_count += 1
                 t += day_ms
-        notes.append(f"fgi_contrarian events emitted: {fgi_event_count}")
+        notes.append(f"fgi_contrarian events emitted: {fgi_event_count} (1d-lagged for no-lookahead)")
 
     stable_flow_event_count = 0
     if include_stable_flow:
@@ -429,7 +584,14 @@ def replay(
             day_ms = 86_400_000
             t = (start_ms // day_ms) * day_ms
             while t <= end_ms:
-                row = get_stablecoin_flow_at_timestamp(stable_history, t)
+                # CORRECTNESS (audit lookahead #5): DefiLlama's
+                # net_24h_change_usd at day-N stamp = circulating(N) -
+                # circulating(N-1). The day-N circulating snapshot is the
+                # END-OF-DAY balance, only knowable AFTER day-N. Using it
+                # at day-N 00:00 = up to 24h lookahead. Lag by 1 day —
+                # today we trade on yesterday's closed flow, which is
+                # genuinely knowable at 00:00.
+                row = get_stablecoin_flow_at_timestamp(stable_history, t - day_ms)
                 if row is not None:
                     net24 = row["net_24h_change_usd"]
                     if net24 > 300_000_000 or net24 < -300_000_000:
@@ -448,6 +610,20 @@ def replay(
                             stable_flow_event_count += 1
                 t += day_ms
         notes.append(f"stable_flow events emitted: {stable_flow_event_count}")
+
+    funding_carry_event_count = 0
+    if include_funding_carry:
+        try:
+            carry_events = reconstruct_funding_carry(
+                symbols=symbols, start_ms=start_ms, end_ms=end_ms,
+            )
+        except Exception as e:
+            notes.append(f"funding_carry history unavailable: {e}")
+            carry_events = []
+        for ce in carry_events:
+            events.append((int(ce["ts_ms"]), "funding_carry", ce["symbol"], ce))
+            funding_carry_event_count += 1
+        notes.append(f"funding_carry events emitted: {funding_carry_event_count}")
 
     if include_fgi_contrarian:
         if include_15m_accel:
@@ -468,8 +644,15 @@ def replay(
     open_positions: list[dict] = []  # mirrors what brain expects in self.open_positions
 
     for ts_ms, kind, sym, payload in events:
-        rate = float(payload.get("funding_rate", 0.0)) if kind == "funding" else 0.0
-        mark = float(payload.get("mark_price", 0.0)) if kind == "funding" else float(payload.get("price", 0.0))
+        if kind == "funding":
+            rate = float(payload.get("funding_rate", 0.0))
+            mark = float(payload.get("mark_price", 0.0))
+        elif kind == "funding_carry":
+            rate = float(payload.get("rate", 0.0))
+            mark = float(payload.get("mark_price", 0.0))
+        else:
+            rate = 0.0
+            mark = float(payload.get("price", 0.0))
         # Close any expired sim positions before this event (timeline-correct)
         still_open = []
         for pos in open_positions:
@@ -480,12 +663,18 @@ def replay(
                 if peak_balance > 0:
                     dd = (peak_balance - balance) / peak_balance * 100.0
                     max_dd_pct = max(max_dd_pct, dd)
-                # Tell brain about the close so re-entry cooldown applies
+                # Tell brain about the close so re-entry cooldown applies.
+                # CORRECTNESS-CRITICAL (audit C2): without `closed_at`,
+                # rule_brain.review_trade falls back to time.time()*1000
+                # → cooldown ms_since==0 → blocks every re-entry across the
+                # wall-clock window of the run, not the simulated window.
                 brain.review_trade({
                     "symbol": pos["trade"].symbol,
                     "pnl_pct": pos["trade"].pnl_pct,
                     "exit": pos["trade"].exit_price,
                     "exit_price": pos["trade"].exit_price,
+                    "closed_at": pos["trade"].exit_time_ms,
+                    "signal_type": pos["trade"].strategy,
                 })
             else:
                 still_open.append(pos)
@@ -600,6 +789,34 @@ def replay(
                     "stablecoin_total_usd": float(payload.get("stablecoin_total_usd", 0.0)),
                 },
             )
+        elif kind == "funding_carry":
+            carry_rate = float(payload.get("rate", 0.0))
+            carry_rank = float(payload.get("funding_rank_pct", 1.0))
+            event_kind = payload.get("event_type", "funding_carry_long")
+            side_hint = payload.get("side_hint", "long")
+            close_price = float(klines[idx]["close"]) if klines else float(payload.get("mark_price", 0.0))
+            packet = SignalPacket(
+                signal_id=f"bt-carry-{sym}-{ts_ms}",
+                symbol=sym,
+                signal_type=event_kind,
+                priority=2,
+                timestamp=float(ts_ms),
+                price_usd=close_price,
+                volume_24h=vol_24h,
+                price_change_24h=change_24h,
+                funding_rate=carry_rate,
+                source="binance_funding_xsec",
+                reasoning=f"x-sec funding carry rank={carry_rank*100:.0f}% rate={carry_rate*100:+.3f}% — {side_hint}",
+                suggested_side=side_hint,
+                suggested_stop_pct=0.06,
+                suggested_target_pct=0.10,
+                data={
+                    "acceleration_1h": accel,
+                    "funding_rate": carry_rate,
+                    "funding_rank_pct": carry_rank,
+                    "mark_price": close_price,
+                },
+            )
         else:  # fgi
             fgi_val = int(payload.get("fgi", 50))
             side_hint = payload.get("side_hint", "long")
@@ -646,6 +863,31 @@ def replay(
                 continue
 
             # Replayable filter chain (time_of_day, correlation, volatility, oi_delta)
+            # Pull the strategy label from thesis_conditions (set by
+            # rule_brain.tick) so the chain can bypass macro signals like
+            # stable_flow_bull/bear that the derivatives filters don't apply to.
+            d_strategy = ""
+            tc = getattr(d, "thesis_conditions", None) or {}
+            if isinstance(tc, dict):
+                d_strategy = tc.get("strategy", "") or ""
+            if not d_strategy:
+                d_strategy = getattr(d, "strategy_type", "") or ""
+            # Compute the realised-vol regime once per decision using BTC
+            # 1h klines as the market-wide proxy. Cheap because the inner
+            # functions are O(168 + 90) on a memoised series.
+            current_regime = "neutral"
+            if apply_regime_gate and btc_klines_for_regime:
+                try:
+                    current_regime = regime_at_timestamp(
+                        d.symbol,
+                        btc_klines_for_regime,
+                        ts_ms,
+                        backtest_start_ms=start_ms,
+                        backtest_end_ms=end_ms,
+                    )
+                except Exception:
+                    current_regime = "neutral"
+                regime_seen[current_regime] = regime_seen.get(current_regime, 0) + 1
             if apply_filters:
                 check = run_offline_filters(
                     symbol=d.symbol,
@@ -659,25 +901,57 @@ def replay(
                     futures_klines_1h=futures_klines_by_symbol.get(d.symbol, []),
                     ls_history=ls_by_symbol.get(d.symbol, []),
                     klines_1h=klines_by_symbol.get(d.symbol, []),
+                    signal_type=d_strategy,
+                    regime_strategy=d_strategy,
+                    current_regime=current_regime if apply_regime_gate else None,
                 )
                 if not check.allowed:
+                    if check.rule == "regime":
+                        regime_blocks += 1
+                    else:
+                        other_blocks += 1
                     continue
 
             # Apply funding-rate-aware sizing (live executor mirror)
-            size_usd = d.size_usd * _funding_size_multiplier(rate)
+            size_usd = d.size_usd * _funding_size_multiplier(rate, d.side)
             if size_usd > balance * 0.4:
                 size_usd = balance * 0.4
             if size_usd < 5:
                 continue
 
+            # Apply entry slippage to fill price (adverse to position side).
+            entry_slip_bps = 0.0
+            if apply_slippage:
+                entry_slip_bps = _slippage_bps(
+                    d.symbol, size_usd, "entry", d_klines, entry_idx,
+                )
+                if d.side == "long":
+                    entry_price = entry_price * (1 + entry_slip_bps / 10_000.0)
+                else:
+                    entry_price = entry_price * (1 - entry_slip_bps / 10_000.0)
+
             exit_idx, exit_price, reason = _simulate_exit(
-                d_klines, entry_idx, entry_price, d.side, d.stop_pct, d.target_pct
+                d_klines, entry_idx, entry_price, d.side, d.stop_pct, d.target_pct,
+                symbol=d.symbol,
             )
+
+            # Apply exit slippage (adverse to closing direction).
+            exit_slip_bps = 0.0
+            if apply_slippage:
+                exit_slip_bps = _slippage_bps(
+                    d.symbol, size_usd, "exit", d_klines, exit_idx,
+                )
+                if d.side == "long":
+                    exit_price = exit_price * (1 - exit_slip_bps / 10_000.0)
+                else:
+                    exit_price = exit_price * (1 + exit_slip_bps / 10_000.0)
+
             qty = size_usd / entry_price
             gross_pnl = (exit_price - entry_price) * qty if d.side == "long" else (entry_price - exit_price) * qty
             fees = (entry_price * qty * TAKER_FEE_PER_SIDE) + (exit_price * qty * TAKER_FEE_PER_SIDE)
             net_pnl = gross_pnl - fees
             pnl_pct = net_pnl / size_usd * 100.0
+            slippage_usd = size_usd * (entry_slip_bps + exit_slip_bps) / 10_000.0
 
             trade = SimTrade(
                 symbol=d.symbol,
@@ -694,6 +968,7 @@ def replay(
                 fees_usd=fees,
                 score=0,  # rule_brain doesn't expose score on TradeDecision
                 funding_rate=rate,
+                slippage_usd=slippage_usd,
             )
             open_positions.append({
                 "trade": trade,
@@ -716,6 +991,7 @@ def replay(
     total_pnl_pct = (total_pnl / initial_balance * 100.0) if initial_balance else 0.0
     avg_pnl_pct = (sum(t.pnl_pct for t in trades) / num_trades) if num_trades else 0.0
     fees_paid = sum(t.fees_usd for t in trades)
+    total_slippage_usd = sum(t.slippage_usd for t in trades)
 
     # Crude Sharpe proxy: mean / stdev of trade-level pct returns (no annualisation)
     sharpe_proxy = 0.0
@@ -731,6 +1007,13 @@ def replay(
         import src.engine.rule_brain as _rb
         _rb.MIN_SCORE_TO_TRADE = _orig_min_score
 
+    if apply_regime_gate:
+        notes.append(
+            f"regime gate: blocked={regime_blocks}, other_filter_blocks={other_blocks}, "
+            f"regime distribution among gated decisions calm={regime_seen.get('calm',0)} "
+            f"neutral={regime_seen.get('neutral',0)} hot={regime_seen.get('hot',0)}"
+        )
+
     return BacktestResult(
         start_ms=start_ms,
         end_ms=end_ms,
@@ -745,6 +1028,7 @@ def replay(
         avg_trade_pnl_pct=avg_pnl_pct,
         sharpe_proxy=sharpe_proxy,
         fees_paid_usd=fees_paid,
+        total_slippage_usd=total_slippage_usd,
         trades=trades,
         notes=notes,
     )

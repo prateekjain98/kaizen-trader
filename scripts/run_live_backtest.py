@@ -45,6 +45,14 @@ def main() -> int:
                    help="Disable listing_pump event replay (Binance + Coinbase listing dates)")
     p.add_argument("--no-stable-flow", action="store_true",
                    help="Disable stable_flow event replay (DefiLlama stablecoin net-flow)")
+    p.add_argument("--no-funding-carry", action="store_true",
+                   help="Disable cross-sectional funding-carry event replay")
+    p.add_argument("--no-regime-gate", action="store_true",
+                   help="Disable realised-vol regime-switch meta-gate (ablation; default ON)")
+    p.add_argument("--no-slippage", action="store_true",
+                   help="Disable per-symbol slippage model (ablation; default ON). "
+                        "With slippage OFF, backtest will OVER-state PnL vs live "
+                        "execution on thin alts.")
     p.add_argument("--include-15m-accel", action="store_true",
                    help="Enable sub-hour accel detection from 15m klines "
                         "(opt-in; empirically hurts PnL — kept for tuning)")
@@ -95,6 +103,9 @@ def main() -> int:
                         include_fgi_contrarian=not args.no_fgi,
                         include_listing_pump=not args.no_listings,
                         include_stable_flow=not args.no_stable_flow,
+                        include_funding_carry=not args.no_funding_carry,
+                        apply_regime_gate=not args.no_regime_gate,
+                        apply_slippage=not args.no_slippage,
                         min_score_override=args.min_score)
         elapsed = time.time() - t0
         all_results.append(result)
@@ -105,17 +116,25 @@ def main() -> int:
         print(f"  Avg trade:    {result.avg_trade_pnl_pct:+.2f}%")
         print(f"  Sharpe proxy: {result.sharpe_proxy:.3f}")
         print(f"  Max DD:       {result.max_dd_pct:.2f}%")
+        print(f"  Slippage:     ${result.total_slippage_usd:.2f}")
         bs = result.by_strategy()
         if bs:
             print(f"  By strategy:")
             for k, v in sorted(bs.items(), key=lambda kv: -kv[1]["total_pnl_usd"]):
                 print(f"    {k:18s} n={v['num_trades']:3d} WR={v['win_rate']:.0f}% "
                       f"pnl=${v['total_pnl_usd']:+.2f} avg={v['avg_trade_pnl_pct']:+.2f}%")
+        eh = result.exit_reason_histogram()
+        if eh:
+            order = ["stop", "trail", "target", "fast_cut", "max_hold"]
+            parts = [f"{r}={eh.get(r,0)}" for r in order if eh.get(r, 0)]
+            extras = [f"{k}={v}" for k, v in eh.items() if k not in order]
+            print(f"  Exit reasons: {' '.join(parts + extras)}")
         print(f"  Elapsed:      {elapsed:.1f}s")
 
     # Aggregate
     total_pnl = sum(r.total_pnl_usd for r in all_results)
     total_trades = sum(r.num_trades for r in all_results)
+    total_slippage = sum(r.total_slippage_usd for r in all_results)
     all_positive = all(r.total_pnl_usd >= 0 for r in all_results)
 
     out = {
@@ -125,6 +144,7 @@ def main() -> int:
             "all_windows_non_negative": all_positive,
             "total_pnl_usd": total_pnl,
             "total_trades": total_trades,
+            "total_slippage_usd": total_slippage,
         },
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "symbols": symbols,
@@ -134,11 +154,22 @@ def main() -> int:
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2, default=str)
 
+    agg_exit: dict[str, int] = {}
+    for r in all_results:
+        for k, v in r.exit_reason_histogram().items():
+            agg_exit[k] = agg_exit.get(k, 0) + v
+    order = ["stop", "trail", "target", "fast_cut", "max_hold"]
+    agg_exit_str = " ".join(
+        [f"{k}={agg_exit.get(k,0)}" for k in order if agg_exit.get(k, 0)]
+        + [f"{k}={v}" for k, v in agg_exit.items() if k not in order]
+    )
+
     print(f"\n=== AGGREGATE ===")
     print(f"  Windows:                  {n_splits}")
     print(f"  Total trades:             {total_trades}")
     print(f"  Total PnL:                ${total_pnl:+.2f}")
     print(f"  All windows non-negative: {all_positive}")
+    print(f"  Exit reasons:             {agg_exit_str}")
     print(f"  Wrote {out_path}")
     if n_splits > 1:
         print(f"\n  Out-of-sample verdict:    "
