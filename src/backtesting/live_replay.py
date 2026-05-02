@@ -956,7 +956,7 @@ def replay(
             trade = SimTrade(
                 symbol=d.symbol,
                 side=d.side,
-                strategy=getattr(d, "strategy_type", "funding_squeeze") or "funding_squeeze",
+                strategy=d_strategy or "funding_squeeze",
                 entry_time_ms=int(d_klines[entry_idx]["open_time"]),
                 exit_time_ms=int(d_klines[exit_idx]["close_time"]),
                 entry_price=entry_price,
