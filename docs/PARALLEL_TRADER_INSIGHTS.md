@@ -4,6 +4,30 @@ This file is APPENDED to by parallel paper-trader agent passes. Each entry is
 timestamped and self-contained. Read the most recent entries when planning
 the next change to the main bot's rule_brain or signal_detector.
 
+## CONFIG STATUS (read before suggesting strategy enables)
+
+Strategies disabled in prod by env-var gate (do NOT suggest enabling without
+fresh n>=30 + ROBUST t-test verdict per scripts/run_live_backtest.py):
+- `FUNDING_CARRY_ENABLED=0` — prior +$5.53 backtest was fabricated by 3
+  compounding bugs (re-entry cooldown sim-time clock, filter-chain bypass,
+  exit-attribution wick-vs-carry-pnl). See data_streams.py:757-767.
+- `LIQUIDATION_CASCADE_ENABLED=0` — sweep at multiple thresholds yields
+  n=6 max events over 90d on 8 majors. INSUFFICIENT for verdict.
+- `OB_IMBALANCE_ENABLED=0` — historical L2 depth not available, OOS
+  validation impossible. See data_streams.py:967-971.
+
+Per-symbol cooldown (4h after 2 losses) and per-strategy cooldown (30min
+after 3 losses) ARE wired and active — see commits 4c3fa60 + a94404a.
+
+MIN_SCORE_TO_TRADE = 60 (was 40 pre-2026-05-03). RuleBrain only;
+ClaudeBrain not currently active in prod (no ANTHROPIC_API_KEY on VM).
+
+`_CARRY_LIQUID_UNIVERSE` (rule_brain.py:84) covers 27 majors — funding_carry
+signals on coins outside this set score 0 on the carry-rank bonus even when
+the env gate is flipped. Pass 2's BUSDT recommendation falls in this hole.
+
+---
+
 ## 2026-05-03 10:50 UTC — Parallel Trader Pass
 ### Market snapshot
 - BTC: $78,370.70 (24h: +0.18%) — dead-flat chop. 24h kline range $78,028–$79,145 (~1.4% intraday band, no trend).
