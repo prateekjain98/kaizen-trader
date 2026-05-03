@@ -240,16 +240,16 @@ def _score_signal(
             strategy_type = "listing_pump"
 
     # FGI extreme fear — contrarian BTC/ETH buy.
-    # CORRECTNESS (audit — brain): aligned threshold to <=20 (was <15) to
-    # match signal_detector.py:200 emit condition. Detector fires whenever
-    # FGI<=20, but brain previously awarded points only at FGI<15, so the
-    # 15-20 sub-band emitted signals that scored 0 and silently dropped.
-    # P0 audit fix: only claim fgi_contrarian attribution if no
-    # higher-priority strategy already set it. A funding_carry_long on
-    # BTC/ETH during FGI<=20 (exactly when crypto fear and funding
-    # extremes co-occur) would otherwise get fgi_contrarian params
-    # (stop 8% / target 15%) instead of carry params (6%/10%).
-    if fgi <= 20 and symbol in ("BTC", "ETH"):
+    # P0 (prior fix): only claim attribution if no higher-priority claimed.
+    # P1 (this fix): the +30 score bonus is a CONTRARIAN LONG signal — adding
+    # it to a directionally-opposed short strategy (mempool_stress short on
+    # fee+greed, funding_carry_short, stable_flow_bear, chain_flow_bear)
+    # inflates the score for trades that fight the contrarian thesis. A
+    # funding_carry_short on BTC at FGI=18 with carry rank 8% would score
+    # 30+30=60 (clears MIN_SCORE) when without the misapplied bonus it scores
+    # 30 (filtered). Don't reward shorts during extreme fear.
+    _SHORT_STRATS = ("funding_carry_short", "mempool_stress", "stable_flow_bear", "chain_flow_bear")
+    if fgi <= 20 and symbol in ("BTC", "ETH") and signal_type not in _SHORT_STRATS:
         score += 30
         factors.append(f"FGI={fgi} extreme fear on {symbol} +30")
         if strategy_type == signal_type:
@@ -409,8 +409,17 @@ def _score_signal(
     # Determine side and risk
     # ------------------------------------------------------------------
 
-    # Default to long; short only for specific setups
-    side = signal.suggested_side or "long"
+    # Default side derives from strategy intent when detector omits it.
+    # P0 audit fix: prior `signal.suggested_side or "long"` silently flipped
+    # any short-strategy signal (funding_carry_short, mempool_stress,
+    # stable_flow_bear, chain_flow_bear) to LONG when emitter omitted
+    # suggested_side. Latent today (every short emitter currently sets
+    # suggested_side explicitly) but defense-in-depth so a future emitter
+    # bug can't invert trade direction.
+    _SHORT_DEFAULT = {"funding_carry_short", "mempool_stress",
+                      "stable_flow_bear", "chain_flow_bear"}
+    _strat_default = "short" if signal_type in _SHORT_DEFAULT else "long"
+    side = signal.suggested_side or _strat_default
 
     # Correlation break: if alt is underperforming (negative divergence), go long
     if strategy_type == "correlation_break" and btc_divergence < -1.5:
