@@ -188,15 +188,21 @@ def _score_signal(
         score += 30
         factors.append(f"1h accel {accel_1h:+.1f}% +30")
 
-    # Funding squeeze
+    # Funding squeeze. Score bonus always applies, but strategy_type
+    # attribution only claimed if signal arrived as the default type.
+    # P1 audit fix: a funding_carry_long signal on a coin with funding
+    # < -0.2% would otherwise inherit funding_squeeze risk params
+    # (stop 10% / target 25%) instead of carry params (stop 6% / target
+    # 10%), holding losing carry trades ~3x longer than intended.
     if funding_rate < -0.002:  # < -0.2%
         score += 40
         factors.append(f"extreme neg funding {funding_rate*100:+.3f}% +40")
-        strategy_type = "funding_squeeze"
+        if strategy_type == signal_type:
+            strategy_type = "funding_squeeze"
     elif funding_rate < -0.001:  # < -0.1%
         score += 25
         factors.append(f"neg funding {funding_rate*100:+.3f}% +25")
-        if accel_1h > 5:
+        if accel_1h > 5 and strategy_type == signal_type:
             strategy_type = "funding_squeeze"
 
     # Correlation break — alts underperforming BTC.
@@ -221,21 +227,33 @@ def _score_signal(
         score += 15
         factors.append(f"vol ${volume_24h/1e6:.0f}M +15")
 
-    # New listing bonus
+    # New listing bonus. P0 audit fix: only claim attribution if no
+    # higher-priority strategy already set it. A funding_carry_short
+    # signal on a freshly-listed coin would otherwise get listing_pump
+    # risk params (stop 10% / target 20%) instead of carry params
+    # (stop 6% / target 10%) — 1.7x stop, 2x target on a strategy
+    # whose edge decays in minutes.
     if listing_age_hours < 6:
         score += 35
         factors.append(f"new listing {listing_age_hours:.1f}h old (77% WR) +35")
-        strategy_type = "listing_pump"
+        if strategy_type == signal_type:
+            strategy_type = "listing_pump"
 
     # FGI extreme fear — contrarian BTC/ETH buy.
     # CORRECTNESS (audit — brain): aligned threshold to <=20 (was <15) to
     # match signal_detector.py:200 emit condition. Detector fires whenever
     # FGI<=20, but brain previously awarded points only at FGI<15, so the
     # 15-20 sub-band emitted signals that scored 0 and silently dropped.
+    # P0 audit fix: only claim fgi_contrarian attribution if no
+    # higher-priority strategy already set it. A funding_carry_long on
+    # BTC/ETH during FGI<=20 (exactly when crypto fear and funding
+    # extremes co-occur) would otherwise get fgi_contrarian params
+    # (stop 8% / target 15%) instead of carry params (6%/10%).
     if fgi <= 20 and symbol in ("BTC", "ETH"):
         score += 30
         factors.append(f"FGI={fgi} extreme fear on {symbol} +30")
-        strategy_type = "fgi_contrarian"
+        if strategy_type == signal_type:
+            strategy_type = "fgi_contrarian"
 
     # Stablecoin net-flow — orthogonal risk-on / risk-off signal (BTC/ETH only)
     if signal_type == "stable_flow_bull" and symbol in ("BTC", "ETH"):
