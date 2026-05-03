@@ -21,7 +21,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-CUTOFF_UTC = datetime(2026, 5, 3, 6, 8, 0, tzinfo=timezone.utc)
+DEFAULT_CUTOFF_UTC = datetime(2026, 5, 3, 6, 8, 0, tzinfo=timezone.utc)
 SSH_CMD = ["gcloud", "compute", "ssh", "kaizen-prod",
            "--zone=asia-east2-a", "--tunnel-through-iap", "--command"]
 
@@ -89,12 +89,39 @@ def summarize(closes: list[dict], label: str) -> None:
           f"mean_pct={mean_pct:+.2f}%  total_pnl=${total_pnl:+.2f}")
     print(f"         exits: target={targets}  stop={stops}  "
           f"trail={trails}  fast_cut={fast}  big_loss(<=-10%)={big_loss}")
+    # Per-symbol bleed histogram (top 5 worst symbols by sum_pnl)
+    by_sym: dict[str, dict] = {}
+    for c in closes:
+        s = by_sym.setdefault(c["symbol"], {"n": 0, "pnl": 0.0, "wins": 0})
+        s["n"] += 1
+        s["pnl"] += c["pnl_usd"]
+        if c["pnl_usd"] >= 0:
+            s["wins"] += 1
+    worst = sorted(by_sym.items(), key=lambda kv: kv[1]["pnl"])[:5]
+    if worst:
+        parts = [f"{sym}(n={d['n']},${d['pnl']:+.2f})"
+                 for sym, d in worst]
+        print(f"         worst symbols: {' | '.join(parts)}")
 
 
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--days", type=int, default=7)
+    p.add_argument("--cutoff-iso", default=None,
+                   help="ISO-8601 UTC cutoff (default 2026-05-03T06:08 — "
+                        "audit-fix wave). Use to A/B at any deploy boundary.")
     args = p.parse_args()
+
+    if args.cutoff_iso:
+        try:
+            cutoff = datetime.fromisoformat(args.cutoff_iso.replace("Z", "+00:00"))
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=timezone.utc)
+        except ValueError:
+            print(f"ERROR: invalid --cutoff-iso: {args.cutoff_iso}")
+            return 2
+    else:
+        cutoff = DEFAULT_CUTOFF_UTC
 
     text = fetch_journal(args.days)
     if not text:
@@ -102,10 +129,12 @@ def main() -> int:
         return 1
 
     closes = parse_closes(text)
-    pre = [c for c in closes if c["ts"] < CUTOFF_UTC]
-    post = [c for c in closes if c["ts"] >= CUTOFF_UTC]
+    pre = [c for c in closes if c["ts"] < cutoff]
+    post = [c for c in closes if c["ts"] >= cutoff]
+    # Mention cutoff change in line above
 
-    print(f"\n=== Post-tightening A/B (cutoff {CUTOFF_UTC.isoformat()}) ===")
+
+    print(f"\n=== Post-tightening A/B (cutoff {cutoff.isoformat()}) ===")
     print(f"Total closes parsed: {len(closes)}  (pre={len(pre)}, post={len(post)})")
     print()
     summarize(pre, "PRE")
