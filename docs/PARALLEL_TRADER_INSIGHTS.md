@@ -4,6 +4,40 @@ This file is APPENDED to by parallel paper-trader agent passes. Each entry is
 timestamped and self-contained. Read the most recent entries when planning
 the next change to the main bot's rule_brain or signal_detector.
 
+## SESSION VERDICT (2026-05-03)
+
+After 15+ shipped fixes (cooldowns, MIN_SCORE 40→60, 7 audit-driven bug
+fixes across rule_brain + signal_detector, trail attribution, README,
+monitoring tools) and validation backtests up to 365d/n=110:
+
+**Kaizen-trader is NOT yet "best crypto trader in world".**
+
+Hard data, no fabrication:
+- 365d backtest, all 3 windows positive, n=110 — clears legacy gate ✓
+- BUT t-stats remain sub-ROBUST: ALL=0.48, carry=0.38, stable=0.58
+  (ROBUST gate requires t>2.81 with n≥100)
+- W3 (most recent 4 months / current regime) = +\$0.04 over 69 trades
+  → essentially flat. Edge does not pay in current low-vol/high-corr
+  regime (BTC realized vol 14.4% annualized, BTC-ETH corr +0.91).
+
+**The binding constraint is statistical power, not bugs.** Every fix
+shipped this session was honest, but mean-reversion strategies on a
+\$50 paper balance simply lack the n × signal/noise ratio to achieve
+ROBUST verdict in any reasonable window.
+
+**Path to \"best in world\" requires one of:**
+1. New strategies with materially higher mean (momentum / cascade /
+   ML-based) — none currently validated
+2. Lower per-trade stdev (impossible without giving up edge given
+   crypto's intrinsic vol)
+3. Larger capital base to amortize fees + slippage (separate decision)
+4. Regime-gating to only trade in regimes where strategies pay
+   (W2 / W1 in our backtest had clear edge; W3 didn't)
+
+Option 4 is the cheapest constructive path. All other paths require
+substantial harness or capital changes.
+
+
 ## CONFIG STATUS (read before suggesting strategy enables)
 
 Strategies disabled in prod by env-var gate (do NOT suggest enabling without
