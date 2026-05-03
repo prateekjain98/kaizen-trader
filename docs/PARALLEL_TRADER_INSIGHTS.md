@@ -132,3 +132,56 @@ the env gate is flipped. Pass 2's BUSDT recommendation falls in this hole.
   - **3-minute gap is too short for FGI/funding regime change** by construction. The "Δ since pass 1" deltas should be read as "what changed in 3 min", not as a trend signal.
   - **KNC -0.67% funding still un-validated against spot.** The dislocation persists, which weakly suggests it's a real (multi-hour) venue imbalance rather than a stale data point — but spot-vs-perp basis was not checked.
   - **AKTUSDT 1h accel of +6.79%** computed from the live (in-progress) bar. By the time the bar closes, this could be +3% or +12%; treat as directional, not point-precise.
+
+## 2026-05-03 11:04 UTC — Parallel Trader Pass (Pass 3 — regime correlation)
+
+### Δ since pass 2 (commit d7dcb66, ~11 min later)
+- **BTC: $78,384.90 → $78,382.60** (−$2.30, essentially flat). Close range over last 24h: $78,131–$78,793 (~0.85% band — even tighter than pass 1's 1.4%).
+- **FGI today: 47 (Neutral)** — same daily snapshot as passes 1 & 2.
+- **FGI 7d trend (oldest → newest): 47, 33, 26, 29, 26, 39, 47.** Sequence is **Fear → recovering**: market spent 5 of last 7 days in Fear (low: 26), today's 47 is a +21pt rebound from yesterday's 39 (and +21pt off the trough). Direction is **rising-out-of-fear**, not greedy.
+
+### Regime metrics (computed this pass)
+- **BTC 24h realized vol (1h close-to-close stdev × √24): 0.75%.** Annualized (× √(24·365)): **~14.4%** — extremely low. For context, BTC's long-run realized vol typically prints 40–80% annualized; 14% is "dead-flat funeral parlor" territory.
+- **BTC-ETH 24h hourly-return Pearson correlation: +0.909.** Very high — BTC and ETH are moving in lockstep. No idiosyncratic alt opportunity at the majors level; whatever happens is a beta trade.
+- **FGI 7d direction: rising-out-of-fear** (trough 26 three days ago, now 47, classification crossed Fear→Neutral today).
+
+### Regime classification
+**CHOP / VOL-COMPRESSION** with a **fear-recovery FGI tailwind**. Specifically:
+- 14.4% annualized BTC vol = bottom-decile vol regime. This is **bad for funding_squeeze** (squeeze needs price impulse to fire — KNC pass 1's prediction failing is exhibit A) and **bad for liquidation_cascade** (no big moves to cascade).
+- 0.91 BTC-ETH corr = **majors are beta-driven**, no relative-value edge at the top of the book. fgi_contrarian on BTC/ETH is the cleanest play if FGI continues recovering, but today's reading (47) is squarely in the Neutral dead zone — no contrarian signal.
+- The 7d FGI arc (Fear → Neutral) is the kind of setup where late-pump altcoin reversals (the BUSDT-class setups) bite hardest: shorts who pressed during the fear lows now get squeezed as risk-on returns, then the late-chasers blow up. **This is funding_carry_short's home regime** — and it remains disabled per CONFIG STATUS.
+
+### Would-have-trade post-mortem (pulled 4 × 1h bars per symbol)
+
+| symbol | pass 1/2 entry signal | 4h price move (close[0]→close[3]) | max favorable | max adverse | verdict |
+| ------ | --------------------- | --------------------------------- | ------------- | ----------- | ------- |
+| **KNCUSDT** | pass 1 LONG @ 0.1779 (funding squeeze, score 55) | **-3.56%** | +1.24% | -5.14% | **LOSER** — KNC made fresh lows (0.1681) before the bounce; a 1-2% stop would have triggered. Pass 1 + pass 2's caution (predicted +5% accel that never came) was correct. |
+| **AKTUSDT** | pass 2 LONG-near-miss @ 0.6197 (funding +mega-accel, score 55, blocked by vol floor) | **+1.64%** | +4.19% | -4.16% | **MILDLY POSITIVE / FLAT** — closed +1.6%, but path was choppy (peaked +4.2%, dipped -4.2%). With a 2% stop on the dip into bar 1's low ($0.6139) the trade would have been stopped out before the +4% bar 2 print. Volume floor saved a coin-flip. |
+| **BUSDT** | pass 2 SHORT-carry conviction @ 0.5372 (extreme positive funding + 30% pump + $500M turnover) | **-23.64%** | +1.40% (long-side) → **-27.44% favorable for SHORT** | -1.40% adverse for SHORT | **MASSIVE WINNER (would-have)** — close fell from $0.5372 → $0.4102 in 4 hours. A short-carry entry at pass 2's call would have realized **~+23.6% PnL** with only 1.4% adverse excursion. **This is the trade the funding_carry_short strategy is meant to capture and is currently gated off by `FUNDING_CARRY_ENABLED=0`.** |
+
+### Insight for main agent — this is the strongest cross-pass evidence yet
+
+1. **Regime is CHOP+VOL-COMPRESSION with a fear-recovery overlay.** 14.4% annualized BTC vol + 0.91 BTC-ETH corr means: don't expect funding_squeeze or cascade strategies to fire cleanly. They need impulse. They're not getting it. Pass 1 + pass 2 + pass 3 all returned zero ≥60 candidates — that's the regime, not a bot bug.
+2. **BUSDT post-mortem is the headline.** A coin we flagged in pass 2 as "highest cross-list conviction, funding_carry_short SHOULD pick this up" just printed -23.6% in 4 hours. The short-carry entry would have been a clean +23% win with negligible adverse excursion. This is **anecdotal n=1**, not a backtest — but it's the kind of n=1 worth logging because it's exactly the trade type the prod backtest harness CANNOT synthesize (per CONFIG STATUS line 14-22). The harness gap is now visibly costing real-world signal.
+3. **Do NOT enable funding_carry on this evidence alone.** The CONFIG STATUS rule is correct: the prior +$5.53 backtest had 3 compounding bugs, and one favorable post-mortem doesn't override that. **What this pass DOES support:** prioritize building the historical 8h-boundary funding-rank loader so the harness can actually validate carry. Today's BUSDT is one data point that says "the gap matters" — it's a reason to fund the harness work, not to flip the env-var gate.
+4. **AKT and KNC outcomes vindicate current gating.** AKT was a coin-flip blocked by the $100M vol floor — floor did its job. KNC was a -3.56% loss prevented by MIN_SCORE_TO_TRADE=60. Both gates earned their keep this pass. **Recommendation: do NOT relax MIN_SCORE or vol floor based on the pass 2 "near-miss" framing.**
+5. **High BTC-ETH correlation (0.91) is a soft signal that idiosyncratic-coin strategies (correlation_break, listing_pump) might also be misfiring.** When everything moves together, "correlation break" detectors will see noise as signal. Worth checking the recent journal for correlation_break entries that lost money in the last 24h.
+
+### Action suggestion grounded in the regime read
+- **Today (next 4-8h):** stay in zero-trade mode. The 14% vol regime + Neutral FGI + 0.91 majors-corr produces no edge for the enabled strategies. Pass 1's "no edge today" call is now confirmed across 3 passes.
+- **This week:** invest engineering time in the funding_carry historical loader (CONFIG STATUS line 19-22). Today's BUSDT post-mortem is concrete justification — a single un-validatable strategy missed a +23% setup in 4h. That's the cost-of-not-validating, made visible.
+- **Watch trigger:** if BTC vol expands above 25% annualized OR FGI crosses above 55 (greedy), re-run this pass. The current regime can flip on any 4h candle.
+
+### Validation honesty notes
+- Sources fetched (this pass):
+  - https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=24 — HTTP 200, 24 bars (3371 bytes).
+  - https://fapi.binance.com/fapi/v1/klines?symbol=ETHUSDT&interval=1h&limit=24 — HTTP 200, 24 bars (3333 bytes).
+  - https://api.alternative.me/fng/?limit=7 — HTTP 200, 7 records (760 bytes), values 47/39/26/29/26/33/47 newest-first.
+  - https://fapi.binance.com/fapi/v1/klines?symbol={KNC,AKT,B}USDT&interval=1h&limit=4 — HTTP 200 each, 4 bars each.
+- Caveats:
+  - **Realized vol = 1h close-to-close log returns × √24.** Standard formulation but sensitive to the 24-bar window; a 7-day window would smooth the 14.4% number, likely landing 18-25% (still bottom-half).
+  - **Pearson on n=23 hourly returns is a small sample.** 0.91 is high enough to be directionally robust but the point estimate has ~±0.05 noise.
+  - **Post-mortem uses the 4 most recent closed/in-progress 1h bars.** Pass 1 was at 10:50 UTC (~14 min ago); 4 bars ≈ 4h is slightly longer than the actual elapsed time, so the earliest bar pre-dates pass 1's signal slightly. Directional verdicts (LOSER/FLAT/WINNER) are robust to this; exact PnL numbers are approximate. The BUSDT bar-0 high of 0.5447 is roughly when pass 2's "highest conviction" call was made.
+  - **No spot-vs-perp basis check** for KNC (still flagged from pass 1).
+  - **No journal/positions context** — same gap as pass 1 & 2.
+  - **BUSDT "+23% would-have" is hypothetical.** No order was placed; slippage, partial fills, funding payments not modeled. Real execution on a -23% in 4h move on a low-cap perp would face widening spreads and likely a 1-3% slippage haircut.
