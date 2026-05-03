@@ -37,6 +37,15 @@ MIN_SCORE_TO_TRADE = 60
 MAX_POSITIONS = 4
 MAX_BALANCE_DEPLOYED_PCT = 0.80
 MAX_DECISIONS_PER_TICK = 3
+
+# Position sizing — percentage of balance per score tier. Actual size is
+# capped by env.max_position_usd (constitution-protected absolute ceiling).
+# Tiers chosen to scale with capital: at balance=$50 + cap=$20 these
+# behave like the prior hardcoded $20/$15/$12 floors; at balance=$1000
+# + raised cap they actually deploy proportional capital.
+MAX_POSITION_PCT_HIGH = 0.40   # score >= 80
+MAX_POSITION_PCT_MED  = 0.30   # score >= 60
+MAX_POSITION_PCT_LOW  = 0.20   # score < 60 (only matters if MIN_SCORE drops)
 CHOP_TIMEOUT_MS = 60 * 60 * 1000  # 60 min
 PUMP_DURATION_LIMIT_HOURS = 8
 RE_ENTRY_COOLDOWN_MS = 30 * 60 * 1000  # 30 min cooldown before re-entry
@@ -187,6 +196,23 @@ def _score_signal(
     elif accel_1h > 5:
         score += 30
         factors.append(f"1h accel {accel_1h:+.1f}% +30")
+
+    # Momentum breakout — strong intraday continuation. Claims strategy_type
+    # so STRATEGY_RISK uses the wider 12%/30% params (vs DEFAULT 10%/20%)
+    # letting trending winners run to a 30% target before exit. Distinct
+    # from late-pump (>100%) which hits a different penalty branch.
+    # Conditions: meaningful trend (15-100% in 24h), strong intraday push
+    # (accel >8%/h), liquid (vol > $50M). The score bonus stacks with the
+    # existing accel +50/+30 to reach 80+ comfortably.
+    if (accel_1h > 8 and 15 < price_change_24h < 100
+            and volume_24h > 50_000_000):
+        score += 15
+        factors.append(
+            f"momentum breakout: 24h {price_change_24h:+.0f}% + "
+            f"accel {accel_1h:+.1f}% + vol $({volume_24h/1e6:.0f}M) +15"
+        )
+        if strategy_type == signal_type:
+            strategy_type = "momentum_breakout"
 
     # Funding squeeze. Score bonus always applies, but strategy_type
     # attribution only claimed if signal arrived as the default type.
@@ -548,13 +574,18 @@ class RuleBrain:
         decisions: list[TradeDecision] = list(close_decisions)
         remaining_budget = (self.balance * MAX_BALANCE_DEPLOYED_PCT) - total_deployed
 
+        # Sizing: percentage of balance per tier, capped by env.max_position_usd
+        # (constitution-protected absolute ceiling). Removing the prior hardcoded
+        # $20/$15/$12 floors lets percentage sizing actually scale with capital.
+        from src.config import env as _env
+        _max_usd = _env.max_position_usd
         for s in top_signals:
             if s.score >= 80:
-                size_usd = min(20.0, self.balance * 0.35)
+                size_usd = min(_max_usd, self.balance * MAX_POSITION_PCT_HIGH)
             elif s.score >= 60:
-                size_usd = min(15.0, self.balance * 0.25)
+                size_usd = min(_max_usd, self.balance * MAX_POSITION_PCT_MED)
             else:
-                size_usd = min(12.0, self.balance * 0.20)
+                size_usd = min(_max_usd, self.balance * MAX_POSITION_PCT_LOW)
             size_usd = min(size_usd, remaining_budget)
 
             if size_usd < 5:
