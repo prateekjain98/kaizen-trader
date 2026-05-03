@@ -11,6 +11,15 @@ fresh n>=30 + ROBUST t-test verdict per scripts/run_live_backtest.py):
 - `FUNDING_CARRY_ENABLED=0` — prior +$5.53 backtest was fabricated by 3
   compounding bugs (re-entry cooldown sim-time clock, filter-chain bypass,
   exit-attribution wick-vs-carry-pnl). See data_streams.py:757-767.
+  **VALIDATION-IMPOSSIBLE-IN-CURRENT-HARNESS:** 90d split=3 walk-forward
+  on 2026-05-03 (commit pending) ran with `include_funding_carry=True`
+  (default). Result: 0 funding_carry trades fired — the historical
+  cross-sectional rank events are not synthesized by `live_replay.py`.
+  Backtest can only measure stable_flow_bull (which it does: n=32,
+  mean +0.8%, t=1.15 PRELIMINARY, 1/3 windows negative). To validate
+  carry, the harness needs: (a) historical 8h-boundary funding rank
+  data per symbol, (b) loader that emits carry_event_type packets at
+  rank tail percentiles. Until those exist, carry stays disabled.
 - `LIQUIDATION_CASCADE_ENABLED=0` — sweep at multiple thresholds yields
   n=6 max events over 90d on 8 majors. INSUFFICIENT for verdict.
 - `OB_IMBALANCE_ENABLED=0` — historical L2 depth not available, OOS
