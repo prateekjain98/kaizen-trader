@@ -138,8 +138,9 @@ def test_trailing_stop_activates_and_overrides_stop_price(executor):
     # Drop to 107 — should hit trailing stop
     executor.update_price("TRAIL", 107.0)
     assert len(executor.positions) == 0
-    # exit reason is still "stop" — trailing is silent in the reason field
-    assert executor.closed_trades[-1].exit_reason == "stop"
+    # exit reason should be "trail" when trailing_stop_price moved off entry
+    # (logging-attribution fix — prior code conflated trail with hard stop)
+    assert executor.closed_trades[-1].exit_reason == "trail"
 
 
 def test_trailing_stop_does_not_move_down(executor):

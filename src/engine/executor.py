@@ -916,11 +916,19 @@ class Executor:
                     if new_trail < current:
                         pos.trailing_stop_price = new_trail
 
-            # Check stop loss (uses trailing if active)
+            # Check stop loss (uses trailing if active).
+            # Logging-attribution fix: if the trailing stop is what triggered
+            # (trailing_stop_price > 0 means trail has moved off entry-stop),
+            # label as "trail" not "stop" so prod close-reason histogram can
+            # distinguish locked-in profit exits from real loss exits. Prior
+            # code conflated them — a trail at +5% locked profit and a hard
+            # stop at -10% both reported "stop", muddying performance analysis.
+            _exit_reason_long = "trail" if pos.trailing_stop_price > 0 else "stop"
+            _exit_reason_short = "trail" if pos.trailing_stop_price > 0 else "stop"
             if pos.side == "long" and price <= pos.stop_price:
-                self._close_position(pos, price, "stop")
+                self._close_position(pos, price, _exit_reason_long)
             elif pos.side == "short" and price >= pos.stop_price:
-                self._close_position(pos, price, "stop")
+                self._close_position(pos, price, _exit_reason_short)
 
             # Check take profit
             elif pos.side == "long" and price >= pos.target_price:
