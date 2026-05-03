@@ -34,6 +34,15 @@ fresh n>=30 + ROBUST t-test verdict per scripts/run_live_backtest.py):
   larger universe (50+ symbols not just the 27 we have), (b) tighter
   carry-rank threshold (e.g. top 2% not top 10%), (c) trade-direction
   cooldown so back-to-back losing carries don't cascade.
+  **365d follow-up (2026-05-03):** n now CLEARS the 100-threshold
+  (n=110 ALL, n=59 carry, n=50 stable). All 3 windows positive!
+  But t-stats remain sub-ROBUST: ALL t=0.48, carry t=0.38, stable
+  t=0.58 — all PRELIMINARY. Positive directional evidence, but
+  stdev (4.6% per trade) too wide to clear Bonferroni α=0.0025.
+  W3 (most-recent year) +$0.04 over 69 trades = essentially FLAT —
+  current regime is barely paying. **No ROBUST verdict achievable
+  with current implementation.** Strategies have edge but it's noisy.
+  Disabled stays disabled per constitution.
 - `LIQUIDATION_CASCADE_ENABLED=0` — sweep at multiple thresholds yields
   n=6 max events over 90d on 8 majors. INSUFFICIENT for verdict.
 - `OB_IMBALANCE_ENABLED=0` — historical L2 depth not available, OOS
