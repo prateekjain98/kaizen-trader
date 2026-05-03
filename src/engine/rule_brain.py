@@ -193,11 +193,19 @@ def _score_signal(
         if accel_1h > 5:
             strategy_type = "funding_squeeze"
 
-    # Correlation break — alts underperforming BTC
+    # Correlation break — alts underperforming BTC.
+    # Score bonus always applies, but strategy_type attribution is only
+    # claimed if no higher-priority strategy (funding_squeeze, etc.) has
+    # already taken it. P0 fix: prior unconditional overwrite was applying
+    # correlation_break risk params (stop 8% / target 15%) to funding_squeeze
+    # entries (intended stop 10% / target 25%), causing tighter stops and
+    # under-targeting. This explains the 7d prod pattern of fast_cut at -2%
+    # before targets could fire.
     if abs(btc_divergence) > 1.5 and symbol in BLUE_CHIP_ALTS:
         score += 20
         factors.append(f"corr break vs BTC {btc_divergence:+.1f}% +20")
-        strategy_type = "correlation_break"
+        if strategy_type == signal_type:
+            strategy_type = "correlation_break"
 
     # Volume
     if volume_24h > 500_000_000:
