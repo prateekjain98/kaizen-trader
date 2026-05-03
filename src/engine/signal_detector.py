@@ -279,11 +279,11 @@ class SignalDetector:
             reasoning=f"x-sec funding carry rank={rank*100:.0f}% rate={rate*100:+.3f}% — {side_hint}",
             suggested_side=side_hint,
             suggested_stop_pct=0.06, suggested_target_pct=0.10,
-            data={
-                "funding_rate": rate,
-                "funding_rank_pct": rank,
-                "mark_price": price,
-            },
+            # P0 audit fix: pass full upstream data through. Prior truncated
+            # dict killed the brain's accel_1h (+50/+30) and btc_divergence
+            # (+20) bonuses for ALL carry signals — only rank-based scoring
+            # could fire. Carry-specific keys layered ON TOP for precedence.
+            data={**d, "funding_rate": rate, "funding_rank_pct": rank, "mark_price": price},
         )
 
     def _process_fgi(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
@@ -314,7 +314,13 @@ class SignalDetector:
         return None
 
     def _process_trending(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
-        """Token just entered CoinGecko trending — potential momentum play."""
+        """Token just entered CoinGecko trending — potential momentum play.
+
+        P0 audit fix below: skip when 24h change <= 0. Prior code emitted with
+        suggested_side="" for negative-change tokens; brain's `or _strat_default`
+        fallback then forced a LONG entry on a falling token. Trending without
+        positive momentum is a fade candidate, not a long-momentum play.
+        """
         rank = signal.data.get("rank", 99)
         symbol = signal.symbol
 
@@ -327,6 +333,9 @@ class SignalDetector:
         price = dex["price_usd"] if dex else 0
         volume = dex["volume_24h"] if dex else 0
         change = dex["price_change_24h"] if dex else 0
+        # P0: drop trending entries without positive momentum
+        if change <= 0:
+            return None
 
         return SignalPacket(
             signal_id=sid, symbol=symbol, signal_type="trending_breakout",
@@ -334,15 +343,23 @@ class SignalDetector:
             price_usd=price, volume_24h=volume, price_change_24h=change,
             fear_greed_index=snapshot.fear_greed_index,
             reasoning=f"#{rank} trending on CoinGecko. 24h volume ${volume:,.0f}, change {change:+.1f}%.",
-            suggested_side="long" if change > 0 else "",
+            suggested_side="long",
             suggested_stop_pct=0.08, suggested_target_pct=0.15,
             data=signal.data,
         )
 
     def _process_major_pump(self, sid: str, signal: TokenSignal, snapshot: MarketSnapshot) -> Optional[SignalPacket]:
-        """Major pump detected (>50% in 24h with volume) — inform Claude for analysis."""
+        """Major pump detected (>50% in 24h with volume) — inform Claude for analysis.
+
+        P1 audit fix: emit explicit suggested_side based on continuation vs
+        exhaustion. Prior code omitted suggested_side, making brain default
+        to long via `_strat_default`. Now: continuing momentum (positive
+        change + accel) → long; otherwise fade short. Future tuning may
+        gate this with an upstream filter.
+        """
         change = signal.data.get("change_pct", 0)
         volume = signal.data.get("volume_24h", 0)
+        accel_1h = signal.data.get("acceleration_1h", 0)
         symbol = signal.symbol
         price = snapshot.prices.get(symbol, 0)
 
@@ -352,6 +369,7 @@ class SignalDetector:
             price_usd=price, volume_24h=volume, price_change_24h=change,
             fear_greed_index=snapshot.fear_greed_index,
             reasoning=f"{symbol} +{change:.0f}% in 24h with ${volume:,.0f} volume. Evaluate: is momentum continuing or exhausted?",
+            suggested_side="long" if (change > 0 and accel_1h > 5) else "short",
             data=signal.data,
         )
 
