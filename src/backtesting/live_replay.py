@@ -252,6 +252,7 @@ def _simulate_exit(
     stop_pct: float,
     target_pct: float,
     symbol: str = "",
+    apply_fast_cut: bool = True,
 ) -> tuple[int, float, str]:
     """Walk forward bar-by-bar mirroring prod executor.update_price.
 
@@ -321,7 +322,7 @@ def _simulate_exit(
             return i, target, "target"
 
         # --- Fast-cut: sustained-downtrend gate ---
-        if not fast_cut_exempt:
+        if apply_fast_cut and not fast_cut_exempt:
             if side == "long":
                 underwater = close <= entry_price * (1 + FAST_CUT_PNL_THRESHOLD)
             else:
@@ -358,6 +359,7 @@ def replay(
     liquidation_min_usd_5m: float = 1_500_000.0,
     apply_regime_gate: bool = True,
     apply_slippage: bool = True,
+    apply_fast_cut: bool = True,
     min_score_override: Optional[int] = None,
 ) -> BacktestResult:
     """Run the live RuleBrain over historical funding events, simulate fills.
@@ -1144,7 +1146,7 @@ def replay(
 
             exit_idx, exit_price, reason = _simulate_exit(
                 d_klines, entry_idx, entry_price, d.side, d.stop_pct, d.target_pct,
-                symbol=d.symbol,
+                symbol=d.symbol, apply_fast_cut=apply_fast_cut,
             )
 
             # Apply exit slippage (adverse to closing direction).

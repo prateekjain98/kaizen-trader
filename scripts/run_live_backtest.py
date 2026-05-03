@@ -51,6 +51,10 @@ def main() -> int:
                    help="Disable cross-sectional funding-carry event replay")
     p.add_argument("--no-regime-gate", action="store_true",
                    help="Disable realised-vol regime-switch meta-gate (ablation; default ON)")
+    p.add_argument("--no-fast-cut", action="store_true",
+                   help="Disable fast-cut early-exit (ablation; default ON). "
+                        "Tests whether the -2% sustained-downtrend cut is "
+                        "saving losses vs cutting trades that would recover.")
     p.add_argument("--no-slippage", action="store_true",
                    help="Disable per-symbol slippage model (ablation; default ON). "
                         "With slippage OFF, backtest will OVER-state PnL vs live "
@@ -109,6 +113,7 @@ def main() -> int:
                         include_chain_flow=not args.no_chain_flow,
                         apply_regime_gate=not args.no_regime_gate,
                         apply_slippage=not args.no_slippage,
+                        apply_fast_cut=not args.no_fast_cut,
                         min_score_override=args.min_score)
         elapsed = time.time() - t0
         all_results.append(result)
