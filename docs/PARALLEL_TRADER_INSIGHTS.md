@@ -11,15 +11,20 @@ fresh n>=30 + ROBUST t-test verdict per scripts/run_live_backtest.py):
 - `FUNDING_CARRY_ENABLED=0` — prior +$5.53 backtest was fabricated by 3
   compounding bugs (re-entry cooldown sim-time clock, filter-chain bypass,
   exit-attribution wick-vs-carry-pnl). See data_streams.py:757-767.
-  **VALIDATION-IMPOSSIBLE-IN-CURRENT-HARNESS:** 90d split=3 walk-forward
-  on 2026-05-03 (commit pending) ran with `include_funding_carry=True`
-  (default). Result: 0 funding_carry trades fired — the historical
-  cross-sectional rank events are not synthesized by `live_replay.py`.
-  Backtest can only measure stable_flow_bull (which it does: n=32,
-  mean +0.8%, t=1.15 PRELIMINARY, 1/3 windows negative). To validate
-  carry, the harness needs: (a) historical 8h-boundary funding rank
-  data per symbol, (b) loader that emits carry_event_type packets at
-  rank tail percentiles. Until those exist, carry stays disabled.
+  **CORRECTION (2026-05-03):** prior "VALIDATION-IMPOSSIBLE" claim was
+  WRONG. The harness HAS a working `funding_carry_loader.py` reconstructor;
+  validation just needs `--symbols` to cover the full 27-symbol
+  `_CARRY_LIQUID_UNIVERSE` (default CLI passes only 8 majors which is
+  exactly `_MIN_SYMBOLS_FOR_RANKING`, making ranks degenerate).
+  **Honest validation, 90d split=3, 27 symbols, 2026-05-03:**
+    All 3 windows positive (W1 +\$3.91 / W2 +\$2.95 / W3 +\$0.63)
+    Total: 62 trades, +\$7.49 (+15% on \$50 balance over 90d)
+    Carry isolated: n=32, mean +0.83%/trade, t=0.68, sum +\$5.63
+    Aggregate: n=62, mean +0.61%, t=0.83 → **PRELIMINARY** (n<100, t<2.81)
+  Verdict gate per constitution: PRELIMINARY < ROBUST → DO NOT flip env.
+  Need n≥100 with t>2.81 (Bonferroni α=0.0025). Next step: 180d run, OR
+  document the PRELIMINARY+all-windows-positive as a softer-tier signal
+  worth shipping with explicit smaller sizing.
 - `LIQUIDATION_CASCADE_ENABLED=0` — sweep at multiple thresholds yields
   n=6 max events over 90d on 8 majors. INSUFFICIENT for verdict.
 - `OB_IMBALANCE_ENABLED=0` — historical L2 depth not available, OOS
