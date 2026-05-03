@@ -22,9 +22,18 @@ fresh n>=30 + ROBUST t-test verdict per scripts/run_live_backtest.py):
     Carry isolated: n=32, mean +0.83%/trade, t=0.68, sum +\$5.63
     Aggregate: n=62, mean +0.61%, t=0.83 → **PRELIMINARY** (n<100, t<2.81)
   Verdict gate per constitution: PRELIMINARY < ROBUST → DO NOT flip env.
-  Need n≥100 with t>2.81 (Bonferroni α=0.0025). Next step: 180d run, OR
-  document the PRELIMINARY+all-windows-positive as a softer-tier signal
-  worth shipping with explicit smaller sizing.
+  Need n≥100 with t>2.81 (Bonferroni α=0.0025).
+  **180d follow-up (2026-05-03, commit pending):** carry edge does NOT
+  hold up. n=47 carry trades, mean +0.024%/trade, t=+0.03 (pure noise).
+  Per-window: W1 +\$0.39 / W2 **-\$1.06** / W3 +\$1.82 — NOT all-positive.
+  90d's "all-windows-positive" was a small-sample artifact. 180d aggregate
+  ALL: n=94, mean +0.27%, t=0.57 PRELIMINARY (mostly carried by
+  stable_flow_bull which IS positive in 2 of 3 windows).
+  **CONCLUSION: funding_carry edge is not robust at the 180d horizon.**
+  Stays disabled. Re-attempt only after harness is extended with: (a)
+  larger universe (50+ symbols not just the 27 we have), (b) tighter
+  carry-rank threshold (e.g. top 2% not top 10%), (c) trade-direction
+  cooldown so back-to-back losing carries don't cascade.
 - `LIQUIDATION_CASCADE_ENABLED=0` — sweep at multiple thresholds yields
   n=6 max events over 90d on 8 majors. INSUFFICIENT for verdict.
 - `OB_IMBALANCE_ENABLED=0` — historical L2 depth not available, OOS
