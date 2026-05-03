@@ -55,6 +55,10 @@ def main() -> int:
                    help="Enable liquidation_cascade event replay (default OFF, "
                         "matches prod env-var gate LIQUIDATION_CASCADE_ENABLED). "
                         "Use to validate before flipping prod env var.")
+    p.add_argument("--liq-min-usd", type=float, default=1_500_000.0,
+                   help="Minimum 5min liquidation USD to trigger cascade event "
+                        "(default 1500000). Lower = more events; useful for "
+                        "threshold sweeps to reach n>=30 verdict tier.")
     p.add_argument("--no-fast-cut", action="store_true",
                    help="Disable fast-cut early-exit (ablation; default ON). "
                         "Tests whether the -2% sustained-downtrend cut is "
@@ -116,6 +120,7 @@ def main() -> int:
                         include_funding_carry=not args.no_funding_carry,
                         include_chain_flow=not args.no_chain_flow,
                         include_liquidation_cascade=args.liq_cascade,
+                        liquidation_min_usd_5m=args.liq_min_usd,
                         apply_regime_gate=not args.no_regime_gate,
                         apply_slippage=not args.no_slippage,
                         apply_fast_cut=not args.no_fast_cut,
