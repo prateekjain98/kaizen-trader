@@ -154,7 +154,13 @@ def _score_signal(
     volume_24h = signal.volume_24h or 0
     funding_rate = funding_rates.get(symbol, signal.funding_rate or 0)
     accel_1h = float(data.get("acceleration_1h", 0))
-    pump_hours = float(data.get("pump_duration_hours", 0))
+    # P2 audit fix: signal_detector never emits `pump_duration_hours`, so
+    # this field is always missing. Default of 0 made the late-pump leniency
+    # branch (line ~360) always fire (-10 instead of -30) on any accelerating
+    # signal with price_change_24h > 100%, regardless of how stale the move
+    # actually was. Default to limit+1 so unknown-pump-age is treated as
+    # stale; signal_detector can later populate the real value to override.
+    pump_hours = float(data.get("pump_duration_hours", PUMP_DURATION_LIMIT_HOURS + 1))
     btc_divergence = float(data.get("btc_divergence_4h", 0))
     # CORRECTNESS (audit — brain/filter): live signal_detector populates
     # the field as `age_hours` (from data_streams TokenSignal.data), backtest
