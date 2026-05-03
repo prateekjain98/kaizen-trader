@@ -37,6 +37,8 @@ from src.engine.log import log
 from src.risk.loss_cooldown import (
     is_symbol_on_cooldown,
     record_symbol_result,
+    is_on_cooldown as is_strategy_on_cooldown,
+    record_trade_result as record_strategy_result,
 )
 
 def _fetch_binance_account_balance() -> float | None:
@@ -345,6 +347,13 @@ class TradingEngine:
                         if is_symbol_on_cooldown(decision.symbol):
                             log("info", f"BLOCKED {decision.action} {decision.symbol} (symbol loss cooldown active)")
                             continue
+                        # Per-strategy loss cooldown (3 losses → 30min shutoff).
+                        # Was wired only in src/main.py; runner path missed it
+                        # entirely, leaving the protection disabled in prod.
+                        _strat = getattr(decision, "strategy", None) or getattr(decision, "signal_type", "")
+                        if _strat and is_strategy_on_cooldown(_strat):
+                            log("info", f"BLOCKED {decision.action} {decision.symbol} (strategy '{_strat}' loss cooldown)")
+                            continue
                         # Get live price for the symbol
                         prices = fetch_binance_prices([decision.symbol], snapshot=self.streams.snapshot)
                         price = prices.get(decision.symbol, 0)
@@ -375,6 +384,8 @@ class TradingEngine:
                                 pnl_pct = last_closed.pnl_pct * 100
                                 pnl_usd = last_closed.pnl_usd
                                 record_symbol_result(pos.symbol, pnl_usd >= 0)
+                                if pos.signal_type:
+                                    record_strategy_result(pos.signal_type, pnl_usd >= 0)
                                 self.trades_closed += 1
                                 self.memory.record_trade(
                                     symbol=pos.symbol,
@@ -425,9 +436,12 @@ class TradingEngine:
                                       if t.position.symbol == sym]
                             if closed:
                                 latest = closed[-1]
-                                # Per-symbol cooldown bookkeeping for stop/target closes
+                                # Per-symbol + per-strategy cooldown bookkeeping
                                 _pnl = latest.pnl_usd if hasattr(latest, 'pnl_usd') else 0
                                 record_symbol_result(sym, _pnl >= 0)
+                                _strat = latest.position.signal_type
+                                if _strat:
+                                    record_strategy_result(_strat, _pnl >= 0)
                                 self.brain.review_trade({
                                     "trade_id": latest.position.id,
                                     "symbol": sym,
@@ -468,6 +482,8 @@ class TradingEngine:
                         # Capture pnl BEFORE close (current_price still set)
                         _tb_pnl = pos.unrealized_pnl_usd if hasattr(pos, 'unrealized_pnl_usd') else 0
                         record_symbol_result(pos.symbol, _tb_pnl >= 0)
+                        if pos.signal_type:
+                            record_strategy_result(pos.signal_type, _tb_pnl >= 0)
                         self.executor._close_position(pos, pos.current_price, "thesis_break")
                         if self.memory:
                             self.memory.record_trade(pos.symbol, pos.unrealized_pnl_pct * 100, pos.unrealized_pnl_usd if hasattr(pos, 'unrealized_pnl_usd') else 0, "thesis_break", pos.signal_type, pos.hold_hours)
