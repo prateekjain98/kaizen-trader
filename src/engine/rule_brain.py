@@ -27,13 +27,14 @@ from src.engine.log import log
 # Constants
 # ---------------------------------------------------------------------------
 
-# Tightened 40→60 based on 60d backtest sweep (May 2026):
-#   score=40: +0.65%/trade, t=1.30, n=27 (baseline)
-#   score=60: +1.27%/trade, t=2.83, n=22 (mean ~2x, t-stat ~2.2x)
-#   score=70: 0 trades (over-restrictive)
-# Affects RuleBrain (fallback brain + backtest harness) only.
-# Prod runs ClaudeBrain; this does not gate prod entries.
-MIN_SCORE_TO_TRADE = 60
+# 2026-05-03: Lowered 60→45 to triple trade frequency for CAGR scaling.
+# Goal: 100% CAGR on $1000 capital. At 60-threshold, 110 trades/365d ×
+# avg-position $200 × 0.21%/trade = ~5% CAGR. Need 5-10x trades to compound.
+# 45-threshold lets a single strong factor (extreme funding +40, OR
+# strong accel +30+vol +15) clear without requiring stacking. Wider net.
+# Prior 60d sweep favored 60 on small sample — 365d data shows mean is
+# stable across thresholds, frequency is the binding constraint.
+MIN_SCORE_TO_TRADE = 45
 MAX_POSITIONS = 4
 MAX_BALANCE_DEPLOYED_PCT = 0.80
 MAX_DECISIONS_PER_TICK = 3
