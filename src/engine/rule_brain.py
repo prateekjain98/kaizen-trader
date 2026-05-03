@@ -27,7 +27,13 @@ from src.engine.log import log
 # Constants
 # ---------------------------------------------------------------------------
 
-MIN_SCORE_TO_TRADE = 40
+# Tightened 40→60 based on 60d backtest sweep (May 2026):
+#   score=40: +0.65%/trade, t=1.30, n=27 (baseline)
+#   score=60: +1.27%/trade, t=2.83, n=22 (mean ~2x, t-stat ~2.2x)
+#   score=70: 0 trades (over-restrictive)
+# Affects RuleBrain (fallback brain + backtest harness) only.
+# Prod runs ClaudeBrain; this does not gate prod entries.
+MIN_SCORE_TO_TRADE = 60
 MAX_POSITIONS = 4
 MAX_BALANCE_DEPLOYED_PCT = 0.80
 MAX_DECISIONS_PER_TICK = 3
