@@ -70,7 +70,10 @@ from src.indicators.core import (
 from src.indicators.cvd import push_trade as push_cvd_trade, get_cvd_snapshot
 from src.indicators.regime import classify_regime
 from src.types import ScannerConfig, MarketContext, Position, TradeSignal
-from src.risk.loss_cooldown import is_on_cooldown, record_trade_result
+from src.risk.loss_cooldown import (
+    is_on_cooldown, record_trade_result,
+    is_symbol_on_cooldown, record_symbol_result,
+)
 from src.risk.regime_gate import is_regime_blocked
 from src.risk.scaling import get_initial_fraction, get_max_tranches, should_add_tranche, compute_tranche_size_usd
 from src.risk.adaptive_stops import compute_adaptive_stop
@@ -389,9 +392,17 @@ def _process_signal(signal: TradeSignal, ctx: MarketContext) -> None:
             symbol=signal.symbol, strategy=signal.strategy)
         return
 
-    # Consecutive loss cooldown check
+    # Consecutive loss cooldown check (per-strategy)
     if is_on_cooldown(signal.strategy):
         log("info", f"Signal blocked (loss cooldown): {signal.strategy} {signal.symbol}",
+            symbol=signal.symbol, strategy=signal.strategy)
+        return
+
+    # Per-symbol loss cooldown — independent of strategy.
+    # Trips after 2 consecutive losses on same symbol; 4h shutoff.
+    # Motivation: prod re-entered KNC 6× for -$2.08 net in 7d (May 2026).
+    if is_symbol_on_cooldown(signal.symbol):
+        log("info", f"Signal blocked (symbol loss cooldown): {signal.strategy} {signal.symbol}",
             symbol=signal.symbol, strategy=signal.strategy)
         return
 
@@ -1183,8 +1194,9 @@ def _check_single_exit(pos: Position, now: float, ctx: MarketContext) -> None:
     # Self-healing: diagnose the trade
     on_position_closed(pos, config, ctx.phase)
 
-    # Track consecutive losses for cooldown
+    # Track consecutive losses for cooldown (strategy + symbol)
     record_trade_result(pos.strategy, pnl_pct >= 0)
+    record_symbol_result(pos.symbol, pnl_pct >= 0)
 
     # Trade journal: structured exit analysis
     try:

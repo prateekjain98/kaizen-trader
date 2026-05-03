@@ -19,6 +19,46 @@ _lock = threading.Lock()
 _consecutive_losses: dict[str, int] = {}  # strategy -> consecutive loss count
 _cooldown_until: dict[str, float] = {}  # strategy -> timestamp when cooldown expires
 
+# Per-symbol cooldown (parallel to per-strategy). Motivation: 7d prod data
+# shows KNC traded 6× for -$2.08 net; brain keeps re-entering despite losses.
+# Symbol-level shutoff after 2 losses for 4h, independent of strategy.
+_SYMBOL_LOSS_THRESHOLD = 2
+_SYMBOL_COOLDOWN_DURATION_S = 4 * 3600  # 4 hours
+_consecutive_symbol_losses: dict[str, int] = {}  # symbol -> consecutive loss count
+_symbol_cooldown_until: dict[str, float] = {}  # symbol -> ts when cooldown expires
+
+
+def record_symbol_result(symbol: str, is_win: bool) -> None:
+    """Record a per-symbol trade outcome and arm cooldown after N losses."""
+    with _lock:
+        if is_win:
+            _consecutive_symbol_losses[symbol] = 0
+            return
+        count = _consecutive_symbol_losses.get(symbol, 0) + 1
+        _consecutive_symbol_losses[symbol] = count
+        if count >= _SYMBOL_LOSS_THRESHOLD:
+            until = time.time() + _SYMBOL_COOLDOWN_DURATION_S
+            _symbol_cooldown_until[symbol] = until
+            log("warn",
+                f"Symbol '{symbol}' in cooldown after {count} consecutive losses "
+                f"(cooldown for {_SYMBOL_COOLDOWN_DURATION_S // 3600}h)",
+                symbol=symbol)
+
+
+def is_symbol_on_cooldown(symbol: str) -> bool:
+    """Check if `symbol` is in per-symbol loss cooldown."""
+    with _lock:
+        until = _symbol_cooldown_until.get(symbol)
+        if until is None:
+            return False
+        if time.time() >= until:
+            del _symbol_cooldown_until[symbol]
+            _consecutive_symbol_losses[symbol] = 0
+            log("info", f"Symbol '{symbol}' cooldown expired — re-enabled",
+                symbol=symbol)
+            return False
+        return True
+
 
 def record_trade_result(strategy: str, is_win: bool) -> None:
     """Record a trade result and manage cooldown state."""
