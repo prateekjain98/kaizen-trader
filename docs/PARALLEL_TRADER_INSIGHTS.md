@@ -41,3 +41,61 @@ the next change to the main bot's rule_brain or signal_detector.
   - **KNC funding magnitude is suspicious** — -0.67% per 8h is annualized ~2,200%. Almost certainly a venue-specific dislocation; spot-vs-perp basis check recommended before any live entry. Did not verify against KNC spot.
   - **FGI is daily-snapshot data** — no intraday refresh; can't compare to 4h-ago.
   - Did not run `tools/post_tightening_report.py` — file present but no recent prod journal data accessible from this worktree path.
+
+## 2026-05-03 10:53 UTC — Parallel Trader Pass (Pass 2)
+### Δ since pass 1 (10:50 UTC, ~3 min later)
+- **BTC: $78,370.70 → $78,384.90** (+$14, +0.018%). Still flat-chop. 24h % barely moved (+0.18% → +0.22%).
+- **FGI: 47 → 47** (Neutral, same daily snapshot — no intraday refresh, as flagged).
+- **Funding regime: essentially identical.** Positive-funding share 59% → 60.5%, median funding +0.0041% → +0.0038% (3.85 bps), mean still dragged negative by KNC (-0.0066% → -0.0066%). No regime shift.
+- **Top movers — same cast.** LAB still -30.79% (was -31.33%, mild bounce of $30M off the floor). TST/BABY/B still leading gainers. AKTUSDT moved up the leaderboard from "rising" to **+28.16% top-5 gainer** with **+6.79% accel in the live 1h bar** — that's the only meaningful intraday delta.
+- **KNC funding -0.6726% → -0.6715%** — still a 3.4x outlier, no normalization. The dislocation is persisting, not resolving. Spot-vs-perp basis check still recommended before sizing.
+
+### Pass 1 marginals re-scored (with live accel_1h pulled this pass)
+| symbol | pass1 score | accel_1h now | new score | promoted? |
+| ------ | ----------- | ------------ | --------- | --------- |
+| KNCUSDT | 55 | **+0.41%** (prev bar -3.89%) | **55** (no change) | **NO** — accel below +5% mega-bonus threshold. Pass 1's "jumps to 85" prediction did NOT trigger; KNC is bouncing weakly off lows, not exploding. |
+| AXLUSDT | 25 | -0.44% | 25 | no |
+| BABYUSDT | ~20 (after late-pump penalty) | **-11.49%** | ~-10 (already-pumped now dumping; reversal trade, not funding squeeze) | no |
+| ENJUSDT | 25 | (not pulled, low vol) | 25 | no |
+| BUSDT | 25 raw | **-9.87%** (now -9.87% in current bar after 24h +30%) | distress mode, short-carry would be tagged — but funding_carry_short loader-emitted only | no |
+| **AKTUSDT (new entrant)** | n/a | **+6.79%** (clears +5% mega-accel) | funding -0.1012% (+25) + accel +30 + vol $31.5M (<$100M, no bonus) = **55** | **NO — vol floor is the blocker**. Drop vol floor from $100M → $30M and AKT scores ~70. |
+
+### Signals scored ≥60 (would-trade under main bot rules)
+| symbol | signal_type | score | factors | suggested_side |
+| ------ | ----------- | ----- | ------- | -------------- |
+| _none_ | — | — | Same as pass 1: zero clean ≥60 from public-API-only scoring. AKTUSDT is the closest miss at 55, blocked by the $100M volume floor. | — |
+
+### Pattern detection — funding outliers vs movers vs volume leaders (NEW this pass)
+**Overlap matrix** (top 10 of each list, vol>$10M universe):
+- **Negative-funding ∩ top-gainers**: KNCUSDT (+6.21%), AXLUSDT (+9.64%), BABYUSDT (+41.23%), AKTUSDT (+28.16%) → 4/10 — these ARE recurring across both lists.
+- **Negative-funding ∩ top-losers**: ENJ (-6.19%), CHIP (-11.00%), ORCA (-7.84%) → 3/10 — also real (these are getting sold WHILE shorts pay longs, classic capitulation).
+- **Negative-funding ∩ top-volume**: BABYUSDT, BIOUSDT (-0.0354% fund, +9.35%), ORCAUSDT — 3/10.
+- **Positive-funding ∩ top-gainers**: BUSDT (+30.11%, fund +0.23%) — 1/10. **This is the textbook short-carry late-pump, and it's the ONE name appearing across all three lists** (top funding, top gainer, top volume).
+- **Top-gainers ∩ top-volume**: BABYUSDT, BUSDT — 2/10.
+
+**Real-money signals (cross-list recurrence):**
+1. **BUSDT** appears in: most-positive-funding (#1, +0.23%), top-gainers (#4, +30%), top-volume (#7, $512M). Now -9.87% in the live 1h bar. **This is the highest-conviction reversal setup of the day** — extreme positive funding + 30% rally + $500M turnover = exhausted longs paying premium. The funding_carry_short strategy SHOULD be picking this up; if it isn't, that's a loader gap to investigate.
+2. **BABYUSDT** appears in: most-negative-funding (#3, -0.16%), top-gainers (#2, +41%), top-volume (#10, $406M). Now -11.49% in live bar — the squeeze already fired and reverted. Late entry would have been chasing.
+3. **LABUSDT** appears in: most-positive-funding (#3, +0.11%), top-losers (#1, -30.79%), top-volume (#2, $3.66B). Capitulation already happened; positive funding now means lingering longs holding bags. Skip.
+
+**Pattern verdict:** the cross-list recurrence test is working — names that show up in 3 lists are the ones the bot's strategies should be eating. The fact that NONE of them score ≥60 in main brain rules suggests either (a) MIN_SCORE_TO_TRADE is too tight for the current sleepy regime, or (b) the carry/squeeze loaders aren't surfacing the BUSDT-class setups.
+
+### Insights for main agent
+- **Pass 1's KNC prediction was wrong (in a useful way).** The "+5% accel → 85 score" path didn't fire because KNC's accel stayed at +0.41%. Translation: extreme funding alone, even at -0.67%, is NOT triggering a reflexive squeeze rally on this venue right now. The funding outlier is a sustained dislocation, not a coiled spring. **Recommendation:** don't pre-emptively widen MIN_SCORE on funding alone; the squeeze needs price confirmation that isn't materializing.
+- **AKTUSDT is the closest near-miss this pass.** Funding -0.10%, accel +6.79%, but vol $31.5M sits below the $100M floor. Two options: (1) lower the volume floor to $25M for funding_squeeze with mega-accel confirmation, or (2) leave it and accept that this regime produces zero trades — both are defensible.
+- **BUSDT short-carry: highest cross-list conviction.** If `funding_carry_short` strategy did NOT emit BUSDT in the last hour, audit the carry loader — extreme positive funding (+0.23%, ~22% annualized × 365/8 = 250%+ APY) with a 30%-pumped name is exactly its mandate. The price now turning over (-9.87% in live bar) means the trade is half-gone if it wasn't taken at the top.
+- **Regime confirmation: still no edge.** 3 minutes between passes was always going to look identical, but the absence of any 60+ signal across two passes confirms pass 1's "no edge today" call. Don't manufacture trades.
+
+### Validation honesty notes
+- Sources fetched (this pass):
+  - https://api.alternative.me/fng/ — HTTP 200, value=47, timestamp 1777766400 (same record as pass 1; daily refresh 47235s away).
+  - https://fapi.binance.com/fapi/v1/premiumIndex — HTTP 200, ~158KB.
+  - https://fapi.binance.com/fapi/v1/ticker/24hr — HTTP 200, ~224KB.
+  - https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=24 — HTTP 200, 24 bars.
+  - https://fapi.binance.com/fapi/v1/klines?symbol={KNC,AXL,BABY,CHIP,ORCA,CL,B,AKT}USDT&interval=1h&limit=2 — HTTP 200 each, accel_1h computed from current bar (open vs close).
+- Caveats:
+  - **accel_1h here = (close-open)/open of the in-progress 1h bar.** Real signal_detector may use a smoothed or delta-vs-prior-bar definition; magnitudes should be directionally correct but exact thresholds may differ.
+  - **No journal/positions context** (same as pass 1). Hard-filters skipped.
+  - **3-minute gap is too short for FGI/funding regime change** by construction. The "Δ since pass 1" deltas should be read as "what changed in 3 min", not as a trend signal.
+  - **KNC -0.67% funding still un-validated against spot.** The dislocation persists, which weakly suggests it's a real (multi-hour) venue imbalance rather than a stale data point — but spot-vs-perp basis was not checked.
+  - **AKTUSDT 1h accel of +6.79%** computed from the live (in-progress) bar. By the time the bar closes, this could be +3% or +12%; treat as directional, not point-precise.
