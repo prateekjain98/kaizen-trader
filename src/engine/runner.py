@@ -34,6 +34,10 @@ from src.engine.claude_brain import ClaudeBrain
 from src.engine.executor import Executor, _PORTFOLIO_FILE
 from src.engine.correlation_scanner import CorrelationScanner
 from src.engine.log import log
+from src.risk.loss_cooldown import (
+    is_symbol_on_cooldown,
+    record_symbol_result,
+)
 
 def _fetch_binance_account_balance() -> float | None:
     """Fetch USDT balance from the configured exchange account.
@@ -336,6 +340,11 @@ class TradingEngine:
                 # Execute decisions
                 for decision in decisions:
                     if decision.action in ("BUY", "SELL"):
+                        # Per-symbol loss cooldown gate (2 losses → 4h shutoff).
+                        # Fixes prod re-entering KNC 6× for -$2 net in 7d.
+                        if is_symbol_on_cooldown(decision.symbol):
+                            log("info", f"BLOCKED {decision.action} {decision.symbol} (symbol loss cooldown active)")
+                            continue
                         # Get live price for the symbol
                         prices = fetch_binance_prices([decision.symbol], snapshot=self.streams.snapshot)
                         price = prices.get(decision.symbol, 0)
@@ -365,6 +374,7 @@ class TradingEngine:
                                     break
                                 pnl_pct = last_closed.pnl_pct * 100
                                 pnl_usd = last_closed.pnl_usd
+                                record_symbol_result(pos.symbol, pnl_usd >= 0)
                                 self.trades_closed += 1
                                 self.memory.record_trade(
                                     symbol=pos.symbol,
@@ -415,6 +425,9 @@ class TradingEngine:
                                       if t.position.symbol == sym]
                             if closed:
                                 latest = closed[-1]
+                                # Per-symbol cooldown bookkeeping for stop/target closes
+                                _pnl = latest.pnl_usd if hasattr(latest, 'pnl_usd') else 0
+                                record_symbol_result(sym, _pnl >= 0)
                                 self.brain.review_trade({
                                     "trade_id": latest.position.id,
                                     "symbol": sym,
@@ -452,6 +465,9 @@ class TradingEngine:
 
                     if broken:
                         log("trade", f"THESIS BREAK: {pos.symbol} - {reason}")
+                        # Capture pnl BEFORE close (current_price still set)
+                        _tb_pnl = pos.unrealized_pnl_usd if hasattr(pos, 'unrealized_pnl_usd') else 0
+                        record_symbol_result(pos.symbol, _tb_pnl >= 0)
                         self.executor._close_position(pos, pos.current_price, "thesis_break")
                         if self.memory:
                             self.memory.record_trade(pos.symbol, pos.unrealized_pnl_pct * 100, pos.unrealized_pnl_usd if hasattr(pos, 'unrealized_pnl_usd') else 0, "thesis_break", pos.signal_type, pos.hold_hours)
