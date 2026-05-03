@@ -51,6 +51,10 @@ def main() -> int:
                    help="Disable cross-sectional funding-carry event replay")
     p.add_argument("--no-regime-gate", action="store_true",
                    help="Disable realised-vol regime-switch meta-gate (ablation; default ON)")
+    p.add_argument("--liq-cascade", action="store_true",
+                   help="Enable liquidation_cascade event replay (default OFF, "
+                        "matches prod env-var gate LIQUIDATION_CASCADE_ENABLED). "
+                        "Use to validate before flipping prod env var.")
     p.add_argument("--no-fast-cut", action="store_true",
                    help="Disable fast-cut early-exit (ablation; default ON). "
                         "Tests whether the -2% sustained-downtrend cut is "
@@ -111,6 +115,7 @@ def main() -> int:
                         include_stable_flow=not args.no_stable_flow,
                         include_funding_carry=not args.no_funding_carry,
                         include_chain_flow=not args.no_chain_flow,
+                        include_liquidation_cascade=args.liq_cascade,
                         apply_regime_gate=not args.no_regime_gate,
                         apply_slippage=not args.no_slippage,
                         apply_fast_cut=not args.no_fast_cut,
