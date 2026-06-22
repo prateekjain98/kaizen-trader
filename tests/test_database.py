@@ -96,9 +96,10 @@ class TestWriteOperations:
     def test_log_enqueues_and_prints(self, mock_client, caplog):
         import logging
         storage, client = mock_client
+        # warn/error/trade are the levels persisted to Convex (info is print-only).
         with caplog.at_level(logging.INFO):
-            storage.log("info", "Test message", symbol="ETH")
-        assert "[INFO]" in caplog.text
+            storage.log("warn", "Test message", symbol="ETH")
+        assert "[WARN]" in caplog.text
         assert "Test message" in caplog.text
         assert storage.pending_count == 1
 

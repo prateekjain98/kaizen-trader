@@ -15,7 +15,7 @@ Key principles:
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from src.engine.claude_brain import TradeDecision
@@ -494,9 +494,8 @@ class RuleBrain:
         self.reddit_sentiment: float = 0.0
         self.reddit_post_count: int = 0
 
-        # Cross-session memory and acceleration (set by runner)
+        # Cross-session memory (set by runner)
         self.memory = None  # BrainMemory instance, set by runner
-        self.acceleration_data: dict[str, float] = {}  # set by runner from AccelerationTracker
 
         # Internal state for learning from results
         self._recently_closed: dict[str, dict] = {}  # symbol -> last closed trade info

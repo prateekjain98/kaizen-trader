@@ -14,7 +14,7 @@ import requests
 from src.config import env
 from src.storage.database import log
 from src.types import Trade
-from src.utils.binance_symbols import BINANCE_SYMBOL_MAP, to_binance_ticker
+from src.utils.binance_symbols import to_binance_ticker
 
 
 def _failed_trade(position_id: str, symbol: str, side: str, error: str) -> Trade:

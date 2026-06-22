@@ -923,12 +923,11 @@ class Executor:
             # distinguish locked-in profit exits from real loss exits. Prior
             # code conflated them — a trail at +5% locked profit and a hard
             # stop at -10% both reported "stop", muddying performance analysis.
-            _exit_reason_long = "trail" if pos.trailing_stop_price > 0 else "stop"
-            _exit_reason_short = "trail" if pos.trailing_stop_price > 0 else "stop"
+            _exit_reason = "trail" if pos.trailing_stop_price > 0 else "stop"
             if pos.side == "long" and price <= pos.stop_price:
-                self._close_position(pos, price, _exit_reason_long)
+                self._close_position(pos, price, _exit_reason)
             elif pos.side == "short" and price >= pos.stop_price:
-                self._close_position(pos, price, _exit_reason_short)
+                self._close_position(pos, price, _exit_reason)
 
             # Check take profit
             elif pos.side == "long" and price >= pos.target_price:

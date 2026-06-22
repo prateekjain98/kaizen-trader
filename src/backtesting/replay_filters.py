@@ -34,7 +34,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from src.backtesting.oi_loader import load_open_interest
 
 
 # ─── Constants kept in lock-step with src.engine.entry_filters ───────────

@@ -20,7 +20,6 @@ sorted by ts_ms.
 
 from __future__ import annotations
 
-from typing import Optional
 
 from src.backtesting.data_loader import load_klines
 

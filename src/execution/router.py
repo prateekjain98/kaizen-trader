@@ -6,7 +6,6 @@ Routing logic:
 """
 
 import threading
-from typing import Optional
 
 from src.config import env
 from src.execution.protocol import ExecutionProvider

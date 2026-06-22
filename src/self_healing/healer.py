@@ -36,7 +36,7 @@ def _classify_loss_reason(p: Position, config: ScannerConfig) -> LossReason:
 
     # Use stored momentum at entry time (frozen at open), not low_watermark
     # which tracks worst price during hold and gives false "pump top" diagnoses
-    momentum_at_entry = getattr(p, "momentum_at_entry", 0.0) or 0.0
+    momentum_at_entry = p.momentum_at_entry or 0.0
 
     # Priority: check stop_too_tight BEFORE pump_top — short holds with stop exits
     # are definitively stop-related, while momentum_at_entry can be a coincidence

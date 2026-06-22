@@ -8,7 +8,6 @@ from typing import Optional
 
 from src.types import TradeSignal, ScannerConfig, MarketContext
 
-NarrativeId = str
 
 NARRATIVE_MEMBERS: dict[str, list[str]] = {
     "ai_tokens":        ["FET", "AGIX", "OCEAN", "RENDER", "TAO", "WLD"],

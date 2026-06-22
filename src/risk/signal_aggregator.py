@@ -9,7 +9,6 @@ from __future__ import annotations
 import time
 import threading
 from dataclasses import dataclass, replace
-from typing import Optional
 
 from src.types import TradeSignal
 

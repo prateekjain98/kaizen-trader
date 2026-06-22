@@ -1,7 +1,6 @@
 """Historical kline data loader — fetches from Binance public API with local CSV caching."""
 
 import csv
-import os
 import time
 from pathlib import Path
 from typing import Optional

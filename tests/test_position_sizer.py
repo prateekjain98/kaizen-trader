@@ -19,7 +19,9 @@ def _mock_stats(win_rate=0.6, avg_win_pct=0.05, avg_loss_pct=0.03, sample_size=5
 
 class TestKellySize:
     @patch("src.risk.position_sizer._compute_strategy_stats")
-    def test_insufficient_history_uses_fixed_fraction(self, mock_stats):
+    @patch("src.risk.position_sizer.env")
+    def test_insufficient_history_uses_fixed_fraction(self, mock_env, mock_stats):
+        mock_env.max_position_usd = 100
         mock_stats.return_value = _mock_stats(sample_size=5)
         size = kelly_size("momentum_swing", 10_000, 70)
         # fraction = 0.01, qual_mult = 0.5 + 70/100 = 1.2
@@ -28,7 +30,9 @@ class TestKellySize:
         assert size == 100  # clamped to max_position_usd
 
     @patch("src.risk.position_sizer._compute_strategy_stats")
-    def test_positive_kelly(self, mock_stats):
+    @patch("src.risk.position_sizer.env")
+    def test_positive_kelly(self, mock_env, mock_stats):
+        mock_env.max_position_usd = 100
         mock_stats.return_value = _mock_stats(
             win_rate=0.6, avg_win_pct=0.05, avg_loss_pct=0.03, sample_size=50
         )
@@ -78,14 +82,18 @@ class TestKellySize:
         assert size == 10  # min size
 
     @patch("src.risk.position_sizer._compute_strategy_stats")
-    def test_qual_score_0_gives_half_multiplier(self, mock_stats):
+    @patch("src.risk.position_sizer.env")
+    def test_qual_score_0_gives_half_multiplier(self, mock_env, mock_stats):
+        mock_env.max_position_usd = 100
         mock_stats.return_value = _mock_stats(sample_size=5)
         size_low = kelly_size("test", 10_000, 0)
         # fraction=0.01, qual_mult=0.5, raw=50 -> clamped to [10,100]
         assert size_low == 50
 
     @patch("src.risk.position_sizer._compute_strategy_stats")
-    def test_qual_score_100_gives_1_5x_multiplier(self, mock_stats):
+    @patch("src.risk.position_sizer.env")
+    def test_qual_score_100_gives_1_5x_multiplier(self, mock_env, mock_stats):
+        mock_env.max_position_usd = 100
         mock_stats.return_value = _mock_stats(sample_size=5)
         size_high = kelly_size("test", 10_000, 100)
         # fraction=0.01, qual_mult=1.5, raw=150 -> clamped to [10,100]

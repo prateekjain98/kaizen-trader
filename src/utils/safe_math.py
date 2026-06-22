@@ -20,6 +20,14 @@ def safe_ratio(value: float) -> float:
     return value
 
 
+def _mean_std(values) -> tuple[float, float]:
+    """Population mean and std-dev. Caller must ensure values is non-empty."""
+    n = len(values)
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n
+    return mean, math.sqrt(variance)
+
+
 # ─── Rolling Z-Score ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -30,7 +38,7 @@ class RollingZScore:
     Use one instance per (symbol, metric) pair.
     """
     window: int = 100
-    _values: deque = field(default_factory=lambda: deque(maxlen=100))
+    _values: deque = field(init=False)
 
     def __post_init__(self):
         self._values = deque(maxlen=self.window)
@@ -53,10 +61,7 @@ class RollingZScore:
         if not math.isfinite(value):
             return 0.0
 
-        n = len(self._values)
-        mean = sum(self._values) / n
-        variance = sum((v - mean) ** 2 for v in self._values) / n
-        std = math.sqrt(variance)
+        mean, std = _mean_std(self._values)
         if std < 1e-12:
             return 0.0
         return safe_ratio((value - mean) / std)
@@ -71,10 +76,7 @@ class RollingZScore:
     def std(self) -> float:
         if len(self._values) < 2:
             return 0.0
-        n = len(self._values)
-        mean = sum(self._values) / n
-        variance = sum((v - mean) ** 2 for v in self._values) / n
-        return math.sqrt(variance)
+        return _mean_std(self._values)[1]
 
     @property
     def count(self) -> int:
@@ -89,10 +91,7 @@ def compute_zscore(values: list[float], current: float) -> float:
     finite_vals = [v for v in values if math.isfinite(v)]
     if len(finite_vals) < 10:
         return 0.0
-    n = len(finite_vals)
-    mean = sum(finite_vals) / n
-    variance = sum((v - mean) ** 2 for v in finite_vals) / n
-    std = math.sqrt(variance)
+    mean, std = _mean_std(finite_vals)
     if std < 1e-12:
         return 0.0
     return safe_ratio((current - mean) / std)

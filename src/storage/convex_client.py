@@ -340,15 +340,6 @@ class ConvexStorage:
             "timestamp": entry["timestamp"],
         })
 
-    def close_orphaned_positions(self, exit_reason: str = "orphaned_restart") -> dict:
-        """Close all open positions in Convex (from a previous bot run)."""
-        client = self._get_client()
-        result = client.mutation("mutations:closeOrphanedPositions", {
-            "exitReason": exit_reason,
-            "closedAt": time.time() * 1000,
-        })
-        return result or {"closed": 0, "positionIds": []}
-
     # ─── Read operations (sync) ────────────────────────────────────────────
 
     def get_open_positions(self) -> list[Position]:

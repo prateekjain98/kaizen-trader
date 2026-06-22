@@ -113,8 +113,6 @@ def insert_trade_journal(entry: dict) -> None:
     _get().insert_trade_journal(entry)
 
 
-def close_orphaned_positions(exit_reason: str = "orphaned_restart") -> dict:
-    return _get().close_orphaned_positions(exit_reason)
 
 
 # ─── Read operations ──────────────────────────────────────────────────────

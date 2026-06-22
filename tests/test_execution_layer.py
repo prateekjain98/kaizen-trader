@@ -111,14 +111,16 @@ class TestBinanceProvider:
         assert provider._get_binance_symbol("eth") == "ETHUSDT"
         assert provider._get_binance_symbol("UNKNOWN") == "UNKNOWNUSDT"
 
-    def test_get_balances_without_creds_returns_empty(self):
+    def test_get_balances_without_creds_returns_none(self):
         from src.execution.providers import BinanceProvider
         provider = BinanceProvider()
         with patch("src.execution.providers.env") as mock_env:
             mock_env.binance_api_key = None
             mock_env.binance_api_secret = None
             balances = provider.get_balances()
-            assert balances == {}
+            # None (not {}) so callers keep stale balance on a creds/fetch
+            # failure instead of overwriting a real balance with 0.
+            assert balances is None
 
 
 # ─── Router ────────────────────────────────────────────────────────────────────
@@ -138,13 +140,13 @@ class TestRouter:
             provider = get_provider("BTC")
             assert provider.name == "paper"
 
-    def test_live_mode_routes_to_coinbase_by_default(self):
+    def test_live_mode_routes_to_binance_by_default(self):
         from src.execution.router import get_provider
         self._reset_router()
         with patch("src.execution.router.env") as mock_env:
             mock_env.paper_trading = False
             provider = get_provider("XRP")
-            assert provider.name == "coinbase"
+            assert provider.name == "binance"
 
     def test_binance_only_symbols(self):
         from src.execution.router import get_provider

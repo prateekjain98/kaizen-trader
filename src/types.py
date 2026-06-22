@@ -1,7 +1,7 @@
 """All type definitions for the self-healing crypto trader."""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 Side = Literal["long", "short"]

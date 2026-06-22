@@ -111,8 +111,10 @@ def _build_blind_spots_section() -> str:
 
 
 def _build_prompt(config: ScannerConfig,
+                  trades: Optional[list] = None,
                   strategy_selector: Optional[StrategySelector] = None) -> str:
-    trades = get_closed_trades(300)
+    if trades is None:
+        trades = get_closed_trades(300)
     diagnoses = get_recent_diagnoses(50)
     error_logs = [l for l in get_recent_logs(200) if l.level in ("error", "warn")][:30]
     metrics = compute_metrics(300)
@@ -389,14 +391,19 @@ def run_analysis(config: ScannerConfig,
         log("warn", "Log analyzer skipped — ANTHROPIC_API_KEY not set")
         return None
 
-    trade_count = len(get_closed_trades(1))
+    # Fetch once and reuse for the count gate, the prompt, and the chart
+    # section below. (Previously fetched limit=1 here, so trade_count was
+    # capped at 1 and could never reach min_trades_for_analysis>1 — the
+    # analysis loop silently never ran.)
+    trades = get_closed_trades(300)
+    trade_count = len(trades)
     if trade_count < env.min_trades_for_analysis:
         log("info", f"Log analyzer skipped — {trade_count}/{env.min_trades_for_analysis} trades needed")
         return None
 
     log("info", f"Running Claude analysis ({trade_count} closed trades)...")
 
-    prompt = _build_prompt(config, strategy_selector=strategy_selector)
+    prompt = _build_prompt(config, trades, strategy_selector=strategy_selector)
     client = anthropic.Anthropic(api_key=env.anthropic_api_key)
 
     try:
@@ -485,8 +492,7 @@ def run_analysis(config: ScannerConfig,
             context=f"Priority: {ds.priority}. Claude analysis (health={analysis.overallHealthScore}/100): {analysis.summary[:200]}",
         )
 
-    # Visual chart analysis for top traded symbols
-    trades = get_closed_trades(50)
+    # Visual chart analysis for top traded symbols (reuse trades fetched above)
     chart_symbols = list(dict.fromkeys(t.symbol for t in trades))[:3]  # top 3 most recent
     for sym in chart_symbols:
         try:

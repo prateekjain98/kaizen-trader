@@ -92,7 +92,10 @@ class TestConvexStorageQueue(unittest.TestCase):
         storage.insert_position(_make_position())
         storage.insert_trade(_make_trade())
         storage.insert_diagnosis(_make_diagnosis())
-        storage.log("info", "test message", symbol="ETH")
+        storage.log("warn", "test message", symbol="ETH")
+        # "info" is intentionally NOT persisted to Convex (cost control) —
+        # only warn/error/trade enqueue, so this does not bump the count.
+        storage.log("info", "noise", symbol="ETH")
 
         assert storage.pending_count == 4
 

@@ -5,9 +5,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
 from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 import requests
 

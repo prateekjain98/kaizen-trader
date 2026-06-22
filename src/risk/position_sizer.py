@@ -3,7 +3,6 @@
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from src.config import env
 from src.storage.database import get_closed_trades

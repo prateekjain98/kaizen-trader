@@ -44,11 +44,6 @@ def get_swing_buffer(symbol: str) -> list[PriceSample]:
         return list(_swing_buffers.get(symbol, []))
 
 
-def get_scalp_buffer(symbol: str) -> list[PriceSample]:
-    """Thread-safe access to scalp price buffer for a symbol."""
-    with _lock:
-        return list(_scalp_buffers.get(symbol, []))
-
 
 def get_ready_symbols(min_samples: int = 5) -> tuple[set[str], set[str]]:
     """Thread-safe check for which symbols have enough buffered data.

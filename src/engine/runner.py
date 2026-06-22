@@ -28,7 +28,7 @@ from urllib.request import urlopen, Request
 
 from src.engine.acceleration_tracker import AccelerationTracker
 from src.engine.brain_memory import BrainMemory
-from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices, fetch_binance_top_movers
+from src.engine.data_streams import DataStreams, TokenSignal, fetch_binance_prices
 from src.engine.signal_detector import SignalDetector, SignalPacket
 from src.engine.claude_brain import ClaudeBrain
 from src.engine.executor import Executor, _PORTFOLIO_FILE
