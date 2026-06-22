@@ -36,6 +36,12 @@ from src.engine.log import log
 # stable across thresholds, frequency is the binding constraint.
 MIN_SCORE_TO_TRADE = 45
 MAX_POSITIONS = 4
+
+# Strategies that trade SHORT by default when the detector omits suggested_side.
+# Used to resolve trade direction before applying directional score bonuses, so
+# a long-only edge (e.g. negative-funding short-squeeze) can't inflate a short.
+SHORT_DEFAULT_STRATS = {"funding_carry_short", "mempool_stress",
+                        "stable_flow_bear", "chain_flow_bear"}
 MAX_BALANCE_DEPLOYED_PCT = 0.80
 MAX_DECISIONS_PER_TICK = 3
 
@@ -215,18 +221,27 @@ def _score_signal(
         if strategy_type == signal_type:
             strategy_type = "momentum_breakout"
 
+    # Resolve trade side up-front. Directional score bonuses below (negative-
+    # funding short-squeeze edge, FGI-fear contrarian edge) must never be
+    # applied to a signal whose actual direction opposes them.
+    side = signal.suggested_side or ("short" if signal_type in SHORT_DEFAULT_STRATS else "long")
+
     # Funding squeeze. Score bonus always applies, but strategy_type
     # attribution only claimed if signal arrived as the default type.
     # P1 audit fix: a funding_carry_long signal on a coin with funding
     # < -0.2% would otherwise inherit funding_squeeze risk params
     # (stop 10% / target 25%) instead of carry params (stop 6% / target
     # 10%), holding losing carry trades ~3x longer than intended.
-    if funding_rate < -0.002:  # < -0.2%
+    # DIRECTION fix: negative funding is a LONG (short-squeeze) edge. Applying
+    # the bonus to SHORT signals inflated bad shorts past the trade threshold
+    # and relabeled them "funding_squeeze"; the basis entry-filter then vetoed
+    # 100% of them (perp already below spot), so the bot took ZERO trades.
+    if funding_rate < -0.002 and side != "short":  # < -0.2%
         score += 40
         factors.append(f"extreme neg funding {funding_rate*100:+.3f}% +40")
         if strategy_type == signal_type:
             strategy_type = "funding_squeeze"
-    elif funding_rate < -0.001:  # < -0.1%
+    elif funding_rate < -0.001 and side != "short":  # < -0.1%
         score += 25
         factors.append(f"neg funding {funding_rate*100:+.3f}% +25")
         if accel_1h > 5 and strategy_type == signal_type:
@@ -275,8 +290,7 @@ def _score_signal(
     # funding_carry_short on BTC at FGI=18 with carry rank 8% would score
     # 30+30=60 (clears MIN_SCORE) when without the misapplied bonus it scores
     # 30 (filtered). Don't reward shorts during extreme fear.
-    _SHORT_STRATS = ("funding_carry_short", "mempool_stress", "stable_flow_bear", "chain_flow_bear")
-    if fgi <= 20 and symbol in ("BTC", "ETH") and signal_type not in _SHORT_STRATS:
+    if fgi <= 20 and symbol in ("BTC", "ETH") and signal_type not in SHORT_DEFAULT_STRATS:
         score += 30
         factors.append(f"FGI={fgi} extreme fear on {symbol} +30")
         if strategy_type == signal_type:
@@ -433,22 +447,11 @@ def _score_signal(
             factors.append(f"price above last exit (${last_exit:.4f} -> ${signal.price_usd:.4f}) -20")
 
     # ------------------------------------------------------------------
-    # Determine side and risk
+    # Determine risk (side resolved up-front, before directional bonuses)
     # ------------------------------------------------------------------
-
-    # Default side derives from strategy intent when detector omits it.
-    # P0 audit fix: prior `signal.suggested_side or "long"` silently flipped
-    # any short-strategy signal (funding_carry_short, mempool_stress,
-    # stable_flow_bear, chain_flow_bear) to LONG when emitter omitted
-    # suggested_side. Latent today (every short emitter currently sets
-    # suggested_side explicitly) but defense-in-depth so a future emitter
-    # bug can't invert trade direction.
-    _SHORT_DEFAULT = {"funding_carry_short", "mempool_stress",
-                      "stable_flow_bear", "chain_flow_bear"}
-    _strat_default = "short" if signal_type in _SHORT_DEFAULT else "long"
-    side = signal.suggested_side or _strat_default
-
-    # Correlation break: if alt is underperforming (negative divergence), go long
+    # `side` defaults via SHORT_DEFAULT_STRATS (not a blanket "long") so a
+    # short-strategy signal that omits suggested_side can't be silently
+    # flipped to LONG. Correlation break overrides to long on underperformance.
     if strategy_type == "correlation_break" and btc_divergence < -1.5:
         side = "long"
 
