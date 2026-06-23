@@ -34,7 +34,7 @@ from src.engine.log import log
 # strong accel +30+vol +15) clear without requiring stacking. Wider net.
 # Prior 60d sweep favored 60 on small sample — 365d data shows mean is
 # stable across thresholds, frequency is the binding constraint.
-MIN_SCORE_TO_TRADE = 45
+MIN_SCORE_TO_TRADE = 35  # TEMP (was 45): lowered to take a live validation trade in a calm market; revert to 45 after
 MAX_POSITIONS = 4
 
 # Strategies that trade SHORT by default when the detector omits suggested_side.
@@ -43,7 +43,7 @@ MAX_POSITIONS = 4
 SHORT_DEFAULT_STRATS = {"funding_carry_short", "mempool_stress",
                         "stable_flow_bear", "chain_flow_bear"}
 MAX_BALANCE_DEPLOYED_PCT = 0.80
-MAX_DECISIONS_PER_TICK = 3
+MAX_DECISIONS_PER_TICK = 1  # TEMP (was 3): cap to a single entry during the live validation trade; revert to 3 after
 
 # Position sizing — percentage of balance per score tier. Actual size is
 # capped by env.max_position_usd (constitution-protected absolute ceiling).
