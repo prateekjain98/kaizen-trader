@@ -105,6 +105,20 @@ def insert_diagnosis(d: TradeDiagnosis) -> None:
     _get().insert_diagnosis(d)
 
 
+def record_skipped_trade(symbol: str, side: str, score: float, strategy: str,
+                         reason: str, detail: str | None = None,
+                         entry_price: float | None = None) -> None:
+    """Best-effort async record of a qualifying decision that never opened.
+    Never let an audit-write failure crash the trading loop."""
+    if _storage is None:
+        return
+    try:
+        _storage.insert_skipped_trade(symbol, side, score, strategy, reason,
+                                      detail=detail, entry_price=entry_price)
+    except Exception:
+        pass
+
+
 def snapshot_config(config: object, reason: str) -> None:
     _get().snapshot_config(config, reason)
 

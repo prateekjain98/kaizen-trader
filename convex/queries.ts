@@ -58,6 +58,17 @@ export const getClosedTrades = query({
   },
 });
 
+export const getSkippedTrades = query({
+  args: { limit: v.optional(v.float64()) },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("skippedTrades")
+      .withIndex("by_timestamp")
+      .order("desc")
+      .take(args.limit ?? 100);
+  },
+});
+
 export const getRecentLogs = query({
   args: {
     limit: v.optional(v.float64()),

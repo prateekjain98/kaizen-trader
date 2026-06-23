@@ -563,6 +563,14 @@ class Executor:
             ctx = {"open_positions": list(self.positions)}
             verdict = run_filters(decision, ctx)
             if not verdict.allowed:
+                # Audit trail: a qualifying decision blocked by an entry filter.
+                from src.storage.database import record_skipped_trade
+                record_skipped_trade(
+                    decision.symbol, decision.side,
+                    getattr(decision, "score", 0.0), getattr(decision, "strategy", ""),
+                    reason=f"filter:{verdict.rule}", detail=verdict.reason,
+                    entry_price=decision.entry_price or None,
+                )
                 return None
             # If a filter computed ATR, use it for an ATR-based stop.
             atr_pct = ctx.get("atr_pct_15m")
@@ -647,11 +655,25 @@ class Executor:
                     )
                 if trade.status == "failed":
                     log("warn", f"{self._binance.name} order failed: {decision.symbol}: {trade.error}")
+                    from src.storage.database import record_skipped_trade
+                    record_skipped_trade(
+                        decision.symbol, decision.side,
+                        getattr(decision, "score", 0.0), getattr(decision, "strategy", ""),
+                        reason="order_rejected", detail=str(trade.error),
+                        entry_price=entry_price or None,
+                    )
                     return None
                 entry_price = trade.price if trade.price > 0 else entry_price
                 quantity = trade.quantity if trade.quantity > 0 else quantity
             except Exception as e:
                 log("error", f"Execution error: {decision.symbol}: {e}")
+                from src.storage.database import record_skipped_trade
+                record_skipped_trade(
+                    decision.symbol, decision.side,
+                    getattr(decision, "score", 0.0), getattr(decision, "strategy", ""),
+                    reason="execution_error", detail=str(e),
+                    entry_price=entry_price or None,
+                )
                 return None
 
             # Stop placement is best-effort — if it raises, the position is

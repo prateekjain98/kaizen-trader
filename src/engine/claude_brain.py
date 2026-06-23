@@ -47,6 +47,8 @@ class TradeDecision:
     signal_id: str
     timestamp: float
     thesis_conditions: dict = field(default_factory=dict)
+    score: float = 0.0       # conviction score that produced this decision
+    strategy: str = ""       # strategy_type that claimed the signal
 
 
 @dataclass

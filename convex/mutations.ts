@@ -164,6 +164,22 @@ export const insertTrade = mutation({
   },
 });
 
+export const insertSkippedTrade = mutation({
+  args: {
+    symbol: v.string(),
+    side: v.string(),
+    score: v.float64(),
+    strategy: v.string(),
+    reason: v.string(),
+    detail: v.optional(v.string()),
+    entryPrice: v.optional(v.float64()),
+    timestamp: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("skippedTrades", args);
+  },
+});
+
 export const insertLog = mutation({
   args: {
     logId: v.string(),

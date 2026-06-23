@@ -93,6 +93,33 @@ class TestWriteOperations:
         client.mutation.assert_called_once()
         assert client.mutation.call_args[0][0] == "mutations:insertTrade"
 
+    def test_insert_skipped_trade(self, mock_client):
+        storage, client = mock_client
+        storage.insert_skipped_trade(
+            "ARX", "long", 75.0, "funding_squeeze",
+            reason="no_binance_futures_price", entry_price=0.4362,
+        )
+        assert storage.pending_count == 1
+        storage._drain_queue()
+        client.mutation.assert_called_once()
+        name, args = client.mutation.call_args[0]
+        assert name == "mutations:insertSkippedTrade"
+        assert args["symbol"] == "ARX"
+        assert args["score"] == 75.0
+        assert args["reason"] == "no_binance_futures_price"
+        assert args["entryPrice"] == 0.4362
+        assert args["timestamp"] > 0
+
+    def test_record_skipped_trade_facade_best_effort_when_uninitialized(self):
+        # Must never raise even if storage isn't initialized (best-effort audit).
+        import src.storage.database as db
+        old = db._storage
+        db._storage = None
+        try:
+            db.record_skipped_trade("ARX", "long", 75.0, "funding_squeeze", "no_price")
+        finally:
+            db._storage = old
+
     def test_log_enqueues_and_prints(self, mock_client, caplog):
         import logging
         storage, client = mock_client

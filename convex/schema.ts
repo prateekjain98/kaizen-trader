@@ -154,6 +154,22 @@ export default defineSchema({
     .index("by_timestamp", ["timestamp"])
     .index("by_strategy", ["strategy"]),
 
+  // Qualifying BUY/SELL decisions (score >= MIN_SCORE_TO_TRADE) that did NOT
+  // become a position — no live price, order rejected, or blocked by an entry
+  // filter. Audit trail so missed high-conviction trades leave a data trail.
+  skippedTrades: defineTable({
+    symbol: v.string(),
+    side: v.string(),
+    score: v.float64(),
+    strategy: v.string(),
+    reason: v.string(),       // e.g. "no_binance_futures_price", "filter:basis", "order_rejected"
+    detail: v.optional(v.string()),
+    entryPrice: v.optional(v.float64()),
+    timestamp: v.float64(),
+  })
+    .index("by_timestamp", ["timestamp"])
+    .index("by_symbol", ["symbol"]),
+
   // Aggregated metrics computed by cron for dashboard health panel
   metrics: defineTable({
     windowStartMs: v.float64(),

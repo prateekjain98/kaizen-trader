@@ -34,6 +34,7 @@ from src.engine.claude_brain import ClaudeBrain
 from src.engine.executor import Executor, _PORTFOLIO_FILE
 from src.engine.correlation_scanner import CorrelationScanner
 from src.engine.log import log
+from src.storage.database import record_skipped_trade
 from src.risk.loss_cooldown import (
     is_symbol_on_cooldown,
     record_symbol_result,
@@ -365,18 +366,25 @@ class TradingEngine:
                                 log("trade", f"OPENED {pos.side} {pos.symbol} ${pos.size_usd:.0f} @ ${pos.entry_price:.4f}")
                             else:
                                 # Decision passed scoring but the executor opened nothing
-                                # (order rejected / below min notional). Don't drop it silently.
+                                # (order rejected / entry-filter block). The executor already
+                                # recorded the specific reason to skipped_trades; just log.
                                 log("warn", f"SKIPPED {decision.action} {decision.symbol} "
                                             f"({_strat}) — executor returned no position "
-                                            f"(order rejected or below min notional)")
+                                            f"(order rejected or entry filter)")
                         else:
                             # No live Binance price → almost always a token that isn't on
                             # Binance Futures (e.g. a brand-new listing scored via the
                             # new-listing/funding bonuses). Previously skipped with zero
-                            # logging, so a high-score BUY vanished with no trace.
+                            # logging, so a high-score BUY vanished with no trace. Record it.
                             log("warn", f"SKIPPED {decision.action} {decision.symbol} "
                                         f"({_strat}) — no live Binance price; symbol likely "
                                         f"not tradeable on Binance Futures")
+                            record_skipped_trade(
+                                decision.symbol, decision.side,
+                                getattr(decision, "score", 0.0), _strat,
+                                reason="no_binance_futures_price",
+                                entry_price=getattr(decision, "entry_price", 0.0) or None,
+                            )
 
                     elif decision.action == "CLOSE":
                         # Find and close the position

@@ -294,6 +294,21 @@ class ConvexStorage:
         sym_tag = f" [{symbol}]" if symbol else ""
         logger.info("[%s] [%s]%s %s", ts_str, level.upper(), sym_tag, message)
 
+    def insert_skipped_trade(self, symbol: str, side: str, score: float,
+                             strategy: str, reason: str, detail: str | None = None,
+                             entry_price: float | None = None) -> None:
+        """Async-record a qualifying decision that never became a position."""
+        self._enqueue("mutations:insertSkippedTrade", {
+            "symbol": symbol,
+            "side": side,
+            "score": float(score),
+            "strategy": strategy or "",
+            "reason": reason,
+            "detail": detail,
+            "entryPrice": entry_price,
+            "timestamp": time.time() * 1000,
+        })
+
     def insert_diagnosis(self, d: TradeDiagnosis) -> None:
         self._enqueue("mutations:insertDiagnosis", {
             "positionId": d.position_id,

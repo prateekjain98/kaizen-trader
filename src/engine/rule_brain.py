@@ -619,6 +619,8 @@ class RuleBrain:
                 signal_id=s.signal.signal_id or f"rule-{int(time.time())}",
                 timestamp=time.time() * 1000,
                 thesis_conditions=thesis_conditions,
+                score=s.score,
+                strategy=s.strategy_type,
             ))
 
             remaining_budget -= size_usd
