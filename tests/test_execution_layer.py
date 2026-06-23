@@ -34,6 +34,21 @@ class TestExecutionProtocol:
         assert CoinbaseProvider().name == "coinbase"
         assert BinanceProvider().name == "binance"
 
+    def test_round_step_no_dust_on_exact_multiples(self):
+        # Regression: float drift (148.5/0.1 == 1484.9999999999998) must NOT
+        # floor an exact step-multiple down a whole step — that left 0.1 dust
+        # on reduceOnly closes. The epsilon scrubs the drift.
+        from src.execution.providers import BinanceProvider
+        p = BinanceProvider()
+        p._step_sizes["LAYERUSDT"] = 0.1
+        p._step_sizes["BTCUSDT"] = 0.001
+        for qty in (148.5, 46.1, 12.3, 99.9, 7.7):
+            assert p._round_step("LAYERUSDT", qty) == round(qty, 1)
+        # genuinely-fractional qtys still floor DOWN (never round up)
+        assert p._round_step("LAYERUSDT", 148.49) == 148.4
+        assert p._round_step("LAYERUSDT", 0.699) == 0.6
+        assert p._round_step("BTCUSDT", 0.0019) == 0.001
+
 
 # ─── PaperProvider ─────────────────────────────────────────────────────────────
 

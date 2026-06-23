@@ -373,6 +373,32 @@ class Executor:
         if ghosts:
             self._save_state()
 
+    def _live_position_amt(self, symbol: str) -> float:
+        """abs() of the live exchange position amount for symbol, or 0.0 if it
+        can't be fetched. Closing the LIVE amount (not the locally-tracked
+        pos.quantity) guarantees we close 100% of the position — tracked-vs-actual
+        drift (partial fills, funding, float rounding) otherwise leaves a 1-step
+        'dust' position behind that reduceOnly never clears."""
+        if self.paper or not self._binance or not hasattr(self._binance, "_get_binance_symbol"):
+            return 0.0
+        try:
+            bsym = self._binance._get_binance_symbol(symbol)
+            ts = int(time.time() * 1000)
+            params = f"timestamp={ts}"
+            sig = hmac.new(env.binance_api_secret.encode(), params.encode(), "sha256").hexdigest()
+            resp = requests.get(
+                f"{self._binance.FAPI_BASE}/fapi/v2/positionRisk",
+                headers={"X-MBX-APIKEY": env.binance_api_key},
+                params={"timestamp": ts, "signature": sig}, timeout=10,
+            )
+            resp.raise_for_status()
+            for p in resp.json():
+                if p.get("symbol") == bsym:
+                    return abs(float(p.get("positionAmt", 0)))
+        except Exception as e:
+            log("warn", f"Live position-amount fetch failed for {symbol}: {e}")
+        return 0.0
+
     def _load_state(self):
         """Load portfolio state from JSON if it exists."""
         if _PORTFOLIO_FILE.exists():
@@ -1013,8 +1039,13 @@ class Executor:
             if not self.paper and self._binance:
                 try:
                     close_side = "SELL" if pos.side == "long" else "BUY"
+                    # Close the LIVE exchange amount, not the tracked quantity,
+                    # so no 1-step dust position is left behind (reduceOnly caps
+                    # at the real position, so over-specifying is safe). Fall
+                    # back to the tracked quantity if the fetch fails.
+                    close_qty = self._live_position_amt(pos.symbol) or pos.quantity
                     trade = self._binance._place_order(
-                        pos.symbol, pos.id, close_side, pos.quantity, exit_price,
+                        pos.symbol, pos.id, close_side, close_qty, exit_price,
                         reduce_only=True,
                     )
                     if trade.status != "filled":

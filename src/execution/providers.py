@@ -122,11 +122,17 @@ class BinanceProvider:
         to step (e.g. math.floor(46.1/0.1)*0.1 = 46.10000000000001), which
         Binance rejects with -1111 "Precision is over the maximum". Round to
         the decimal count implied by step to scrub it.
+
+        It also drifts at the floor INPUT: 148.5/0.1 == 1484.9999999999998, so
+        math.floor would drop an exact multiple down a whole step (148.5 → 148.4).
+        On a reduceOnly close that left a 1-step "dust" position behind that the
+        watchdog kept seeing as open. A small epsilon before flooring scrubs the
+        drift without ever rounding a genuinely fractional qty up.
         """
         step = self._step_sizes.get(binance_symbol)
         if not step or step <= 0:
             return qty
-        rounded = math.floor(qty / step) * step
+        rounded = math.floor(qty / step + 1e-9) * step
         # Decimals from step: 0.001 -> 3, 1.0 -> 0, 0.5 -> 1.
         if step >= 1:
             decimals = 0
