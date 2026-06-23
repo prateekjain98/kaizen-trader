@@ -363,6 +363,20 @@ class TradingEngine:
                             if pos:
                                 self.trades_opened += 1
                                 log("trade", f"OPENED {pos.side} {pos.symbol} ${pos.size_usd:.0f} @ ${pos.entry_price:.4f}")
+                            else:
+                                # Decision passed scoring but the executor opened nothing
+                                # (order rejected / below min notional). Don't drop it silently.
+                                log("warn", f"SKIPPED {decision.action} {decision.symbol} "
+                                            f"({_strat}) — executor returned no position "
+                                            f"(order rejected or below min notional)")
+                        else:
+                            # No live Binance price → almost always a token that isn't on
+                            # Binance Futures (e.g. a brand-new listing scored via the
+                            # new-listing/funding bonuses). Previously skipped with zero
+                            # logging, so a high-score BUY vanished with no trace.
+                            log("warn", f"SKIPPED {decision.action} {decision.symbol} "
+                                        f"({_strat}) — no live Binance price; symbol likely "
+                                        f"not tradeable on Binance Futures")
 
                     elif decision.action == "CLOSE":
                         # Find and close the position
