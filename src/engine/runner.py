@@ -35,6 +35,7 @@ from src.engine.executor import Executor, _PORTFOLIO_FILE
 from src.engine.correlation_scanner import CorrelationScanner
 from src.engine.log import log
 from src.storage.database import record_skipped_trade
+from src.evaluation.strategy_selector import get_selector
 from src.risk.loss_cooldown import (
     is_symbol_on_cooldown,
     record_symbol_result,
@@ -355,6 +356,12 @@ class TradingEngine:
                         if _strat and is_strategy_on_cooldown(_strat):
                             log("info", f"BLOCKED {decision.action} {decision.symbol} (strategy '{_strat}' loss cooldown)")
                             continue
+                        # Darwinian selection gate: skip strategies the selector has
+                        # auto-disabled for chronic underperformance. Was wired only in
+                        # src/main.py; the live engine ignored it until now.
+                        if _strat and not get_selector().is_strategy_enabled(_strat):
+                            log("info", f"BLOCKED {decision.action} {decision.symbol} (strategy '{_strat}' auto-disabled by selector)")
+                            continue
                         # Get live price for the symbol
                         prices = fetch_binance_prices([decision.symbol], snapshot=self.streams.snapshot)
                         price = prices.get(decision.symbol, 0)
@@ -541,6 +548,14 @@ class TradingEngine:
                 # method internally rate-limits to 5 min so calling more
                 # often is safe but redundant.
                 self.executor.refresh_funding_paid_24h()
+                # Darwinian strategy evaluation (#4): auto-disable/cull chronic
+                # underperformers from real closed-trade history. The gate in the
+                # decision loop reads get_selector().is_strategy_enabled().
+                try:
+                    from src.storage.database import get_closed_trades as _gct
+                    get_selector().evaluate_strategies(_gct(100))
+                except Exception as e:
+                    log("warn", f"Strategy selector evaluation failed: {e}")
             reconcile_counter += 1
 
             stats = self.executor.get_stats()

@@ -174,3 +174,19 @@ class StrategySelector:
     def get_health_report(self) -> list[StrategyHealth]:
         with self._lock:
             return list(self._health.values())
+
+
+# Process-wide singleton so the live engine (src.engine.runner) shares one
+# selector across its decision loop, close handler, and periodic evaluation.
+# (src/main.py keeps its own module-level instance for the legacy path.)
+_selector: Optional[StrategySelector] = None
+_selector_lock = threading.Lock()
+
+
+def get_selector() -> StrategySelector:
+    global _selector
+    if _selector is None:
+        with _selector_lock:
+            if _selector is None:
+                _selector = StrategySelector()
+    return _selector
