@@ -104,6 +104,57 @@ _CARRY_LIQUID_UNIVERSE = frozenset({
 })
 DEFAULT_RISK = {"stop_pct": 0.10, "target_pct": 0.20}
 
+# ─── Fee-aware edge (#5 fee gate) + edge-based sizing (#8) ──────────────────
+# Round-trip cost a directional trade must overcome to break even:
+# 0.1% taker fee per side × 2 + a slippage buffer.
+ROUND_TRIP_COST = 0.0025
+MIN_TRADES_FOR_EDGE = 15          # need this much history before gating/sizing on it
+EDGE_MULT_MIN, EDGE_MULT_MAX = 0.7, 1.3
+_EDGE_CACHE: dict = {"ts": 0.0, "by_strategy": {}}
+_EDGE_CACHE_TTL = 300             # recompute per-strategy win-rates at most every 5 min
+
+
+def _strategy_win_rates() -> dict:
+    """{strategy: {'win_rate': float, 'n': int}} from recent closed trades, cached."""
+    now = time.time()
+    if now - _EDGE_CACHE["ts"] < _EDGE_CACHE_TTL and _EDGE_CACHE["by_strategy"]:
+        return _EDGE_CACHE["by_strategy"]
+    out: dict = {}
+    try:
+        from collections import defaultdict
+        from src.storage.database import get_closed_trades
+        buckets = defaultdict(list)
+        for t in get_closed_trades(200):
+            strat = getattr(t, "strategy", "") or ""
+            pnl = getattr(t, "pnl_pct", None)
+            if strat and pnl is not None:
+                buckets[strat].append(pnl)
+        for strat, pnls in buckets.items():
+            n = len(pnls)
+            out[strat] = {"win_rate": (sum(1 for p in pnls if p > 0) / n) if n else 0.0, "n": n}
+    except Exception:
+        pass
+    _EDGE_CACHE["ts"] = now
+    _EDGE_CACHE["by_strategy"] = out
+    return out
+
+
+def _edge_metrics(strategy_type: str, stop_pct: float, target_pct: float):
+    """Return (ev_after_fees, win_rate, sample_n, size_multiplier).
+
+    ev = win_rate·target − (1−win_rate)·stop − round-trip cost.
+    size_multiplier scales the conviction-tier size by a fractional-Kelly edge,
+    bounded so it can never do anything wild. Neutral (1.0, no gate) until there
+    is enough per-strategy history."""
+    stats = _strategy_win_rates().get(strategy_type, {})
+    n = int(stats.get("n", 0))
+    wr = float(stats.get("win_rate", 0.0))
+    ev = wr * target_pct - (1 - wr) * stop_pct - ROUND_TRIP_COST
+    rr = (target_pct / stop_pct) if stop_pct > 0 else 1.0
+    kelly = wr - (1 - wr) / rr if rr > 0 else 0.0     # fraction of bankroll Kelly suggests
+    mult = max(EDGE_MULT_MIN, min(EDGE_MULT_MAX, 0.7 + max(0.0, kelly) * 3.0))
+    return ev, wr, n, mult
+
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -583,12 +634,26 @@ class RuleBrain:
         from src.config import env as _env
         _max_usd = _env.max_position_usd
         for s in top_signals:
+            # #5 fee-aware gate + #8 edge sizing — from per-strategy history.
+            ev, wr, n, edge_mult = _edge_metrics(s.strategy_type, s.stop_pct, s.target_pct)
+            if n >= MIN_TRADES_FOR_EDGE and ev <= 0:
+                log("info", f"[RuleBrain] SKIP {s.signal.symbol}: negative EV after fees "
+                            f"(WR {wr:.0%}/{n}, EV {ev*100:+.2f}%) [{s.strategy_type}]")
+                from src.storage.database import record_skipped_trade
+                record_skipped_trade(s.signal.symbol, s.side, s.score, s.strategy_type,
+                                     reason="negative_ev_after_fees",
+                                     detail=f"wr={wr:.2f} n={n} ev={ev:.4f}")
+                continue
+
             if s.score >= 80:
                 size_usd = min(_max_usd, self.balance * MAX_POSITION_PCT_HIGH)
             elif s.score >= 60:
                 size_usd = min(_max_usd, self.balance * MAX_POSITION_PCT_MED)
             else:
                 size_usd = min(_max_usd, self.balance * MAX_POSITION_PCT_LOW)
+            # #8 scale by measured edge (only once there's enough history)
+            if n >= MIN_TRADES_FOR_EDGE:
+                size_usd *= edge_mult
             size_usd = min(size_usd, remaining_budget)
 
             if size_usd < 5:
