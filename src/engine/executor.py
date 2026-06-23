@@ -762,69 +762,54 @@ class Executor:
             log("warn", f"Server-side stops not implemented for {self._binance.name} — skipping for {symbol}")
             return
 
-        import requests
-
         binance_symbol = self._binance._get_binance_symbol(symbol)
         close_side = "SELL" if side == "long" else "BUY"
         stop_price = entry * (1 - stop_pct) if side == "long" else entry * (1 + stop_pct)
         tp_price = entry * (1 + target_pct) if side == "long" else entry * (1 - target_pct)
 
-        timestamp = int(time.time() * 1000)
+        # As of 2025-12-09 Binance migrated USDⓈ-M conditional orders OFF
+        # /fapi/v1/order (now -4120 "Order type not supported … use the Algo
+        # Order API") to the Algo Service at /fapi/v1/algoOrder. Both the stop
+        # and the take-profit go through that endpoint now.
+        self._place_algo_conditional(binance_symbol, close_side, "STOP_MARKET",
+                                     stop_price, quantity, "stop", symbol)
+        self._place_algo_conditional(binance_symbol, close_side, "TAKE_PROFIT_MARKET",
+                                     tp_price, quantity, "TP", symbol)
 
-        # Stop loss order. Binance India accounts now reject closePosition=true with
-        # STOP_MARKET on /fapi/v1/order with -4120; use explicit quantity + reduceOnly
-        # which is the supported pattern across Binance Futures regions.
+    def _place_algo_conditional(self, binance_symbol: str, close_side: str,
+                                order_type: str, trigger_price: float,
+                                quantity: float, label: str, symbol: str) -> None:
+        """Place ONE reduce-only conditional order (STOP_MARKET / TAKE_PROFIT_MARKET)
+        via the Binance Futures Algo Service (/fapi/v1/algoOrder, algoType=CONDITIONAL,
+        triggerPrice). Timestamp is captured per-call so a slow first POST can't push
+        the second outside the 5s recvWindow (silent -1021)."""
         try:
-            sl_params = (
-                f"symbol={binance_symbol}&side={close_side}&type=STOP_MARKET"
-                f"&stopPrice={stop_price:.8f}&quantity={quantity}&reduceOnly=true"
-                f"&workingType=MARK_PRICE&timeInForce=GTC"
-                f"&timestamp={timestamp}"
+            ts = int(time.time() * 1000)
+            params = (
+                f"algoType=CONDITIONAL&symbol={binance_symbol}&side={close_side}"
+                f"&type={order_type}&triggerPrice={trigger_price:.8f}"
+                f"&quantity={quantity}&reduceOnly=true"
+                f"&workingType=MARK_PRICE&timeInForce=GTC&timestamp={ts}"
             )
             signature = hmac.new(
-                env.binance_api_secret.encode(), sl_params.encode(), "sha256"
+                env.binance_api_secret.encode(), params.encode(), "sha256"
             ).hexdigest()
             r = requests.post(
-                f"{self._binance.FAPI_BASE}/fapi/v1/order",
+                f"{self._binance.FAPI_BASE}/fapi/v1/algoOrder",
                 headers={"X-MBX-APIKEY": env.binance_api_key},
-                data=f"{sl_params}&signature={signature}",
+                data=f"{params}&signature={signature}",
                 timeout=10,
             )
-            # Binance returns 4xx for rejected orders without raising — must check status.
-            # Previous code logged success unconditionally, which masked silent failures.
+            # Binance returns 4xx for rejected orders without raising — must check
+            # status so a silent rejection can't masquerade as success.
             if r.status_code == 200:
-                log("info", f"Server-side stop placed: {symbol} @ ${stop_price:.4f} orderId={r.json().get('orderId')}")
+                body = r.json()
+                aid = body.get("algoId") or body.get("clientAlgoId") or body.get("orderId")
+                log("info", f"Server-side {label} placed: {symbol} @ ${trigger_price:.4f} algoId={aid}")
             else:
-                log("error", f"Server-side stop REJECTED for {symbol}: {r.status_code} {r.text[:300]}")
+                log("error", f"Server-side {label} REJECTED for {symbol}: {r.status_code} {r.text[:300]}")
         except Exception as e:
-            log("error", f"Server-side stop EXCEPTION for {symbol}: {e}")
-
-        # Take profit order — re-capture timestamp. The original timestamp can
-        # easily fall outside Binance's recvWindow (5s default) if the SL POST
-        # took >5s, causing a silent -1021 rejection where the TP never lands.
-        try:
-            tp_timestamp = int(time.time() * 1000)
-            tp_params = (
-                f"symbol={binance_symbol}&side={close_side}&type=TAKE_PROFIT_MARKET"
-                f"&stopPrice={tp_price:.8f}&quantity={quantity}&reduceOnly=true"
-                f"&workingType=MARK_PRICE&timeInForce=GTC"
-                f"&timestamp={tp_timestamp}"
-            )
-            signature = hmac.new(
-                env.binance_api_secret.encode(), tp_params.encode(), "sha256"
-            ).hexdigest()
-            r = requests.post(
-                f"{self._binance.FAPI_BASE}/fapi/v1/order",
-                headers={"X-MBX-APIKEY": env.binance_api_key},
-                data=f"{tp_params}&signature={signature}",
-                timeout=10,
-            )
-            if r.status_code == 200:
-                log("info", f"Server-side TP placed: {symbol} @ ${tp_price:.4f} orderId={r.json().get('orderId')}")
-            else:
-                log("error", f"Server-side TP REJECTED for {symbol}: {r.status_code} {r.text[:300]}")
-        except Exception as e:
-            log("error", f"Server-side TP EXCEPTION for {symbol}: {e}")
+            log("error", f"Server-side {label} EXCEPTION for {symbol}: {e}")
 
     # Symbols exempt from fast-cut (slower-base majors).
     _FAST_CUT_EXEMPT = frozenset({"BTC", "ETH", "SOL", "BNB", "XRP"})
