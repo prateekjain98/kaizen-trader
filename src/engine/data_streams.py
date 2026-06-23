@@ -388,8 +388,13 @@ def fetch_binance_prices(symbols: list[str], snapshot=None) -> dict[str, float]:
         missing = [s.upper() for s in symbols]
 
     # Per-symbol fallback for what's still missing (cheap: 1 small JSON each).
+    # Use the FUTURES (fapi) ticker, not spot: the whole bot trades Binance
+    # Futures (executor, funding discovery, and the WS snapshot all use
+    # fapi/fstream). New perps (e.g. ARX) list on Futures before Spot, so the
+    # old spot endpoint returned no price and the engine silently dropped a
+    # valid high-conviction BUY for a symbol it could actually trade.
     for s in missing:
-        item = _fetch_json(f"https://api.binance.com/api/v3/ticker/price?symbol={s}USDT")
+        item = _fetch_json(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={s}USDT")
         if item and "price" in item:
             try:
                 prices[s] = float(item["price"])
