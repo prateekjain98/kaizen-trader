@@ -331,12 +331,22 @@ class Executor:
         if self._binance.name == "binance":
             self._reconcile_positions(reason)
 
+    # Defaults applied when ADOPTING an externally-opened position whose original
+    # intent we don't know. The trailing stop (update_price) is what actually
+    # locks profit; these are just the initial floor/target.
+    ADOPT_STOP_PCT = 0.10
+    ADOPT_TARGET_PCT = 0.25
+    ADOPT_MIN_NOTIONAL_USD = 1.0   # ignore dust (e.g. the 0.1 LAYER remnant)
+
     def _reconcile_positions(self, reason: str) -> None:
-        """Drop any local position that no longer exists on the exchange.
-        This catches watchdog-closed, manually-closed, or liquidated positions
-        that the bot would otherwise still track in self.positions.
-        Without this, has_position() blocks re-entry and daily_pnl/protections
-        stay blind to the loss."""
+        """Two-way reconcile against the exchange:
+          - DROP local positions that no longer exist on the exchange (watchdog-
+            closed, manually-closed, liquidated) so has_position()/protections
+            don't stay blind.
+          - ADOPT exchange positions the engine isn't tracking (e.g. manually /
+            out-of-band opened) so they get the engine's trailing-stop + chop-exit
+            management instead of riding only a fixed stop. (This is the gap that
+            let the manual ARX long round-trip a +14% gain to its −10% stop.)"""
         try:
             timestamp = int(time.time() * 1000)
             params = f"timestamp={timestamp}"
@@ -350,17 +360,46 @@ class Executor:
                 timeout=10,
             )
             resp.raise_for_status()
-            live_symbols = {
-                p["symbol"].replace("USDT", "")
+            live = {
+                p["symbol"].replace("USDT", ""): p
                 for p in resp.json() if abs(float(p.get("positionAmt", 0))) > 0
             }
         except Exception as e:
             log("warn", f"Position reconcile fetch failed ({reason}): {e}")
             return
 
+        live_symbols = set(live.keys())
+        adopted: list[Position] = []
         with self._lock:
             ghosts = [p for p in self.positions if p.symbol not in live_symbols]
             self.positions = [p for p in self.positions if p.symbol in live_symbols]
+            tracked = {p.symbol for p in self.positions}
+            for sym, row in live.items():
+                if sym in tracked:
+                    continue
+                try:
+                    amt = float(row["positionAmt"])
+                    entry = float(row.get("entryPrice", 0)) or float(row.get("markPrice", 0))
+                    mark = float(row.get("markPrice", 0)) or entry
+                    qty = abs(amt)
+                    if entry <= 0 or qty * entry < self.ADOPT_MIN_NOTIONAL_USD:
+                        continue  # skip dust / bad data
+                    side = "long" if amt > 0 else "short"
+                    pos = Position(
+                        id=str(uuid.uuid4()), symbol=sym, side=side,
+                        entry_price=entry, size_usd=qty * entry, quantity=qty,
+                        stop_pct=self.ADOPT_STOP_PCT, target_pct=self.ADOPT_TARGET_PCT,
+                        opened_at=float(row.get("updateTime", time.time() * 1000)),
+                        signal_type="adopted",
+                        reasoning="adopted from exchange (out-of-band position)",
+                        current_price=mark,
+                        high_watermark=(max(entry, mark) if side == "long" else min(entry, mark)),
+                        low_watermark=(min(entry, mark) if side == "long" else max(entry, mark)),
+                    )
+                    self.positions.append(pos)
+                    adopted.append(pos)
+                except Exception as e:
+                    log("warn", f"Position adopt failed for {sym} ({reason}): {e}")
 
         for pos in ghosts:
             # We don't know the exit price/PnL — log loudly and clear the
@@ -370,7 +409,11 @@ class Executor:
             log("warn", f"Position reconcile ({reason}): {pos.symbol} disappeared from exchange "
                 f"— removed locally; PnL not credited (check exchange for actual close)")
             self._clear_watchdog_stop(pos.symbol)
-        if ghosts:
+        for pos in adopted:
+            self._sync_watchdog_stop(pos)
+            log("trade", f"ADOPTED {pos.side} {pos.symbol} qty={pos.quantity} entry=${pos.entry_price:.6f} "
+                f"— now engine-managed (trailing stop + chop exit + watchdog active)")
+        if ghosts or adopted:
             self._save_state()
 
     def _live_position_amt(self, symbol: str) -> float:
