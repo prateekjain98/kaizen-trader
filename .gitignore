@@ -19,3 +19,9 @@ skills-lock.json
 package-lock.json
 .dead_letters.jsonl
 reports/
+# Python virtualenv (was showing up as untracked on prod)
+.venv/
+venv/
+# macOS AppleDouble resource-fork files (synced over from local, clutter git status on prod)
+._*
+.env.bak.*
