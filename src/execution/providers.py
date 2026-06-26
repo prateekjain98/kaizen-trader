@@ -426,6 +426,25 @@ class BinanceProvider:
         return self._place_order(symbol, position_id, "SELL", quantity, market_price,
                                  reduce_only=reduce_only)
 
+    def open_short(self, symbol: str, position_id: str, quantity: float,
+                   market_price: float) -> Trade:
+        """Open a SHORT perp (the hedged leg of a delta-neutral funding carry).
+        A plain SELL with reduce_only=False so Binance opens a new short rather
+        than only reducing an existing long."""
+        if quantity <= 0 or market_price <= 0:
+            return _failed_trade(position_id, symbol, "sell", "Invalid quantity or price")
+        return self._place_order(symbol, position_id, "SELL", quantity, market_price,
+                                 reduce_only=False)
+
+    def close_short(self, symbol: str, position_id: str, quantity: float,
+                    market_price: float) -> Trade:
+        """Close a SHORT perp by buying it back, reduce_only so it can never
+        flip net long if the live size drifted below `quantity`."""
+        if quantity <= 0 or market_price <= 0:
+            return _failed_trade(position_id, symbol, "buy", "Invalid quantity or price")
+        return self._place_order(symbol, position_id, "BUY", quantity, market_price,
+                                 reduce_only=True)
+
     def get_funding_income(self, start_ms: int, end_ms: Optional[int] = None) -> Optional[float]:
         """Sum of FUNDING_FEE income (USDT) over the time window. Positive
         means net received, negative means net paid. Returns None on error
