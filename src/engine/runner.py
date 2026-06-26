@@ -141,6 +141,28 @@ class TradingEngine:
         self.accel_tracker = AccelerationTracker()
         self.corr_scanner = CorrelationScanner()
 
+        # Delta-neutral funding-carry (short perp + long spot). Built only when
+        # ENABLE_FUNDING_CARRY_NEUTRAL=true; otherwise stays None and the hourly
+        # carry pass is a no-op. Default-OFF — no behaviour change to the engine.
+        self.neutral_mgr = None
+        self._neutral_last_run = 0.0
+        try:
+            from src.strategies.funding_neutral import is_enabled as _carry_enabled
+            if _carry_enabled():
+                from src.execution.neutral_carry import NeutralCarryManager
+                spot_provider = None
+                if not paper:
+                    from src.execution.spot_providers import BinanceSpotProvider
+                    spot_provider = BinanceSpotProvider()
+                self.neutral_mgr = NeutralCarryManager(
+                    paper=paper, perp_provider=self.executor._binance,
+                    spot_provider=spot_provider,
+                    max_notional_usd=getattr(self.executor, "max_position_usd", 45.0),
+                )
+                log("info", "[neutral] delta-neutral funding carry ENABLED")
+        except Exception as exc:  # noqa: BLE001
+            log("warn", f"[neutral] failed to init carry manager (staying off): {exc}")
+
         # OKX WS: only meaningful in live mode against an OKX account.
         # Public WS gets dynamic ticker subs for open positions (sub-second stop checks).
         # Private WS pushes order/position/balance events (replaces REST polling latency).
@@ -309,6 +331,71 @@ class TradingEngine:
         if hasattr(self.brain, 'memory'):
             self.brain.memory = self.memory
 
+    def _neutral_carry_pass(self, now: float) -> None:
+        """Hourly delta-neutral funding-carry pass. No-op unless the capability
+        is enabled (ENABLE_FUNDING_CARRY_NEUTRAL). Opens short-perp+long-spot
+        pairs on the deepest positive-funding perps and unwinds when the funding
+        edge decays. Fully wrapped so it can never crash the main loop."""
+        if self.neutral_mgr is None:
+            return
+        if now - self._neutral_last_run < 3600:  # hourly cadence
+            return
+        self._neutral_last_run = now
+        try:
+            import requests
+            from src.strategies.funding_neutral import (
+                find_funding_neutral_opportunities, passes_liquidity_gate,
+                MIN_GROSS_APR,
+            )
+            funding = dict(getattr(self.streams.snapshot, "funding_rates", {}) or {})
+            if not funding:
+                return
+            opps = [o for o in find_funding_neutral_opportunities(funding)
+                    if o.recommended and o.perp_side == "short"]
+
+            held = {p.symbol for p in self.neutral_mgr.positions}
+
+            # Unwind existing positions whose funding edge has decayed below the
+            # APR floor (or flipped sign — no longer a short-funding capture).
+            for pos in list(self.neutral_mgr.positions):
+                cur = funding.get(pos.symbol, 0.0)
+                if cur <= 0 or abs(cur) * 3 * 365 < MIN_GROSS_APR:
+                    mark = self.streams.snapshot.prices.get(pos.symbol, pos.entry_perp_price)
+                    self.neutral_mgr.unwind(pos, mark_price=mark)
+
+            # Capacity: at most 2 concurrent neutral positions.
+            if len(self.neutral_mgr.positions) >= 2:
+                return
+
+            for opp in opps[:3]:
+                if opp.symbol in held:
+                    continue
+                bsym = f"{opp.symbol.upper()}USDT"
+                try:
+                    t = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr",
+                                     params={"symbol": bsym}, timeout=8).json()
+                    vol = float(t.get("quoteVolume", 0) or 0)
+                    bk = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker",
+                                      params={"symbol": bsym}, timeout=8).json()
+                    bid = float(bk.get("bidPrice", 0) or 0); ask = float(bk.get("askPrice", 0) or 0)
+                    spread = (ask - bid) / ((ask + bid) / 2) * 100 if (bid and ask) else 99.0
+                    mark = (bid + ask) / 2 if (bid and ask) else self.streams.snapshot.prices.get(opp.symbol, 0)
+                except Exception as exc:  # noqa: BLE001
+                    log("warn", f"[neutral] {opp.symbol}: liquidity probe failed: {exc}")
+                    continue
+                if not passes_liquidity_gate(vol, spread):
+                    log("info", f"[neutral] {opp.symbol}: liquidity gate FAIL "
+                                f"(vol ${vol/1e6:.0f}M, spread {spread:.3f}%) — skip")
+                    continue
+                notional = min(getattr(self.neutral_mgr, "max_notional_usd", 45.0),
+                               self.executor.balance * 0.9)
+                if notional < 5:
+                    return
+                self.neutral_mgr.open(opp, notional_usd=notional, mark_price=mark)
+                break  # one new position per pass
+        except Exception as exc:  # noqa: BLE001
+            log("warn", f"[neutral] carry pass error (ignored): {exc}")
+
     def _brain_tick_loop(self):
         """Main brain loop — runs every tick_interval seconds."""
         # Wait for initial data collection
@@ -336,6 +423,9 @@ class TradingEngine:
                         suggested_stop_pct=0.03, suggested_target_pct=0.05,
                         data=cs,
                     ))
+
+                # Delta-neutral funding carry (hourly, default-OFF capability).
+                self._neutral_carry_pass(time.time())
 
                 # Claude brain tick — one Haiku call with full state
                 decisions = self.brain.tick()

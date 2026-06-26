@@ -37,8 +37,23 @@ MIN_GROSS_APR = 0.08          # 8% APR floor
 MAX_BREAKEVEN_DAYS = 10.0
 
 
+# Hard execution gate — the edge analysis showed the funding is largest on the
+# THINNEST perps (~$1M/24h, 0.2% spreads), where slippage eats the carry. Only
+# trade names liquid enough to enter AND unwind both legs cleanly.
+MIN_LIQUIDITY_VOL_USD = 50_000_000.0   # perp 24h quote volume floor
+MAX_SPREAD_PCT = 0.05                   # top-of-book spread ceiling (%)
+
+
 def is_enabled() -> bool:
     return os.getenv("ENABLE_FUNDING_CARRY_NEUTRAL", "false").lower() == "true"
+
+
+def passes_liquidity_gate(vol_24h_usd: float, spread_pct: float,
+                          min_vol: float = MIN_LIQUIDITY_VOL_USD,
+                          max_spread: float = MAX_SPREAD_PCT) -> bool:
+    """A carry candidate is tradeable only if the perp is deep enough and tight
+    enough that round-trip slippage on both legs won't swamp the funding yield."""
+    return vol_24h_usd >= min_vol and 0.0 <= spread_pct <= max_spread
 
 
 @dataclass
